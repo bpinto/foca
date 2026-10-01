@@ -1,8 +1,8 @@
 # foca — design
 
-Status: **accepted**, not built yet. This document is the specification foca will be built
-to; a change to the code that changes the design updates it too. §16 lists the tests that
-hold each security property as they are written, and §17 what isn't built or verified yet.
+Status: **accepted**, and partly built (§17). This document is the specification foca is
+built to; a change to the code that changes the design updates it too. §16 lists the tests
+that hold each security property, and §17 what isn't built or verified yet.
 
 foca is a small per-instance service, similar to `ssh-agent`. It hands credentials from a
 host (the owner's Mac) to processes and microVMs. Each access needs a deliberate user approval
@@ -1167,8 +1167,9 @@ prompt of their own rather than being reused.
 ### 9.8 Listing (D16)
 
 `secret.list` and `action.list` return names and descriptions only, never values. They need
-no approval by default but are always audited. `[approval] list_requires_approval = true` makes
-them approval-gated. Listing is not a read of secret material, and agents need discoverability.
+no approval but are always audited. Listing is not a read of secret material, and agents need
+discoverability. An `[approval] list_requires_approval = true` to make them approval-gated is
+planned but not built (§17).
 
 ---
 
@@ -1388,7 +1389,7 @@ Format: context → decision → consequences. Short on purpose.
 | D13 | Platform events unhealthy → wipe and EveryTime | Reuse is only safe when we can wipe on sleep or lock | Linux hosts without logind get no reuse |
 | D14 | Command provider: no shell, allowlists, clean env | Rules 2 and 3 | Every action is written out in config |
 | D15 | One prompt per batch request | `run` with N secrets shouldn't need N touches | Prompt must list all names |
-| D16 | Listing needs no approval by default; audited; configurable | Names aren't values, and discoverability matters | `list_requires_approval` for the strict case |
+| D16 | Listing needs no approval by default; audited | Names aren't values, and discoverability matters | `list_requires_approval` for the strict case (not built yet) |
 | D17 | No auto-spawn; launchd or systemd runs `serve` | VM clients can't spawn on the host anyway; avoids env-inheritance bugs | Host CLI says "service not running" |
 | D18 | No ported third-party code | Clean implementation, no notices to carry | Everything is written and tested here |
 | D19 | Optional guest relay for guest-verified identity | Lets the prompt show a process the VM kernel vouches for | Needs a dedicated VM user and ssh config |
@@ -1556,23 +1557,23 @@ noted; packages are named as in `go test` output (`main` is `cmd/foca`, whose te
 | Property | Tests |
 |---|---|
 | **Pipeline and socket** | |
-| approve → read → audit; deny → audit, nothing returned | — |
-| an audit failure refuses; a torn write never hides the next event | — |
-| management methods refused and audited; only `client.sock` exists, 0600 in 0700 | — |
-| uid mismatch, wrong kind of peer, and every other refusal audited | — |
-| verified, guest-verified and reported identity kept apart | — |
-| prompts: claims never stated as fact, unsealed names marked, no name elided | — |
-| a realm can't exhaust the service or flood the log | — |
-| config rejections and file trust | — |
-| test-only plugins unreachable in a production build | — |
+| approve → read → audit; deny → audit, nothing returned | `core.TestApproveReadAudit`, `server.TestRequestApprovalAuditOverRealSocket`, `core.TestDenyIsAuditedAndReturnsNothing` |
+| an audit failure refuses; a torn write never hides the next event | `core.TestAuditFailureRefusesAccess`, `core.TestAddSecretRolledBackWhenAuditFails`, `audit.TestJSONLTornWriteDoesNotSwallowNextEvent`, `audit.TestJSONLFailedSyncLatches` |
+| management methods refused and audited; only `client.sock` exists, 0600 in 0700 | `server.TestManagementMethodsRefusedAndAudited`, `server.TestSocketAndDirectoryModes` |
+| uid mismatch, wrong kind of peer, and every other refusal audited | `server.TestUIDMismatchIsRefusedAndAudited`, `server.TestNonProxyPeerRefusedOnOpaqueRealm`, `server.TestProxyPeerRefusedOnDirectRealm`, `server.TestEveryRefusedRequestIsAudited` |
+| verified, guest-verified and reported identity kept apart | `audit.TestVerifiedAndReportedStaySeparateOnTheWire`, `core.TestIdentityLevelsHaveDistinctTypes` |
+| prompts: claims never stated as fact, unsealed names marked, no name elided | `core.TestPromptWording`, `core.TestPromptNeverElidesCredentials`, `core.TestOversizedBatchRefusedBeforePrompting`, `peer.TestMountsCantLendASealedName`, `peer.TestLoadedCodeMustBeSealedToo` |
+| a realm can't exhaust the service or flood the log | `server.TestConnectionCapPerInstance` |
+| config rejections and file trust | `config.TestRejections`, `config.TestLoadChecksFileTrust` |
+| test-only plugins unreachable in a production build | `wiring.TestFakeAuthenticatorRefusedInProductionBuild` |
 | **Vaults, exposure and the host CLI** | |
-| a vault shared without explicit `expose` is a config error | — |
-| an unexposed secret looks like `not_found` and is audited; private vaults can't see each other | — |
+| a vault shared without explicit `expose` is a config error | `config.TestImplicitPrivateVaultCollisionCountsAsSharing` |
+| an unexposed secret looks like `not_found` and is audited; private vaults can't see each other | `core.TestUnexposedLooksLikeMissingButIsAuditedWithReason` |
 | crypto round trip; AAD swaps and ambiguous files refused | — |
 | atomic writes | — |
 | no secret in argv; no value written to a terminal | — |
 | formatters | — |
-| add, edit and remove name every realm affected | — |
+| add, edit and remove name every realm affected | `core.TestAddNamesEveryRealmThatWillSeeTheSecret` |
 | signals only reach a verified service | — |
 | key holders hide their memory | — |
 | `--only` never splits a vault; one process per instance | — |
@@ -1613,7 +1614,25 @@ noted; packages are named as in `go test` output (`main` is `cmd/foca`, whose te
 
 ## 17. Not built or not verified yet
 
-Nothing is built yet: this document is the specification the code will follow.
+**Not built**
+
+- The encrypted vault file, its key protector and the host CLI (`init`, `add`, `edit`,
+  `remove`, `get`, `run`, `reload`, `stop`): secrets live in the in-memory store only.
+- Reuse: policy levels, grants, denial backoff and wipes, the logind events source, `lock`
+  and `policy explain`. Every access asks.
+- The `foca-darwin` helper (Touch ID, the Keychain protector, sleep and lock events) and
+  the macOS peer identifier: on macOS, `serve` has no authenticator and identifies no peer.
+- Actions: the command provider, `action.list` and `action.run`, `foca exec` and
+  `foca actions`.
+- polkit and the TPM key protector, with `foca recover` and `foca rekey`: on Linux, `serve`
+  and the host commands have no real authenticator and run only in `foca_testing` builds.
+- Audit log rotation, and `foca events query` and `follow`.
+- Nix packaging, and `serve --only` for one process per instance or group.
+- The guest relay, guest-verified identity and the `guest-*` scopes, which are a config
+  error until then.
+- `[approval] list_requires_approval` (D16); the `secure-enclave`, `libsecret` and
+  `keyring` key protectors.
+- macOS container runtimes' proxies in the default `opaque_peers` (§2.1).
 
 ---
 

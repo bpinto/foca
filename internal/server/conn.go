@@ -1,0 +1,289 @@
+package server
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"errors"
+	"net"
+	"time"
+
+	"github.com/bpinto/foca/internal/audit"
+	"github.com/bpinto/foca/internal/identity"
+	"github.com/bpinto/foca/internal/ids"
+	"github.com/bpinto/foca/internal/protocol"
+	"github.com/bpinto/foca/internal/server/core"
+)
+
+// clientMethods is everything a socket offers. None of it changes state on
+// the host.
+var clientMethods = map[string]bool{
+	protocol.MethodHello:      true,
+	protocol.MethodSecretList: true,
+	protocol.MethodSecretRead: true,
+}
+
+// managementMethods are host CLI operations. They exist on no socket; a realm
+// that asks for one is refused and the attempt is audited (design §6.2).
+var managementMethods = map[string]bool{
+	"secret.add": true, "secret.update": true, "secret.remove": true,
+	"vault.init": true, "vault.reset": true,
+	"config.reload": true, "instance.lock": true, "server.shutdown": true,
+	"events.query": true, "events.subscribe": true,
+}
+
+type connState struct {
+	inst   *core.Instance
+	peer   identity.VerifiedPeer
+	client *identity.ClientInfo // from server.hello; per-request client overrides it
+}
+
+// message is one framed request, or the error that ended reading.
+type message struct {
+	line []byte
+	err  error
+}
+
+// serveConn handles requests one at a time, in order. A separate reader
+// keeps reading while a request is handled, so a client that hangs up is
+// noticed at once: its pending prompt is cancelled instead of holding a
+// queue slot until prompt_timeout. A connection that sends no complete
+// request within IdleTimeout is closed; the deadline is lifted while a
+// request is being handled, so a slow approval never trips it.
+func (s *Server) serveConn(conn *net.UnixConn, inst *core.Instance) {
+	peer, ok := s.admit(conn, inst)
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithCancel(s.ctx)
+	defer cancel()
+	st := &connState{inst: inst, peer: peer}
+	msgs := make(chan message)
+	go s.readLoop(conn, cancel, msgs)
+	conn.SetReadDeadline(time.Now().Add(s.opts.IdleTimeout))
+	for m := range msgs {
+		if m.err != nil {
+			call := core.Call{RequestID: ids.New(), Origin: audit.OriginClientSocket, Instance: inst, Peer: peer, Reported: st.client}
+			s.write(conn, *s.refuseAs(ctx, call, nil, "", "message_too_large",
+				protocol.NewError(protocol.CodeParseError, "message too large (max %d bytes)", protocol.MaxMessage)))
+			return
+		}
+		conn.SetReadDeadline(time.Time{})
+		if resp := s.handle(ctx, st, m.line); resp != nil {
+			s.write(conn, *resp)
+		}
+		conn.SetReadDeadline(time.Now().Add(s.opts.IdleTimeout))
+	}
+}
+
+// readLoop frames messages until the connection fails, then cancels the
+// connection's in-flight work. EOF counts as hanging up, so clients must not
+// half-close while they wait for an answer.
+func (s *Server) readLoop(conn *net.UnixConn, cancel context.CancelFunc, msgs chan<- message) {
+	defer close(msgs)
+	defer cancel()
+	r := bufio.NewReaderSize(conn, 64*1024)
+	for {
+		line, err := protocol.ReadMessage(r)
+		if errors.Is(err, protocol.ErrTooLarge) {
+			msgs <- message{err: err}
+			return
+		}
+		if err != nil {
+			return
+		}
+		msgs <- message{line: line}
+	}
+}
+
+func (s *Server) handle(ctx context.Context, st *connState, line []byte) *protocol.Response {
+	call := core.Call{RequestID: ids.New(), Origin: audit.OriginClientSocket, Instance: st.inst, Peer: st.peer, Reported: st.client}
+	if !json.Valid(line) {
+		return s.refuse(ctx, call, nil, "", protocol.NewError(protocol.CodeParseError, "invalid JSON"))
+	}
+	req, err := protocol.DecodeRequest(line)
+	if err != nil {
+		return s.refuse(ctx, call, nil, "", protocol.NewError(protocol.CodeInvalidRequest, "%v", err))
+	}
+	if req.JSONRPC != "2.0" || req.Method == "" {
+		return s.refuse(ctx, call, req.ID, req.Method, protocol.NewError(protocol.CodeInvalidRequest, "not a JSON-RPC 2.0 request"))
+	}
+	if len(req.ID) == 0 {
+		// Notifications aren't part of this protocol; there is nothing to
+		// answer them with, but the attempt is still recorded.
+		s.refuse(ctx, call, nil, req.Method, protocol.NewError(protocol.CodeInvalidRequest, "notifications are not supported"))
+		return nil
+	}
+	if managementMethods[req.Method] {
+		return s.refuseAs(ctx, call, req.ID, req.Method, "forbidden_on_socket",
+			protocol.NewError(protocol.CodeForbiddenOnSocket, "%s is a host CLI operation; it is not available on any socket", req.Method))
+	}
+	if !clientMethods[req.Method] {
+		return s.refuse(ctx, call, req.ID, req.Method, protocol.NewError(protocol.CodeMethodNotFound, "unknown method %q", safeMethod(req.Method)))
+	}
+
+	result, perr := s.dispatch(ctx, st, call, req)
+	if perr != nil {
+		if rejectionCodes[perr.Code] && perr.Data.EventSeq == 0 {
+			// Refused before the core recorded anything: record it here.
+			return s.refuse(ctx, call, req.ID, req.Method, perr)
+		}
+		return errResp(req.ID, perr)
+	}
+	b, err := protocol.Marshal(result)
+	if err != nil {
+		return errResp(req.ID, protocol.NewError(protocol.CodeInternal, "encoding failed"))
+	}
+	return &protocol.Response{JSONRPC: "2.0", ID: req.ID, Result: b}
+}
+
+// rejectionCodes are refusals of the request itself. Each is audited as
+// request.rejected (design §8.2), so a realm probing the socket is visible.
+var rejectionCodes = map[int]bool{
+	protocol.CodeParseError:          true,
+	protocol.CodeInvalidRequest:      true,
+	protocol.CodeMethodNotFound:      true,
+	protocol.CodeInvalidParams:       true,
+	protocol.CodeProtocolUnsupported: true,
+}
+
+// refuse records a rejected request, reason named after the error code, and
+// returns the error response. If it can't be recorded, the answer becomes
+// audit_failed, as for every other unrecorded request.
+func (s *Server) refuse(ctx context.Context, call core.Call, id json.RawMessage, method string, pe *protocol.Error) *protocol.Response {
+	return s.refuseAs(ctx, call, id, method, protocol.CodeName(pe.Code), pe)
+}
+
+func (s *Server) refuseAs(ctx context.Context, call core.Call, id json.RawMessage, method, reason string, pe *protocol.Error) *protocol.Response {
+	e := s.opts.Core.Event(call, audit.TypeRequestRejected, audit.OutcomeRejected)
+	e.Reason = reason
+	if method != "" {
+		e.Params = map[string]string{"method": safeMethod(method)}
+	}
+	seq, err := s.opts.Core.RecordRejection(ctx, e)
+	if err != nil {
+		return errResp(id, protocol.NewError(protocol.CodeAuditFailed, "could not record the request; refusing it"))
+	}
+	pe.Data.RequestID, pe.Data.EventSeq = call.RequestID, seq
+	return errResp(id, pe)
+}
+
+// safeMethod bounds a caller-supplied method name before it is stored or
+// echoed: method-name characters only, at most 64 bytes.
+func safeMethod(m string) string {
+	b := []byte(m)
+	if len(b) > 64 {
+		b = b[:64]
+	}
+	for i, c := range b {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '.' || c == '_' || c == '-') {
+			b[i] = '?'
+		}
+	}
+	return string(b)
+}
+
+// decode applies strict decoding and the per-request common fields.
+func (s *Server) decode(call *core.Call, raw json.RawMessage, v protocol.Params) *protocol.Error {
+	if err := protocol.DecodeParams(raw, v); err != nil {
+		return protocol.NewError(protocol.CodeInvalidParams, "%v", err)
+	}
+	base := v.Base()
+	if base.MinProtocol > protocol.Version {
+		return protocol.NewError(protocol.CodeProtocolUnsupported,
+			"client needs protocol %d; this server speaks %d", base.MinProtocol, protocol.Version)
+	}
+	if base.Client != nil {
+		c := base.Client.Clean()
+		call.Reported = &c
+	}
+	return nil
+}
+
+func (s *Server) dispatch(ctx context.Context, st *connState, call core.Call, req protocol.Request) (any, *protocol.Error) {
+	switch req.Method {
+	case protocol.MethodHello:
+		var p protocol.HelloParams
+		if e := s.decode(&call, req.Params, &p); e != nil {
+			return nil, e
+		}
+		if call.Reported != nil {
+			st.client = call.Reported
+		}
+		return protocol.HelloResult{
+			Protocol: protocol.Version, Instance: st.inst.Name, Realm: st.inst.Realm,
+			ServerVersion: s.opts.Version, Features: []string{protocol.MethodSecretList, protocol.MethodSecretRead},
+		}, nil
+
+	case protocol.MethodSecretList:
+		var p protocol.SecretListParams
+		if e := s.decode(&call, req.Params, &p); e != nil {
+			return nil, e
+		}
+		rs, err := s.opts.Core.ListSecrets(ctx, call)
+		if err != nil {
+			return nil, asProtocol(err)
+		}
+		out := protocol.SecretListResult{Secrets: []protocol.SecretInfo{}}
+		for _, r := range rs {
+			info := protocol.SecretInfo{Name: r.Ref.ID, Description: r.Description, Tags: r.Tags}
+			if r.Ref.Display != r.Ref.ID {
+				info.DisplayName = r.Ref.Display
+			}
+			out.Secrets = append(out.Secrets, info)
+		}
+		return out, nil
+
+	case protocol.MethodSecretRead:
+		var p protocol.SecretReadParams
+		if e := s.decode(&call, req.Params, &p); e != nil {
+			return nil, e
+		}
+		secrets, err := s.opts.Core.ReadSecrets(ctx, call, p.Names)
+		if err != nil {
+			return nil, asProtocol(err)
+		}
+		defer core.ZeroSecrets(secrets)
+		out := protocol.SecretReadResult{}
+		for _, sec := range secrets {
+			v, enc := protocol.EncodeValue(sec.Value)
+			out.Secrets = append(out.Secrets, protocol.SecretOut{Name: sec.Name, Value: v, Encoding: enc})
+		}
+		return out, nil
+	}
+	return nil, protocol.NewError(protocol.CodeMethodNotFound, "unknown method %q", req.Method)
+}
+
+func asProtocol(err error) *protocol.Error {
+	var pe *protocol.Error
+	if errors.As(err, &pe) {
+		return pe
+	}
+	return protocol.NewError(protocol.CodeInternal, "internal error")
+}
+
+func errResp(id json.RawMessage, e *protocol.Error) *protocol.Response {
+	if len(id) == 0 {
+		id = json.RawMessage("null")
+	}
+	return &protocol.Response{JSONRPC: "2.0", ID: id, Error: e}
+}
+
+// write sends one response and zeroes the encoded bytes afterwards, since
+// they may contain secret values.
+func (s *Server) write(conn net.Conn, resp protocol.Response) {
+	b, err := json.Marshal(resp)
+	if err != nil {
+		return
+	}
+	b = append(b, '\n')
+	conn.Write(b)
+	zero(b)
+	zero(resp.Result)
+}
+
+func zero(b []byte) {
+	for i := range b {
+		b[i] = 0
+	}
+}
