@@ -38,3 +38,13 @@ func TestPlannedAuthenticatorsSayTheyAreNotImplemented(t *testing.T) {
 		t.Fatal("unknown authenticator accepted")
 	}
 }
+
+func TestPlannedKeyProtectorsSayTheyAreNotImplemented(t *testing.T) {
+	cfg, err := config.Parse([]byte("version = 1\n[plugins]\nauthenticator = \"x\"\nsecret_store = \"vault-file\"\nkey_protector = \"keychain\"\n[instances.dev]\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := keyProtector(cfg, config.Paths{}); err == nil || !strings.Contains(err.Error(), "not implemented yet") {
+		t.Fatalf("got %v", err)
+	}
+}

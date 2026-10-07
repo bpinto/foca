@@ -17,6 +17,7 @@ import (
 	"github.com/bpinto/foca/internal/ids"
 	"github.com/bpinto/foca/internal/plugin"
 	"github.com/bpinto/foca/internal/protocol"
+	"github.com/bpinto/foca/internal/secretname"
 )
 
 type Options struct {
@@ -26,25 +27,32 @@ type Options struct {
 	MaxQueue      int
 	ShowClient    bool
 	SkipAncestors []string
-	Now           func() time.Time
+	// Keys unseals each vault's data key, by vault name. A vault without
+	// one is a store that doesn't encrypt (the in-memory test store).
+	Keys map[string]plugin.DEKFunc
+	Now  func() time.Time
 }
 
 // Instance is one realm's view of the service.
 type Instance struct {
-	Name    string
-	Realm   identity.Realm
+	Name  string
+	Realm identity.Realm
+	// Vault is the vault a host operation changes; prompts and events name
+	// it. A realm's instance leaves it empty: each read names its own.
 	Vault   string
 	Secrets plugin.Provider
-	// Exposes reports whether this instance can see a secret with this
-	// metadata. Tag selectors make this depend on vault metadata, so the
-	// host CLI shows it when a secret is added (design §7.1).
-	Exposes func(plugin.SecretMeta) bool
+	// Vaults are the vaults the instance reads, and Exposes says which of
+	// their secrets it may see (design §7.1). Host operations name the
+	// realms a change reaches with them.
+	Vaults  []string
+	Exposes func(vault, secretID string) bool
 }
 
-// visibleTo lists the realms of every instance that would see meta in vault.
-func (s *Service) visibleTo(vault string, meta plugin.SecretMeta) (realms []identity.Realm, names []string) {
+// visibleTo lists the realms of every instance that may read secret id in
+// vault.
+func (s *Service) visibleTo(vault, id string) (realms []identity.Realm, names []string) {
 	for _, inst := range s.instances {
-		if inst.Vault == vault && inst.Exposes != nil && inst.Exposes(meta) {
+		if inst.Exposes != nil && inst.Exposes(vault, id) {
 			realms = append(realms, inst.Realm)
 			names = append(names, inst.Name)
 		}
@@ -137,13 +145,7 @@ func (s *Service) fail(c Call, code int, seq uint64, format string, a ...any) *p
 func (s *Service) ListSecrets(ctx context.Context, c Call) ([]plugin.Resource, error) {
 	rs, err := c.Instance.Secrets.List(ctx)
 	if err != nil {
-		e := s.Event(c, audit.TypeSecretList, audit.OutcomeError)
-		e.Error = &audit.ErrorInfo{Code: "internal", Message: err.Error()}
-		seq, aerr := s.record(ctx, c, e)
-		if aerr != nil {
-			return nil, aerr
-		}
-		return nil, s.fail(c, protocol.CodeInternal, seq, "listing failed")
+		return nil, s.internal(ctx, c, audit.TypeSecretList, "", err)
 	}
 	e := s.Event(c, audit.TypeSecretList, audit.OutcomeOK)
 	e.Approval = &audit.Approval{Mode: audit.ModeNone}
@@ -222,6 +224,7 @@ func (s *Service) ReadSecrets(ctx context.Context, c Call, names []string) ([]Se
 		for _, r := range resources {
 			e := s.Event(c, audit.TypeSecretRead, audit.OutcomeError)
 			e.Resource = &audit.Resource{Kind: "secret", ID: r.Ref.ID}
+			setVault(e, r.Ref)
 			e.Approval = appr
 			e.Reason = "cancelled"
 			if _, aerr := s.record(ctx, c, e); aerr != nil {
@@ -244,6 +247,7 @@ func (s *Service) ReadSecrets(ctx context.Context, c Call, names []string) ([]Se
 	for _, r := range resources {
 		e := s.Event(c, audit.TypeSecretRead, audit.OutcomeOK)
 		e.Resource = &audit.Resource{Kind: "secret", ID: r.Ref.ID}
+		setVault(e, r.Ref)
 		e.Approval = appr
 		if _, aerr := s.record(ctx, c, e); aerr != nil {
 			ZeroSecrets(out)
@@ -263,8 +267,8 @@ func (s *Service) checkNames(c Call, names []string) ([]string, *protocol.Error)
 	seen := map[string]bool{}
 	var out []string
 	for _, n := range names {
-		if !validSecretID(n) {
-			return nil, s.fail(c, protocol.CodeInvalidParams, 0, "invalid secret name %q", n)
+		if _, _, ok := secretname.Split(n); !ok {
+			return nil, s.fail(c, protocol.CodeInvalidParams, 0, "invalid secret name %q: name secrets <vault>:<secret>", n)
 		}
 		if !seen[n] {
 			seen[n] = true
@@ -278,6 +282,14 @@ func (s *Service) internal(ctx context.Context, c Call, typ, id string, err erro
 	e := s.Event(c, typ, audit.OutcomeError)
 	if id != "" {
 		e.Resource = &audit.Resource{Kind: "secret", ID: id}
+	}
+	if errors.Is(err, plugin.ErrNotInitialized) {
+		e.Error = &audit.ErrorInfo{Code: protocol.CodeName(protocol.CodeNotInitialized), Message: err.Error()}
+		seq, aerr := s.record(ctx, c, e)
+		if aerr != nil {
+			return aerr
+		}
+		return s.fail(c, protocol.CodeNotInitialized, seq, "%s", notInitialized(err))
 	}
 	e.Error = &audit.ErrorInfo{Code: "internal", Message: err.Error()}
 	seq, aerr := s.record(ctx, c, e)
@@ -293,12 +305,13 @@ func (s *Service) internal(ctx context.Context, c Call, typ, id string, err erro
 // records one access event per resource so a UI can show what was attempted.
 // There is no reuse yet: every call is a fresh approval.
 func (s *Service) approve(ctx context.Context, c Call, op string, refs []plugin.ResourceRef, accessType string) (*audit.Approval, error) {
-	return s.approveVisible(ctx, c, op, refs, accessType, nil)
+	return s.approveVisible(ctx, c, op, refs, accessType, nil, nil)
 }
 
-// approveVisible is approve with the list of realms an added secret becomes
-// visible to, which the add prompt must state.
-func (s *Service) approveVisible(ctx context.Context, c Call, op string, refs []plugin.ResourceRef, accessType string, visible []identity.Realm) (*audit.Approval, error) {
+// approveVisible is approve for host operations, whose prompts must state
+// every realm that will see the secret (visible) and every realm that will
+// stop seeing it (hidden).
+func (s *Service) approveVisible(ctx context.Context, c Call, op string, refs []plugin.ResourceRef, accessType string, visible, hidden []identity.Realm) (*audit.Approval, error) {
 	auth := s.opts.Authenticator
 	approvalID := ids.New()
 	resources := make([]audit.Resource, len(refs))
@@ -308,7 +321,7 @@ func (s *Service) approveVisible(ctx context.Context, c Call, op string, refs []
 	prompt, fits := BuildPrompt(PromptInput{
 		Operation: op, Realm: c.Instance.Realm, Vault: c.Instance.Vault, Resources: refs,
 		Requester: c.requester(), ShowClient: s.opts.ShowClient, Skip: s.opts.SkipAncestors,
-		VisibleTo: visible,
+		VisibleTo: visible, Hidden: hidden,
 	})
 	if !fits {
 		// Every name must be on screen; refuse rather than elide any.
@@ -405,98 +418,6 @@ func (s *Service) approveVisible(ctx context.Context, c Call, op string, refs []
 	}
 }
 
-// ---- secret.add (host CLI) ----
-
-// AddSecret runs in the host CLI process, not behind a socket: the CLI builds
-// its own Service over the same authenticator, store and audit sink.
-
-type NewSecret struct {
-	Vault       string
-	ID          string
-	DisplayName string
-	Description string
-	Tags        []string
-	Value       []byte
-}
-
-func (s *Service) AddSecret(ctx context.Context, c Call, ns NewSecret) error {
-	if ns.Vault == "" {
-		ns.Vault = c.Instance.Vault
-	}
-	store, ok := s.stores[ns.Vault]
-	if !ok {
-		return s.fail(c, protocol.CodeInvalidParams, 0, "unknown vault %q", ns.Vault)
-	}
-	if !validSecretID(ns.ID) {
-		return s.fail(c, protocol.CodeInvalidParams, 0, "invalid secret name %q", ns.ID)
-	}
-	if err := validLabel("display_name", ns.DisplayName, 64); err != nil {
-		return s.fail(c, protocol.CodeInvalidParams, 0, "%v", err)
-	}
-	if err := validLabel("description", ns.Description, 512); err != nil {
-		return s.fail(c, protocol.CodeInvalidParams, 0, "%v", err)
-	}
-	for _, t := range ns.Tags {
-		if err := validLabel("tag", t, 64); err != nil || t == "" || strings.ContainsAny(t, " ,:") {
-			return s.fail(c, protocol.CodeInvalidParams, 0, "invalid tag %q", t)
-		}
-	}
-	if len(ns.Value) == 0 {
-		return s.fail(c, protocol.CodeInvalidParams, 0, "value must not be empty")
-	}
-	existing, err := store.List(ctx, nil)
-	if err != nil {
-		// Without the list we can't rule out overwriting a secret.
-		return s.internal(ctx, c, audit.TypeSecretAdd, ns.ID, err)
-	}
-	for _, m := range existing {
-		if m.ID == ns.ID {
-			return s.fail(c, protocol.CodeInvalidParams, 0, "secret %q already exists in vault %q", ns.ID, ns.Vault)
-		}
-	}
-
-	ref := plugin.ResourceRef{Kind: "secret", ID: ns.ID, Display: displayOr(ns.DisplayName, ns.ID)}
-	addCall := c
-	inst := *c.Instance
-	inst.Vault = ns.Vault
-	addCall.Instance = &inst
-	meta := plugin.SecretMeta{ID: ns.ID, DisplayName: ns.DisplayName, Description: ns.Description, Tags: ns.Tags}
-	// Tag selectors mean metadata decides who sees the secret, so the prompt
-	// names every realm it becomes visible to before anyone approves.
-	visible, visibleNames := s.visibleTo(ns.Vault, meta)
-	appr, err := s.approveVisible(ctx, addCall, "secret.add", []plugin.ResourceRef{ref}, audit.TypeSecretAdd, visible)
-	if err != nil {
-		return err
-	}
-	if err := store.Put(ctx, nil, meta, plugin.SecretValue{Bytes: ns.Value}); err != nil {
-		return s.internal(ctx, addCall, audit.TypeSecretAdd, ns.ID, err)
-	}
-	e := s.Event(addCall, audit.TypeSecretAdd, audit.OutcomeOK)
-	e.Resource = &audit.Resource{Kind: "secret", ID: ns.ID}
-	e.Params = map[string]string{"visible_to": strings.Join(visibleNames, ",")}
-	e.Approval = appr
-	if _, aerr := s.record(ctx, addCall, e); aerr != nil {
-		// The value is stored but unrecorded: remove it again so nothing
-		// exists that the audit log doesn't know about.
-		if derr := store.Delete(context.WithoutCancel(ctx), nil, ns.ID); derr != nil {
-			// Nothing more can be recorded. Say plainly what was left
-			// behind, so the operator can remove it.
-			return s.fail(addCall, protocol.CodeAuditFailed, 0,
-				"could not record the add, and could not undo it (%v): secret %q is stored in vault %q without an audit record; remove it",
-				derr, ns.ID, ns.Vault)
-		}
-		return aerr
-	}
-	return nil
-}
-
-func displayOr(d, id string) string {
-	if d != "" {
-		return d
-	}
-	return id
-}
-
 func validSecretID(s string) bool {
 	if len(s) == 0 || len(s) > 128 {
 		return false
@@ -519,4 +440,28 @@ func validLabel(field, s string, max int) error {
 		}
 	}
 	return nil
+}
+
+// notInitialized says which vault isn't initialized, when the error names it.
+func notInitialized(err error) string {
+	var ni plugin.NotInitialized
+	if errors.As(err, &ni) {
+		return ni.Error()
+	}
+	return "a vault is not initialized"
+}
+
+// setVault names the vault of refs on e, when they are all in one; events
+// about several vaults name none.
+func setVault(e *audit.Event, refs ...plugin.ResourceRef) {
+	vault := ""
+	for i, r := range refs {
+		if r.Vault == "" || i > 0 && r.Vault != vault {
+			return
+		}
+		vault = r.Vault
+	}
+	if vault != "" {
+		e.Vault = vault
+	}
 }

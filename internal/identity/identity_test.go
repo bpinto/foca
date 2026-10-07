@@ -37,6 +37,21 @@ func TestCleanStripsControlAndBoundsSize(t *testing.T) {
 	if got.Parents[0].Sealed {
 		t.Fatal("a client vouched for its own parent's file")
 	}
+
+	// The run target is a claim like the rest, cleaned the same way and
+	// without touching the receiver's copy.
+	c = ClientInfo{Target: &Target{Exe: "/bin/‮np\x1bm" + strings.Repeat("a", 2*MaxClientString), Argv0: "npm\n"}}
+	got = c.Clean()
+	if got.Target == c.Target || got.Target.Argv0 != "npm" || len(got.Target.Exe) != MaxClientString ||
+		!strings.HasPrefix(got.Target.Exe, "/bin/npmaaa") {
+		t.Fatalf("target not cleaned: %+v", got.Target)
+	}
+	if c.Target.Argv0 != "npm\n" {
+		t.Fatal("Clean mutated its receiver's target")
+	}
+	if got := (ClientInfo{Target: &Target{Argv0: "\x1b"}}).Clean(); got.Target != nil {
+		t.Fatalf("empty target kept: %+v", got.Target)
+	}
 }
 
 // A client can't vouch for its own files: whatever it claims, its parents

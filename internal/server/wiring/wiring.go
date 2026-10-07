@@ -10,8 +10,10 @@ import (
 	"github.com/bpinto/foca/internal/config"
 	"github.com/bpinto/foca/internal/fsutil"
 	"github.com/bpinto/foca/internal/plugin"
+	keyfile "github.com/bpinto/foca/internal/plugins/keyprot/file"
 	"github.com/bpinto/foca/internal/plugins/provider/static"
 	"github.com/bpinto/foca/internal/plugins/store/memory"
+	"github.com/bpinto/foca/internal/plugins/store/vaultfile"
 	"github.com/bpinto/foca/internal/server"
 	"github.com/bpinto/foca/internal/server/core"
 )
@@ -42,6 +44,91 @@ func authenticator(name string) (plugin.Authenticator, error) {
 	return nil, fmt.Errorf("unknown authenticator %q", name)
 }
 
+// plannedProtectors are key protectors the design names but foca doesn't
+// have yet.
+var plannedProtectors = map[string]bool{"keychain": true, "secure-enclave": true, "tpm": true, "libsecret": true, "keyring": true}
+
+func keyProtector(cfg *config.Config, paths config.Paths) (plugin.KeyProtector, error) {
+	switch name := cfg.Plugins.KeyProtector; name {
+	case "file":
+		// config.validate has already required insecure_file_protector.
+		return keyfile.New(paths.KeysDir()), nil
+	default:
+		if plannedProtectors[name] {
+			return nil, fmt.Errorf("key_protector %q is not implemented yet", name)
+		}
+		return nil, fmt.Errorf("unknown key_protector %q", name)
+	}
+}
+
+// vaults is every configured vault's store and key.
+type vaults struct {
+	stores    map[string]plugin.SecretStore
+	keys      map[string]plugin.DEKFunc
+	files     map[string]*vaultfile.Store // only with secret_store = "vault-file"
+	protector plugin.KeyProtector
+}
+
+func openVaults(cfg *config.Config, paths config.Paths, log *slog.Logger) (*vaults, error) {
+	v := &vaults{stores: map[string]plugin.SecretStore{}, keys: map[string]plugin.DEKFunc{}, files: map[string]*vaultfile.Store{}}
+	switch cfg.Plugins.SecretStore {
+	case "memory":
+		log.Warn("secret_store is memory: secrets are lost when the service stops")
+		for _, name := range cfg.Vaults {
+			v.stores[name] = memory.New()
+		}
+	case "vault-file":
+		p, err := keyProtector(cfg, paths)
+		if err != nil {
+			return nil, err
+		}
+		if p.Name() == "file" {
+			log.Warn("key_protector is file: the vault key is in a plain file; anyone who can read " + paths.KeysDir() + " can decrypt the vaults")
+		}
+		v.protector = p
+		for _, name := range cfg.Vaults {
+			s := vaultfile.New(paths.VaultFile(name), name)
+			v.stores[name], v.files[name], v.keys[name] = s, s, s.DEKFunc(p)
+		}
+	default:
+		return nil, fmt.Errorf("unknown secret_store %q", cfg.Plugins.SecretStore)
+	}
+	return v, nil
+}
+
+func openAudit(cfg *config.Config, paths config.Paths) (plugin.AuditSink, error) {
+	switch cfg.Plugins.AuditSink {
+	case "jsonl":
+		if err := fsutil.EnsurePrivateDir(paths.DataDir); err != nil {
+			return nil, fmt.Errorf("data dir: %w", err)
+		}
+		return audit.OpenJSONL(paths.AuditLog())
+	default:
+		return nil, fmt.Errorf("unknown audit_sink %q", cfg.Plugins.AuditSink)
+	}
+}
+
+func newCore(cfg *config.Config, auth plugin.Authenticator, sink plugin.AuditSink, v *vaults) *core.Service {
+	var instances []*core.Instance
+	for _, ic := range cfg.Instances {
+		var vaults []*static.Provider
+		for _, name := range ic.Vaults() {
+			e := ic.Expose[name]
+			vaults = append(vaults, static.New(name, v.stores[name], static.Exposure{All: e.All, IDs: e.IDs}, v.keys[name]))
+		}
+		instances = append(instances, &core.Instance{
+			Name: ic.Name, Realm: ic.Realm, Vaults: ic.Vaults(),
+			Secrets: static.NewVaults(vaults...),
+			Exposes: ic.Exposes,
+		})
+	}
+	return core.New(core.Options{
+		Authenticator: auth, Audit: sink, Keys: v.keys,
+		PromptTimeout: cfg.Approval.PromptTimeout, MaxQueue: cfg.Approval.MaxQueue,
+		ShowClient: cfg.Approval.PromptShowClient, SkipAncestors: cfg.Approval.SkipAncestors,
+	}, instances, v.stores)
+}
+
 // Built is everything a running service needs.
 type Built struct {
 	Server *server.Server
@@ -50,6 +137,7 @@ type Built struct {
 	Stores map[string]plugin.SecretStore
 }
 
+// Build wires the service. It binds nothing; Server.Start does.
 func Build(cfg *config.Config, paths config.Paths, version string, log *slog.Logger) (*Built, error) {
 	auth, err := authenticator(cfg.Plugins.Authenticator)
 	if err != nil {
@@ -58,59 +146,55 @@ func Build(cfg *config.Config, paths config.Paths, version string, log *slog.Log
 	if TestBuild {
 		log.Warn("TEST BUILD: test-only plugins are available; never use this binary for real secrets")
 	}
-
-	stores := map[string]plugin.SecretStore{}
-	for _, v := range cfg.Vaults {
-		switch cfg.Plugins.SecretStore {
-		case "memory":
-			stores[v] = memory.New()
-		case "vault-file":
-			return nil, fmt.Errorf("secret_store %q is not implemented yet", cfg.Plugins.SecretStore)
-		default:
-			return nil, fmt.Errorf("unknown secret_store %q", cfg.Plugins.SecretStore)
-		}
+	v, err := openVaults(cfg, paths, log)
+	if err != nil {
+		return nil, err
 	}
-	if cfg.Plugins.SecretStore == "memory" {
-		log.Warn("secret_store is memory: secrets are lost when the service stops")
-	}
-
 	peers, err := peerIdentifier(cfg.Plugins.PeerIdentifier)
 	if err != nil {
 		return nil, err
 	}
-
-	var sink plugin.AuditSink
-	switch cfg.Plugins.AuditSink {
-	case "jsonl":
-		if err := fsutil.EnsurePrivateDir(paths.DataDir); err != nil {
-			return nil, fmt.Errorf("data dir: %w", err)
-		}
-		sink, err = audit.OpenJSONL(paths.AuditLog())
-		if err != nil {
-			return nil, err
-		}
-	default:
-		return nil, fmt.Errorf("unknown audit_sink %q", cfg.Plugins.AuditSink)
+	sink, err := openAudit(cfg, paths)
+	if err != nil {
+		return nil, err
 	}
-
-	var instances []*core.Instance
-	for _, ic := range cfg.Instances {
-		exp := static.Exposure{All: ic.Expose.All, IDs: ic.Expose.IDs, Tags: ic.Expose.Tags}
-		instances = append(instances, &core.Instance{
-			Name: ic.Name, Realm: ic.Realm, Vault: ic.Vault,
-			Secrets: static.New(ic.Vault, stores[ic.Vault], exp, nil),
-			Exposes: exp.Allows,
-		})
-	}
-	svc := core.New(core.Options{
-		Authenticator: auth, Audit: sink,
-		PromptTimeout: cfg.Approval.PromptTimeout, MaxQueue: cfg.Approval.MaxQueue,
-		ShowClient: cfg.Approval.PromptShowClient, SkipAncestors: cfg.Approval.SkipAncestors,
-	}, instances, stores)
+	svc := newCore(cfg, auth, sink, v)
 	srv := server.New(server.Options{
 		Paths: paths, Instances: cfg.Instances, OpaquePeers: cfg.OpaquePeers,
 		Core: svc, Peers: peers, Version: version, Log: log,
 		MaxConnections: cfg.Limits.MaxConnections, IdleTimeout: cfg.Limits.IdleTimeout,
 	})
-	return &Built{Server: srv, Core: svc, Audit: sink, Stores: stores}, nil
+	return &Built{Server: srv, Core: svc, Audit: sink, Stores: v.stores}, nil
+}
+
+// Host is what the host CLI needs to manage vaults in its own process: the
+// same authenticator, vault files and audit log as the service, and no
+// sockets.
+type Host struct {
+	Core      *core.Service
+	Audit     plugin.AuditSink
+	Vaults    map[string]*vaultfile.Store
+	Protector plugin.KeyProtector
+}
+
+func BuildHost(cfg *config.Config, paths config.Paths, log *slog.Logger) (*Host, error) {
+	if cfg.Plugins.SecretStore != "vault-file" {
+		return nil, fmt.Errorf("the host CLI manages vault files; secret_store is %q (set secret_store = \"vault-file\")", cfg.Plugins.SecretStore)
+	}
+	auth, err := authenticator(cfg.Plugins.Authenticator)
+	if err != nil {
+		return nil, err
+	}
+	if TestBuild {
+		log.Warn("TEST BUILD: test-only plugins are available; never use this binary for real secrets")
+	}
+	v, err := openVaults(cfg, paths, log)
+	if err != nil {
+		return nil, err
+	}
+	sink, err := openAudit(cfg, paths)
+	if err != nil {
+		return nil, err
+	}
+	return &Host{Core: newCore(cfg, auth, sink, v), Audit: sink, Vaults: v.files, Protector: v.protector}, nil
 }

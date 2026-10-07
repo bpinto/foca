@@ -24,6 +24,10 @@ const (
 	TypeSecretList      = "secret.list"
 	TypeSecretRead      = "secret.read"
 	TypeSecretAdd       = "secret.add"
+	TypeSecretUpdate    = "secret.update"
+	TypeSecretRemove    = "secret.remove"
+	TypeVaultInit       = "vault.init"
+	TypeConfigReload    = "config.reload"
 	TypeLock            = "lock"
 	TypeRequestRejected = "request.rejected"
 )

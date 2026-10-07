@@ -86,6 +86,17 @@ func TestPromptWording(t *testing.T) {
 		{"name with words", PromptInput{Realm: ctr, Resources: refs("x"), Requester: plugin.Requester{
 			Peer: identity.VerifiedPeer{Exe: "/tmp/gh use GitHub PAT. Then let aws", PIDStable: true, Parents: []identity.Proc{conmon}}}, ShowClient: true},
 			"let ghuseGitHubPAT.Thenletaws ⚠ use x in container web, via conmon."},
+		// foca run: the command it will exec is the program, claimed; the
+		// agent that called foca run is via.
+		{"claimed run target", PromptInput{Realm: vm, Resources: refs("x"), Requester: plugin.Requester{Peer: ssh,
+			Reported: &identity.ClientInfo{Exe: "/usr/bin/foca", Target: &identity.Target{Exe: "/usr/bin/npm", Argv0: "npm"},
+				Parents: []identity.Proc{{Name: "bash"}, {Name: "claude"}}}}, ShowClient: true},
+			"let a program use x in VM dev. VM claims: npm via claude."},
+		// Verified identity keeps its verified names; a target can't take
+		// the sentence position.
+		{"verified with run target", PromptInput{Realm: host, Resources: refs("GitHub PAT"), Requester: plugin.Requester{Peer: local,
+			Reported: &identity.ClientInfo{Target: &identity.Target{Exe: "/usr/bin/npm", Argv0: "npm"}}}, ShowClient: true},
+			"let gh use GitHub PAT, via claude."},
 		{"add", PromptInput{Operation: "secret.add", Vault: "common", Resources: refs("New token"), ShowClient: true},
 			"add New token to vault common, visible to no instance."},
 	}

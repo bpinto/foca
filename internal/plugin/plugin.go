@@ -23,7 +23,15 @@ var (
 	ErrNotExposed = fmt.Errorf("%w: not exposed to this instance", ErrNotFound)
 	// ErrExists: a resource with this id already exists.
 	ErrExists = errors.New("already exists")
+	// ErrNotInitialized: the vault has not been created yet (foca init).
+	ErrNotInitialized = errors.New("vault not initialized")
 )
+
+// NotInitialized is ErrNotInitialized for a named vault.
+type NotInitialized struct{ Vault string }
+
+func (e NotInitialized) Error() string        { return "vault " + e.Vault + " is not initialized" }
+func (e NotInitialized) Is(target error) bool { return target == ErrNotInitialized }
 
 // ---- Authenticator ----
 
@@ -31,6 +39,9 @@ type ResourceRef struct {
 	Kind    string // "secret" | "action"
 	ID      string
 	Display string // trusted display name from the host
+	// Vault is the vault a secret is in, as named by its ID, "<vault>:<id>"
+	// (package secretname). Audit events name it.
+	Vault string
 }
 
 // Requester carries the three identity levels side by side, never merged.
@@ -85,13 +96,17 @@ type KeyProtector interface {
 	Destroy(ctx context.Context, ref KeyRef, sealed []byte) error
 }
 
+// DEKFunc returns a vault's data key and a function that zeroes and releases
+// it. Stores that don't encrypt (the in-memory test store) need none, so a
+// nil DEKFunc stands for "no key".
+type DEKFunc func(ctx context.Context) (dek []byte, release func(), err error)
+
 // ---- Secret store ----
 
 type SecretMeta struct {
 	ID          string    `json:"id"`
 	DisplayName string    `json:"display_name,omitempty"`
 	Description string    `json:"description,omitempty"`
-	Tags        []string  `json:"tags,omitempty"`
 	Created     time.Time `json:"created"`
 	Updated     time.Time `json:"updated,omitempty"`
 }
@@ -132,7 +147,6 @@ type SecretStore interface {
 type Resource struct {
 	Ref         ResourceRef
 	Description string
-	Tags        []string
 }
 
 type Result struct {

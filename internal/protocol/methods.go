@@ -46,10 +46,9 @@ type SecretListParams struct {
 }
 
 type SecretInfo struct {
-	Name        string   `json:"name"`
-	DisplayName string   `json:"display_name,omitempty"`
-	Description string   `json:"description,omitempty"`
-	Tags        []string `json:"tags,omitempty"`
+	Name        string `json:"name"`
+	DisplayName string `json:"display_name,omitempty"`
+	Description string `json:"description,omitempty"`
 }
 
 type SecretListResult struct {

@@ -35,6 +35,8 @@ func (m *Memory) Events() []Event {
 	return append([]Event(nil), m.mem.events...)
 }
 
+func (p *memPersister) begin() (uint64, func(), error) { return 0, func() {}, nil }
+
 func (p *memPersister) write(e *Event) error {
 	if err := p.fail.Load(); err != nil {
 		return *err

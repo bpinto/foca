@@ -150,7 +150,7 @@ testable on Linux with fakes.
    the service's uid.
 2. **Decode** the JSON-RPC request. Management methods are refused: they don't exist on any
    socket (§6.2).
-3. **Resolve** each named resource (`secret:<id>` or `action:<id>`) through its provider.
+3. **Resolve** each named resource (`secret:<vault>:<id>` or `action:<id>`) through its provider.
    Unknown names fail with `not_found`, which is still audited. Callers send **names only**,
    never definitions.
 4. **Validate parameters** against the host-declared constraints (actions only).
@@ -201,7 +201,7 @@ type ApprovalResult struct {
 
 - **The daemon builds prompt text only from trusted fields**: instance, operation, resolved
   resource names and validated params. Example:
-  `foca [dev]: read github-pat (via ssh forward)`. Callers can't supply a reason string,
+  `foca [dev]: read common:github-pat (via ssh forward)`. Callers can't supply a reason string,
   because a caller-chosen reason could put a reassuring lie on the prompt.
 - **The requesting process is shown on the prompt, labelled by trust level.** Only
   `guest-verified:` comes from the optional guest relay (§14). `<Realm> claims:` (e.g. `VM claims:`) is the client's own,
@@ -346,7 +346,6 @@ type SecretStore interface {
 }
 type SecretMeta struct {
     ID, DisplayName, Description string
-    Tags     []string
     Created, Updated time.Time
 }
 type SecretValue struct{ Bytes []byte }   // []byte, never string, so it can be zeroed
@@ -367,10 +366,13 @@ type Provider interface {
 }
 ```
 
-- `static` exposes vault secrets as `secret:<id>`. `Serve` decrypts one entry.
-- `Resolve` takes every name of a request at once, so a request unseals the vault's DEK and
+- `static` exposes vault secrets as `secret:<vault>:<id>`: a `Provider` per vault, filtered by
+  an instance's exposure, and `Vaults` over every vault the instance reads. A name says which
+  vault it is read from, and `Serve` decrypts one entry there.
+- `Resolve` takes every name of a request at once, so a request unseals each vault's DEK and
   reads its metadata once however many names it carries. Unknown names get a per-name
-  `not_found` (or `not_exposed`, which matches it).
+  `not_found` (or `not_exposed`, which matches it), and so do names in a vault the instance
+  doesn't read. A name in a vault not created yet is `not_initialized`.
 - `command` exposes config-declared actions as `action:<id>` (§11).
 - Later: `oauth-refresh`.
 - `Serve` is only ever called by the core after a successful approval. Providers never see raw
@@ -597,9 +599,9 @@ the host, working directly on host files:
 
 | Host CLI operation | How | Approval |
 |---|---|---|
-| `init`, `add`, `edit`, `remove`, `reset` | takes an exclusive `flock` on the vault, asks through the configured authenticator, unseals the DEK through the key protector, writes atomically, appends the audit event | **yes** |
+| `init`, `add`, `edit`, `remove` (`reset` is reserved, not built) | takes an exclusive `flock` on the vault, asks through the configured authenticator, unseals the DEK through the key protector, writes atomically, appends the audit event | **yes** |
 | `lock` (wipe now) | sends `SIGUSR1` to the service | no (tightening) |
-| `reload` (config) | sends `SIGHUP`; a config that fails validation keeps the old one | no |
+| `reload` (config) | checks the config, then sends `SIGHUP`; a config that fails validation keeps the old one. A good one replaces the running service: open connections close and pending approvals are cancelled | no |
 | `stop` | sends `SIGTERM`, or uses launchctl / systemctl | no |
 | `events` | reads the audit log (§8.5) | no |
 
@@ -646,9 +648,13 @@ could follow what other realms do.
 
 ### 6.4 Secret values on the wire
 
-`secret.read` returns `{"secrets":[{"name":"github-pat","value":"…","encoding":"utf8"}]}`.
-Non-UTF-8 values use `"encoding":"base64"`. Clients write values only to a pipe, a file
-(0600), or a child's environment. The CLI refuses to write a value to a TTY.
+`secret.read` returns `{"secrets":[{"name":"common:github-pat","value":"…","encoding":"utf8"}]}`.
+Non-UTF-8 values use `"encoding":"base64"`, and so do UTF-8 values that escaping would make
+longer than base64 (control characters take six bytes each as JSON). Values whose answer
+wouldn't fit in one message are refused with `invalid_params` ("read fewer at a time") after
+approval and before anything is served; each read is recorded as `secret.read` with outcome
+`error` and `reason: response_too_large`. Clients write values only to a pipe, a file (0600),
+or a child's environment. The CLI refuses to write a value to a TTY.
 
 - `get --output FILE` checks the destination before asking the service: it must be a new
   file in an existing directory, or an existing regular file of the user's, never a symlink,
@@ -699,33 +705,43 @@ How much is shared is a **user preference**, not built into the architecture:
 
 | Preference | Config | Effect |
 |---|---|---|
-| **Separate per realm** (default, most secure) | each instance gets its own vault, named after the instance | a realm can only ever see its own vault; different DEK, different Keychain entry |
-| **Partly shared** | instances `dev` and `work` both use vault `common`, each with its own `expose` list | one place to manage common tokens; each realm sees only what it lists |
-| **Everything to everything** | one vault, every instance `expose = "*"` and `actions = "*"` | single source; each realm still has its own socket, so prompts and audit still say *which* realm asked |
+| **Separate per realm** (default, most secure) | no `expose`: each instance reads its own vault, named after the instance | a realm can only ever see its own vault; different DEK, different Keychain entry |
+| **Partly shared** | `dev` reads `["dev:*", "common:github-pat"]`, `work` reads `["common:*"]` | private secrets stay in each realm's vault; common tokens are managed in one place, and each realm reads only what it lists |
+| **Everything to everything** | one vault, every instance `expose = ["common:*"]` and `actions = "*"` | single source; each realm still has its own socket, so prompts and audit still say *which* realm asked |
 
 **Defaults and safeguards**
 
-1. **No `vault` key means a private vault.** An instance without one gets a private vault
-   named after itself, and implicitly `expose = "*"` for it.
-2. **Sharing is never implicit.** If two or more instances reference the same vault, every one
-   of them **must** set `expose` explicitly; otherwise it is a config error. `expose = "*"` is
-   allowed, but it must be written. This stops a copy-pasted vault name from silently sharing
-   everything.
-3. **Exposure only narrows.** `expose` is a list of secret ids or tag selectors
-   (`"tag:github"`). A secret outside it is reported as `not_found` to that instance, exactly
-   like a secret that doesn't exist. Requests for it are audited as `not_found` with
-   `reason: not_exposed`, so the host can see the attempt while the realm can't learn the
-   secret exists.
-4. **Actions are opt-in per instance.** `actions = ["aws-creds"]` lists them; `"*"` is
+1. **No `expose` means a private vault.** An instance without one reads all of a private
+   vault named after itself, as if it had `expose = ["<name>:*"]`.
+2. **`expose` names every vault.** Each entry is `"<vault>:*"` (all of it) or
+   `"<vault>:<secret>"`. The vaults an instance reads are exactly the ones its list names.
+   A vault other than the instance's own private one must be declared in `[vaults]`, so a
+   typo can't create a vault, and an entry that repeats or overlaps another is an error.
+3. **Sharing is never implicit.** If another instance reads a vault that an instance has
+   implicitly, through having no `expose`, that is a config error: the instance must say what
+   it reads. This stops a copy-pasted vault name from silently sharing everything.
+4. **Exposure only narrows, and only config decides it.** A secret outside `expose` is
+   reported as `not_found` to that instance, exactly like a secret that doesn't exist.
+   Requests for it are audited as `not_found` with `reason: not_exposed`, so the host can see
+   the attempt while the realm can't learn the secret exists. Bursts of them share a
+   coalescing window with unknown names (§9.6), so not even whether an event was written tells
+   them apart. Nothing stored in a vault takes
+   part in exposure: a vault edit can never change who reads a secret.
+5. **A secret is named by its vault.** Its full name is `<vault>:<id>`, everywhere: realms
+   ask for `common:github-pat`, and prompts, grants, policy (`[secrets."common:github-pat"]`),
+   `env_secrets` and the audit log use the same name. Two vaults can hold the same id; they
+   are two secrets, and no name ever stands for either. A realm sees the names of the vaults
+   it reads, and nothing of the others. Moving a secret to another vault changes its name.
+6. **Actions are opt-in per instance.** `actions = ["aws-creds"]` lists them; `"*"` is
    allowed but must be written. No `actions` key means no actions.
-5. **Policy still folds "stricter wins"**, now with a vault level and an instance level (§9.2).
-   Sharing a vault never loosens a secret's policy in any realm.
-6. **Host CLI operations name the vault** (`foca add --vault common …`). Tag selectors
-   make vault metadata part of exposure: adding or retagging a secret can make it visible to
-   another realm. So the **approval prompt** for an add or edit names every realm that will
-   see the secret, e.g. `add npm token to vault common, visible in VM dev and VM work.`, and
-   the `secret.add` event records them in `params.visible_to`. CLI output shows the same.
-7. **One socket forwarded to many realms is possible, but discouraged.** The host can't tell
+7. **Policy still folds "stricter wins"**, with a vault level, the vault the secret is in,
+   and an instance level (§9.2). Sharing a vault never loosens a secret's policy in any realm.
+8. **Host CLI operations name the vault** through the secret's full name
+   (`foca add common:npm-token`). The **approval prompt** for an add, edit or
+   remove names every realm that reads the secret, e.g. `add npm token to vault common,
+   visible in VM dev and VM work.`, and the event records them in `params.visible_to` (or
+   `hidden_from` for a remove). CLI output shows the same.
+9. **One socket forwarded to many realms is possible, but discouraged.** The host can't tell
    those realms apart, so prompts and audit can't say which one asked. Sharing a vault between
    separate instances gives the same "everything everywhere" result without losing that.
 
@@ -752,8 +768,9 @@ setups:
 | instance (CLI on the host) | the only one, if there is just one | `--instance`, `FOCA_INSTANCE` |
 | client socket (client side) | `~/.foca.sock` if it exists, else the instance's `client.sock` | `--socket`, `FOCA_SOCK` |
 
-Example host config: VMs `dev` and `work` share a `common` vault, a Linux-style container
-`web` has its own vault, and AWS actions are offered only to `dev`.
+Example host config: VMs `dev` and `work` share a `common` vault, `dev` also reads its own
+private vault, a Linux-style container `web` reads only its own, and AWS actions are offered
+only to `dev`.
 
 ```toml
 version      = 1
@@ -780,24 +797,20 @@ max_queue      = 4                 # pending prompts per service; more -> busy
 max_connections = 32
 idle_timeout    = "2m"
 
-[vaults.common]                    # shared by dev and work (each must set expose)
-[vaults.web]                       # optional: an instance without `vault` gets a private one anyway
+[vaults.common]                    # shared, so declared; private vaults need no table
 
 # ---- instances: one per realm ----
 [instances.dev]
 realm   = { kind = "vm", name = "dev", peers = "opaque" }
-vault   = "common"
-expose  = ["github-pat", "tag:npm"]
+expose  = ["dev:*", "common:github-pat", "common:npm-token"]
 actions = ["aws-creds", "aws-sso-login"]
 
 [instances.work]
 realm   = { kind = "vm", name = "work", peers = "opaque" }
-vault   = "common"
-expose  = "*"                      # explicit: required because the vault is shared
+expose  = ["common:*"]
 
-[instances.web]
+[instances.web]                    # no expose: all of its private vault "web"
 realm   = { kind = "container", name = "web", peers = "direct" }
-vault   = "web"
 
 # ---- policy: every table is optional; leaving one out means "no opinion" (§9) ----
 [instances.dev.policy]             # instance level
@@ -813,7 +826,7 @@ window   = "2h"
 approval = "reuse"
 window   = "1h"
 
-[secrets.prod-db-password.policy]  # secret level (secret ids are unique across vaults)
+[secrets."common:prod-db-password".policy]  # secret level, by full name
 approval = "every-time"
 
 [actions.aws-creds]                # §11
@@ -831,9 +844,9 @@ env         = { HOME = "/Users/bruno", PATH = "/usr/bin:/bin" }
   scope    = "peer-session"
 ```
 
-In this example, reading `github-pat` from `dev` folds instance 30m, vault 2h and
-authenticator 1h, which gives reuse for 30m within `peer-session`. Reading `prod-db-password`
-from `work` is always every-time, whatever the other levels say.
+In this example, reading `common:github-pat` from `dev` folds instance 30m, vault 2h and
+authenticator 1h, which gives reuse for 30m within `peer-session`. Reading
+`common:prod-db-password` from `work` is always every-time, whatever the other levels say.
 
 ---
 
@@ -865,7 +878,7 @@ continues.
   "outcome": "ok",
   "request_id": "01J9Z8K3H…",
   "origin": "client-socket",
-  "resource": { "kind": "secret", "id": "github-pat" },
+  "resource": { "kind": "secret", "id": "common:github-pat" },
   "params": null,
   "approval": {
     "id": "01J9Z8K3J…",
@@ -925,7 +938,7 @@ continues.
 `server.start` · `server.stop` · `config.load` · `config.reload` · `approval.granted` ·
 `approval.denied` · `approval.reused` · `approval.timeout` · `secret.list` · `secret.read` ·
 `action.list` · `action.run` · `secret.add` · `secret.update` · `secret.remove` · `vault.init`
-· `vault.reset` · `grants.drop` · `lock` (with `reason`: `sleep`, `screen-lock`,
+· `vault.reset` (reserved for `reset`, not built) · `grants.drop` · `lock` (with `reason`: `sleep`, `screen-lock`,
 `session-end`, `shutdown`, `manual`, `expired`, `events-unhealthy`) · `request.rejected`.
 
 `request.rejected` covers every request the socket refuses before it reaches the pipeline,
@@ -1016,7 +1029,7 @@ VM session, VM session + program) from blurring:
    wins". `grants.drop` is the only thing a caller can do to its grants.
 6. **The prompt states how far the approval reaches.** If approving creates a grant, the
    prompt says so in plain words, for example:
-   `Approve read github-pat? Also allows silent reads for 15m by: anything in VM dev`, or
+   `Approve read common:github-pat? Also allows silent reads for 15m by: anything in VM dev`, or
    `… by: aws (guest-verified) in the same VM session`.
 7. **`foca policy explain` shows the same wording.** It runs on the host CLI, reading config only
    and prints the effective policy for every secret and action in that plain-language form,
@@ -1030,8 +1043,8 @@ VM session, VM session + program) from blurring:
 The order does not matter.
 
 1. instance: `[instances.<name>.policy]`
-2. vault: `[vaults.<name>.policy]` (secrets only)
-3. resource: `[secrets.<id>.policy]` or `[actions.<id>.policy]`
+2. vault: `[vaults.<name>.policy]` of the vault the secret is in (secrets only)
+3. resource: `[secrets."<vault>:<id>".policy]` or `[actions.<id>.policy]`
 4. authenticator: `[authenticators.<name>.policy]`
 5. code floor: `Reuse{window: 8h, scope: peer-session}`. This is the hard cap and is not
    configurable. Even `instance` scope is capped at `peer-session` unless a future decision says
@@ -1061,9 +1074,8 @@ What follows:
 - With no config, everything is `EveryTime`.
 - Opt-in happens wherever reuse is explicitly enabled, and any other level can veto or shorten
   it.
-- The vault cannot contain policy, so a vault edit can't loosen a policy. It can widen
-  exposure through tags (§7.1 rule 6), which is why add and edit prompts name every realm that
-  will see the secret.
+- The vault cannot contain policy or exposure, so a vault edit can't loosen a policy or
+  widen who reads a secret (§7.1 rule 4).
 
 ### 9.4 Limits (in code)
 
@@ -1180,7 +1192,7 @@ planned but not built (§17).
 ```json
 {
   "format": "foca-vault", "version": 1,
-  "vault_id": "01J…", "instance": "dev", "cipher": "aes-256-gcm",
+  "vault_id": "01J…", "vault": "common", "cipher": "aes-256-gcm",
   "key_slots": [
     { "type": "keychain",   "sealed": "<base64>" },
     { "type": "passphrase", "kdf": "argon2id",
@@ -1198,8 +1210,15 @@ planned but not built (§17).
   so the plaintext file doesn't reveal secret names.
 - **Per-entry encryption.** Reading one secret decrypts only that one, which keeps less
   plaintext in memory than decrypting the whole vault.
-- **AAD** = `format|version|vault_id|instance|<entry-id or "meta">`. Ciphertexts can't be
-  swapped between entries, vaults or instances.
+- **AAD** = `format|version|vault_id|vault|<entry-id or "meta">`. Ciphertexts can't be
+  swapped between entries or vaults. A vault can be shared by several instances (D20), so
+  the header and AAD name the vault, not an instance.
+- **Parsed strictly.** The file, and its metadata once decrypted, follow the protocol's
+  rules (§6): unknown, duplicate or case-variant keys and trailing data are refused, so no
+  two readers can find different contents in the same bytes.
+- **A write in doubt is kept.** If the directory `fsync` after the `rename` (below) fails,
+  the new file is already the one readers see. The write reports that it may not survive a
+  crash, but nothing is rolled back: `init` keeps the protector entry the new file needs.
 - **Fresh 96-bit random nonce on every write.** Writes are atomic: temp file in the same
   directory, `fsync`, `rename`, `fsync` the directory. Mode 0600, data dir 0700.
 - The passphrase slot is optional and set by `foca init --recovery` through an
@@ -1261,7 +1280,7 @@ environment, so the VM gets only the result:
 [actions.gh-pr-list]
 command      = "/…/bin/gh"
 args         = ["pr", "list", "--repo", "{repo}"]
-env_secrets  = { GH_TOKEN = "github-pat" }   # vault secret → child env, on the host
+env_secrets  = { GH_TOKEN = "common:github-pat" }   # vault secret → child env, on the host
 mask_output  = true                          # default true when env_secrets is set
   [actions.gh-pr-list.params.repo]
   pattern = "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
@@ -1331,8 +1350,16 @@ Secret values; the DEK; the ability to run host actions; config integrity; audit
 - **The user approving blindly.** We reduce prompt fatigue with batching and opt-in reuse, but
   we can't stop someone from approving everything.
 - **Same-user malware on the host, or root.** Such code can:
-  - run the host CLI, though management still needs approval;
-  - read daemon memory (debugger, `/proc/<pid>/mem` without Yama);
+  - run the host CLI. Managing secrets (`add`, `edit`, `remove`, `init`, `recover`) still
+    needs approval, but changing policy doesn't: the config is the user's own file, so such
+    code can edit it (expose a vault to another instance, allow reuse with a long window,
+    offer an action) and `foca reload` with no prompt. A reload drops every grant, so under
+    the loosened policy a read or action still needs at least one approval, and the reload
+    and every access are audited;
+  - on macOS, read daemon memory (a debugger). On Linux the service and the host commands
+    that unseal a vault (`init`, `add`, `edit`, `remove`) aren't dumpable, so only root can
+    attach to them or read their memory, environment or executable through `/proc`. Socket
+    clients stay readable: the service identifies them through `/proc`;
   - drive the helper;
   - under ad-hoc signing, read the plain Keychain item holding the DEK, because Touch ID is
     enforced by our code and not by the item (§5).
@@ -1505,7 +1532,7 @@ and the relay service.
 ## 15. Repository layout
 
 ```
-cmd/foca/            main: serve and the CLI subcommands
+cmd/foca/            main: runs internal/cli (serve and every CLI subcommand)
 internal/protocol/        wire contract shared by both sides: JSON-RPC framing, method types, error codes
 internal/client/          protocol client (CLI, tests, later the relay); must not import service-side code
 internal/cli/             CLI commands
@@ -1513,14 +1540,15 @@ internal/server/          listeners, per-connection identification, method dispa
 internal/server/core/     request → approval → audit pipeline, prompt text, prompt queue
 internal/server/wiring/   config → plugins; test-only plugins gated by the foca_testing tag
 internal/plugin/          plugin interfaces
-internal/plugins/…        authn/fake, store/memory, provider/static, peer (linux); later
-                          darwin, keyprot/*, store/vaultfile, provider/command, events/*
+internal/plugins/…        authn/fake, store/memory, store/vaultfile, keyprot/file, provider/static,
+                          peer (linux); later darwin, keyprot/*, provider/command, events/*
 internal/audit/           event types (v1) + sinks: memory, jsonl
 internal/config/          TOML load and validation, paths
 internal/identity/        host-verified, guest-verified and reported identity, one distinct type each
-internal/fsutil/          trusted-file and private-directory checks
+internal/fsutil/          trusted-file and private-directory checks, atomic writes, file locks
+internal/svcctl/          serve.pid and verified signalling for reload / stop
 internal/ids/             sortable ids
-internal/format/          output formatters
+internal/format/          output formatters: raw, json, env
 helpers/darwin/           Swift package: foca-darwin
 flake.nix                 dev shell (go, gopls, socat; gcc only for `go test -race`)
 ```
@@ -1565,17 +1593,17 @@ noted; packages are named as in `go test` output (`main` is `cmd/foca`, whose te
 | prompts: claims never stated as fact, unsealed names marked, no name elided | `core.TestPromptWording`, `core.TestPromptNeverElidesCredentials`, `core.TestOversizedBatchRefusedBeforePrompting`, `peer.TestMountsCantLendASealedName`, `peer.TestLoadedCodeMustBeSealedToo` |
 | a realm can't exhaust the service or flood the log | `server.TestConnectionCapPerInstance` |
 | config rejections and file trust | `config.TestRejections`, `config.TestLoadChecksFileTrust` |
-| test-only plugins unreachable in a production build | `wiring.TestFakeAuthenticatorRefusedInProductionBuild` |
+| test-only plugins unreachable in a production build | `wiring.TestFakeAuthenticatorRefusedInProductionBuild`, `cli.TestServiceDoesNotImportCLIUI` |
 | **Vaults, exposure and the host CLI** | |
 | a vault shared without explicit `expose` is a config error | `config.TestImplicitPrivateVaultCollisionCountsAsSharing` |
-| an unexposed secret looks like `not_found` and is audited; private vaults can't see each other | `core.TestUnexposedLooksLikeMissingButIsAuditedWithReason` |
-| crypto round trip; AAD swaps and ambiguous files refused | — |
-| atomic writes | — |
-| no secret in argv; no value written to a terminal | — |
-| formatters | — |
-| add, edit and remove name every realm affected | `core.TestAddNamesEveryRealmThatWillSeeTheSecret` |
-| signals only reach a verified service | — |
-| key holders hide their memory | — |
+| an unexposed secret looks like `not_found` and is audited; private vaults can't see each other | `core.TestUnexposedLooksLikeMissingButIsAuditedWithReason`, `cli.TestHostCLIAndClientEndToEnd` |
+| crypto round trip; AAD swaps and ambiguous files refused | `vaultfile.TestCryptoRoundTrip`, `vaultfile.TestAADSwapRejected`, `vaultfile.TestAmbiguousVaultFilesAreRefused` |
+| atomic writes | `fsutil.TestWriteFileAtomicNeverLeavesAPartialFile` |
+| no secret in argv; no value written to a terminal | `cli.TestNoSecretInArgv`, `cli.TestGetRefusesTerminalBeforeAsking`, `main.TestBinaryServeGetReloadStop` |
+| formatters | `format.TestJSONGolden`, `format.TestEnvGolden`, `format.TestEnvRefusesWhatItCantHold` |
+| add, edit and remove name every realm affected | `core.TestAddNamesEveryRealmThatWillSeeTheSecret`, `core.TestEditNamesEveryRealmThatReadsIt`, `core.TestRemoveNamesRealmsThatLoseIt` |
+| signals only reach a verified service | `svcctl.TestSignalRefusesUnverifiedProcesses`, `svcctl.TestSignalRefusesOtherUID` |
+| key holders hide their memory | `main.TestBinaryKeyHoldersHideTheirMemory` |
 | `--only` never splits a vault; one process per instance | — |
 | **Policy, grants and wipes** | |
 | lattice laws; no setting loosens; the 8 h cap | — |
@@ -1600,7 +1628,7 @@ noted; packages are named as in `go test` output (`main` is `cmd/foca`, whose te
 | helper conformance and the macOS peer identifier (on a Mac, in CI) | — |
 | **Events** | |
 | paging and filters | — |
-| backfill + live with no gaps, across writers and rotations | — |
+| backfill + live with no gaps, across writers and rotations | `audit.TestJSONLSeqUniqueAcrossProcesses` |
 | recorded names can't act on the terminal | — |
 | **Guest relay** | |
 | bad or missing `relay.hello` refused | — |
@@ -1616,8 +1644,6 @@ noted; packages are named as in `go test` output (`main` is `cmd/foca`, whose te
 
 **Not built**
 
-- The encrypted vault file, its key protector and the host CLI (`init`, `add`, `edit`,
-  `remove`, `get`, `run`, `reload`, `stop`): secrets live in the in-memory store only.
 - Reuse: policy levels, grants, denial backoff and wipes, the logind events source, `lock`
   and `policy explain`. Every access asks.
 - The `foca-darwin` helper (Touch ID, the Keychain protector, sleep and lock events) and
@@ -1630,8 +1656,12 @@ noted; packages are named as in `go test` output (`main` is `cmd/foca`, whose te
 - Nix packaging, and `serve --only` for one process per instance or group.
 - The guest relay, guest-verified identity and the `guest-*` scopes, which are a config
   error until then.
-- `[approval] list_requires_approval` (D16); the `secure-enclave`, `libsecret` and
-  `keyring` key protectors.
+- A command that opens a vault with its recovery passphrase: `init --recovery` writes the
+  slot, but nothing reads it yet.
+- On macOS, `reload` and `stop` match the service by its command name only, without
+  pinning its pid.
+- `foca reset` and its `vault.reset` event; `[approval] list_requires_approval` (D16); a
+  custom `--format`; the `secure-enclave`, `libsecret` and `keyring` key protectors.
 - macOS container runtimes' proxies in the default `opaque_peers` (§2.1).
 
 ---

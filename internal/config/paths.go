@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 )
 
 // Paths are the resolved locations a service uses.
@@ -25,7 +26,8 @@ type Overrides struct {
 // getenv is injected so tests don't depend on the real environment.
 func ResolvePaths(o Overrides, getenv func(string) string) (Paths, error) {
 	home := getenv("HOME")
-	pick := func(flag, env, xdg, xdgFallback string) (string, error) {
+	// fallback is the whole directory to use when neither is set.
+	pick := func(flag, env, xdg, fallback string) (string, error) {
 		if flag != "" {
 			return filepath.Abs(flag)
 		}
@@ -35,27 +37,33 @@ func ResolvePaths(o Overrides, getenv func(string) string) (Paths, error) {
 		if v := getenv(xdg); v != "" {
 			return filepath.Join(v, "foca"), nil
 		}
-		if xdgFallback == "" {
+		if fallback == "" {
 			return "", fmt.Errorf("cannot determine %s: set %s", env, env)
 		}
-		return filepath.Join(xdgFallback, "foca"), nil
+		return fallback, nil
 	}
 	var p Paths
 	var err error
-	if p.Config, err = pick(o.Config, "FOCA_CONFIG", "XDG_CONFIG_HOME", join(home, ".config")); err != nil {
+	if p.Config, err = pick(o.Config, "FOCA_CONFIG", "XDG_CONFIG_HOME", join(home, ".config/foca")); err != nil {
 		return p, err
 	}
 	if o.Config == "" && getenv("FOCA_CONFIG") == "" {
 		p.Config = filepath.Join(p.Config, "config.toml")
 	}
-	if p.DataDir, err = pick(o.DataDir, "FOCA_DATA_DIR", "XDG_DATA_HOME", join(home, ".local/share")); err != nil {
+	if p.DataDir, err = pick(o.DataDir, "FOCA_DATA_DIR", "XDG_DATA_HOME", join(home, ".local/share/foca")); err != nil {
 		return p, err
 	}
+	// Without XDG_RUNTIME_DIR (cron, su, ssh without pam_systemd) the
+	// runtime directory is foca-<uid> in the temporary directory. A shared
+	// name such as /tmp/foca could be created first by another local user:
+	// the service then couldn't start, and the CLI could reach a socket that
+	// user listens on.
 	tmp := getenv("TMPDIR")
 	if tmp == "" {
 		tmp = os.TempDir()
 	}
-	if p.RuntimeDir, err = pick(o.RuntimeDir, "FOCA_RUNTIME_DIR", "XDG_RUNTIME_DIR", tmp); err != nil {
+	runtimeFallback := filepath.Join(tmp, "foca-"+strconv.Itoa(os.Getuid()))
+	if p.RuntimeDir, err = pick(o.RuntimeDir, "FOCA_RUNTIME_DIR", "XDG_RUNTIME_DIR", runtimeFallback); err != nil {
 		return p, err
 	}
 	return p, nil
@@ -78,6 +86,19 @@ func (p Paths) ClientSocket(instance string) string {
 }
 
 func (p Paths) AuditLog() string { return filepath.Join(p.DataDir, "audit.jsonl") }
+
+// VaultsDir holds one encrypted file per vault.
+func (p Paths) VaultsDir() string { return filepath.Join(p.DataDir, "vaults") }
+
+func (p Paths) VaultFile(vault string) string {
+	return filepath.Join(p.VaultsDir(), vault+".fcv")
+}
+
+// KeysDir holds the file key protector's keys (insecure, opt-in).
+func (p Paths) KeysDir() string { return filepath.Join(p.DataDir, "keys") }
+
+// PIDFile is where serve records its pid so the host CLI can signal it.
+func (p Paths) PIDFile() string { return filepath.Join(p.RuntimeDir, "serve.pid") }
 
 // MaxSocketPath is the longest usable Unix socket path on this OS (sun_path
 // minus the terminating NUL).

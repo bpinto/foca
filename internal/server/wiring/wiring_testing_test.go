@@ -46,7 +46,7 @@ func TestBuildFromConfigEndToEnd(t *testing.T) {
 	}
 	defer c.Close()
 	var res protocol.SecretReadResult
-	if err := c.Call(ctx, protocol.MethodSecretRead, protocol.SecretReadParams{Names: []string{"tok"}}, &res); err != nil {
+	if err := c.Call(ctx, protocol.MethodSecretRead, protocol.SecretReadParams{Names: []string{"dev:tok"}}, &res); err != nil {
 		t.Fatal(err)
 	}
 	if res.Secrets[0].Value != "v1" {

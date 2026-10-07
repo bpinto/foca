@@ -31,7 +31,7 @@ func TestMinimalDefaults(t *testing.T) {
 	if inst.Realm != want {
 		t.Fatalf("realm %+v", inst.Realm)
 	}
-	if inst.Vault != "dev" || !inst.Expose.All || inst.SharedVault {
+	if strings.Join(inst.Vaults(), ",") != "dev" || !inst.Expose["dev"].All {
 		t.Fatalf("private vault defaults wrong: %+v", inst)
 	}
 	if c.Approval.PromptTimeout != time.Minute || c.Approval.MaxQueue != 4 || !c.Approval.PromptShowClient {
@@ -54,19 +54,20 @@ func TestRejections(t *testing.T) {
 		"no instances": {`version = 1
 [plugins]
 authenticator = "fake"`, "at least one"},
-		"bad instance name":       {strings.Replace(minimal, "instances.dev", "instances.Dev", 1), "instance name"},
-		"timeout too long":        {minimal + "\n[approval]\nprompt_timeout = \"2h\"\n", "outside"},
-		"timeout typo":            {minimal + "\n[approval]\nprompt_timeout = \"30\"\n", "missing unit"},
-		"queue too big":           {minimal + "\n[approval]\nmax_queue = 1000\n", "max_queue"},
-		"vm claims direct":        {strings.Replace(minimal, `{ kind = "vm" }`, `{ kind = "vm", peers = "direct" }`, 1), "always opaque"},
-		"container without peers": {strings.Replace(minimal, `{ kind = "vm" }`, `{ kind = "container" }`, 1), "must set peers"},
-		"unknown realm kind":      {strings.Replace(minimal, `{ kind = "vm" }`, `{ kind = "jail" }`, 1), "unknown kind"},
-		"undeclared vault":        {minimal + "vault = \"common\"\n", "not declared"},
-		"expose star in list":     {minimal + "expose = [\"*\"]\n", `use expose = "*"`},
-		"expose bad id":           {minimal + "expose = [\"../etc\"]\n", "invalid secret id"},
-		"no connections":          {minimal + "\n[limits]\nmax_connections = 0\n", "max_connections"},
-		"too many connections":    {minimal + "\n[limits]\nmax_connections = 5000\n", "max_connections"},
-		"idle timeout too short":  {minimal + "\n[limits]\nidle_timeout = \"1s\"\n", "idle_timeout"},
+		"bad instance name":            {strings.Replace(minimal, "instances.dev", "instances.Dev", 1), "instance name"},
+		"timeout too long":             {minimal + "\n[approval]\nprompt_timeout = \"2h\"\n", "outside"},
+		"timeout typo":                 {minimal + "\n[approval]\nprompt_timeout = \"30\"\n", "missing unit"},
+		"queue too big":                {minimal + "\n[approval]\nmax_queue = 1000\n", "max_queue"},
+		"vm claims direct":             {strings.Replace(minimal, `{ kind = "vm" }`, `{ kind = "vm", peers = "direct" }`, 1), "always opaque"},
+		"container without peers":      {strings.Replace(minimal, `{ kind = "vm" }`, `{ kind = "container" }`, 1), "must set peers"},
+		"unknown realm kind":           {strings.Replace(minimal, `{ kind = "vm" }`, `{ kind = "jail" }`, 1), "unknown kind"},
+		"no connections":               {minimal + "\n[limits]\nmax_connections = 0\n", "max_connections"},
+		"too many connections":         {minimal + "\n[limits]\nmax_connections = 5000\n", "max_connections"},
+		"idle timeout too short":       {minimal + "\n[limits]\nidle_timeout = \"1s\"\n", "idle_timeout"},
+		"vault-file without protector": {strings.Replace(minimal, "[plugins]", "[plugins]\nsecret_store = \"vault-file\"", 1), "key_protector is required"},
+		"file protector not opted in":  {strings.Replace(minimal, "[plugins]", "[plugins]\nsecret_store = \"vault-file\"\nkey_protector = \"file\"", 1), "insecure_file_protector = true"},
+		"opt-in without file":          {strings.Replace(minimal, "[plugins]", "[plugins]\nsecret_store = \"vault-file\"\nkey_protector = \"keychain\"\ninsecure_file_protector = true", 1), "not \"file\""},
+		"protector without vault-file": {strings.Replace(minimal, "[plugins]", "[plugins]\nkey_protector = \"file\"", 1), "only used with"},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -78,60 +79,90 @@ authenticator = "fake"`, "at least one"},
 	}
 }
 
-func TestSharedVaultRequiresExplicitExposeOnEveryUser(t *testing.T) {
-	base := `
+func TestExposeNamesTheVaultsAnInstanceReads(t *testing.T) {
+	c, err := Parse([]byte(`
 version = 1
 [plugins]
 authenticator = "fake"
+secret_store = "memory"
 [vaults.common]
+[vaults.team]
 [instances.dev]
 realm = { kind = "vm" }
-vault = "common"
-expose = ["github-pat", "tag:npm"]
+expose = ["dev:*", "common:github-pat", "common:npm-token", "team:*"]
 [instances.work]
 realm = { kind = "vm" }
-vault = "common"
-`
-	_, err := Parse([]byte(base))
-	if err == nil || !strings.Contains(err.Error(), "instances.work: vault \"common\" is shared with dev") {
-		t.Fatalf("missing expose on shared vault not rejected: %v", err)
-	}
-
-	c, err := Parse([]byte(base + "expose = \"*\"\n"))
+expose = ["common:*"]
+`))
 	if err != nil {
 		t.Fatal(err)
 	}
 	dev, _ := c.Instance("dev")
 	work, _ := c.Instance("work")
-	if !dev.SharedVault || dev.Expose.All || len(dev.Expose.IDs) != 1 || dev.Expose.Tags[0] != "npm" {
-		t.Fatalf("dev %+v", dev)
+	if got := dev.Vaults(); strings.Join(got, ",") != "common,dev,team" {
+		t.Fatalf("dev reads %v", got)
 	}
-	if !work.Expose.All {
-		t.Fatalf("work %+v", work)
+	if !dev.Exposes("common", "github-pat") || dev.Exposes("common", "prod-db") || !dev.Exposes("dev", "x") || dev.Exposes("work", "x") {
+		t.Fatalf("dev exposes %+v", dev.Expose)
+	}
+	if got := work.Vaults(); strings.Join(got, ",") != "common" {
+		t.Fatalf("work reads %v", got)
+	}
+	if strings.Join(c.Vaults, ",") != "common,dev,team" {
+		t.Fatalf("vaults %v", c.Vaults)
+	}
+}
+
+func TestExposeRejections(t *testing.T) {
+	head := "version = 1\n[plugins]\nauthenticator = \"fake\"\nsecret_store = \"memory\"\n[vaults.common]\n[instances.dev]\nrealm = { kind = \"vm\" }\n"
+	for name, tc := range map[string]struct{ expose, want string }{
+		"undeclared vault":  {`["work:*"]`, `instances.dev.expose: vault "work" is not declared in [vaults]`},
+		"not a list":        {`"*"`, `expose must be a list of "<vault>:*" and "<vault>:<secret>"`},
+		"empty":             {`[]`, "expose is empty"},
+		"no vault":          {`["github-pat"]`, `"github-pat" must be "<vault>:*" or "<vault>:<secret>"`},
+		"bad vault name":    {`["Common:*"]`, `invalid vault name "Common"`},
+		"bad secret name":   {`["common:../etc"]`, `invalid secret name "../etc"`},
+		"tag selector":      {`["common:tag:npm"]`, `invalid secret name "tag:npm"`},
+		"star and a name":   {`["common:*", "common:a"]`, `"common:a" overlaps`},
+		"name and a star":   {`["common:a", "common:*"]`, `"common:*" overlaps`},
+		"listed twice":      {`["common:a", "common:a"]`, `"common:a" is listed twice`},
+		"star twice":        {`["common:*", "common:*"]`, `"common:*" overlaps`},
+		"not strings":       {`[1]`, "expose entries must be strings"},
+		"old vault key set": {`["common:*"]` + "\nvault = \"common\"", "unknown keys: instances.dev.vault"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := Parse([]byte(head + "expose = " + tc.expose + "\n"))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("got %v, want %q", err, tc.want)
+			}
+		})
 	}
 }
 
 func TestImplicitPrivateVaultCollisionCountsAsSharing(t *testing.T) {
-	// "work" points at the vault "dev" gets implicitly; dev never opted in.
+	// "work" reads the vault "dev" gets implicitly; dev never opted in.
 	cfg := `
 version = 1
 [plugins]
 authenticator = "fake"
+secret_store = "memory"
 [vaults.dev]
 [instances.dev]
 realm = { kind = "vm" }
 [instances.work]
 realm = { kind = "vm" }
-vault = "dev"
-expose = "*"
+expose = ["dev:*"]
 `
 	_, err := Parse([]byte(cfg))
-	if err == nil || !strings.Contains(err.Error(), "instances.dev: vault \"dev\" is shared") {
+	if err == nil || !strings.Contains(err.Error(), "instances.dev: vault \"dev\" is shared with work") {
 		t.Fatalf("got %v", err)
 	}
+	if _, err := Parse([]byte(strings.Replace(cfg, "[instances.dev]\nrealm = { kind = \"vm\" }\n", "[instances.dev]\nrealm = { kind = \"vm\" }\nexpose = [\"dev:*\"]\n", 1))); err != nil {
+		t.Fatalf("explicit expose on the shared private vault: %v", err)
+	}
 }
-
 func TestLoadChecksFileTrust(t *testing.T) {
+
 	dir := t.TempDir()
 	p := filepath.Join(dir, "config.toml")
 	os.WriteFile(p, []byte(minimal), 0o600)
@@ -233,5 +264,15 @@ func TestDirectContainerRefusedOnMacOS(t *testing.T) {
 	goos = "darwin"
 	if _, err := Parse([]byte(cfg)); err == nil || !strings.Contains(err.Error(), "always opaque") {
 		t.Fatalf("darwin: got %v", err)
+	}
+}
+
+func TestFileProtectorWhenOptedIn(t *testing.T) {
+	c, err := Parse([]byte(strings.Replace(minimal, "[plugins]", "[plugins]\nsecret_store = \"vault-file\"\nkey_protector = \"file\"\ninsecure_file_protector = true", 1)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Plugins.KeyProtector != "file" || !c.Plugins.InsecureFileProtector {
+		t.Fatalf("%+v", c.Plugins)
 	}
 }

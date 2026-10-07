@@ -99,6 +99,17 @@ type ClientInfo struct {
 	Tool     string `json:"tool,omitempty"`
 	// Parents is the client's ancestor chain, nearest first.
 	Parents []Proc `json:"parents,omitempty"`
+	// Target is the command the client will start with what it reads
+	// (foca run), or nil.
+	Target *Target `json:"target,omitempty"`
+}
+
+// Target is the command `foca run` is about to exec (design §4.1.1): its
+// resolved path and the base name of its argv[0]. The other arguments are
+// never sent; they may hold anything.
+type Target struct {
+	Exe   string `json:"exe,omitempty"`
+	Argv0 string `json:"argv0,omitempty"`
 }
 
 // GuestInfo is a caller's identity as read from a realm's own kernel by the
@@ -147,6 +158,13 @@ func (c ClientInfo) Clean() ClientInfo {
 		parents = nil
 	}
 	c.Parents = parents
+	if c.Target != nil {
+		t := Target{Exe: cleanString(c.Target.Exe, MaxClientString), Argv0: cleanString(c.Target.Argv0, MaxClientString)}
+		c.Target = &t
+		if t == (Target{}) {
+			c.Target = nil
+		}
+	}
 	return c
 }
 

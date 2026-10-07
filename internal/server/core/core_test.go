@@ -56,7 +56,7 @@ func newHarness(t *testing.T, decisions ...fake.Decision) *harness {
 	t.Helper()
 	store := memory.New()
 	ctx := context.Background()
-	store.Put(ctx, nil, plugin.SecretMeta{ID: "github-pat", DisplayName: "GitHub PAT", Tags: []string{"github"}}, plugin.SecretValue{Bytes: []byte("ghp_secret")})
+	store.Put(ctx, nil, plugin.SecretMeta{ID: "github-pat", DisplayName: "GitHub PAT"}, plugin.SecretValue{Bytes: []byte("ghp_secret")})
 	store.Put(ctx, nil, plugin.SecretMeta{ID: "npm-token", DisplayName: "npm token"}, plugin.SecretValue{Bytes: []byte("npm_secret")})
 	store.Put(ctx, nil, plugin.SecretMeta{ID: "prod-db"}, plugin.SecretValue{Bytes: []byte("pw")})
 	auth := fake.New(decisions...)
@@ -65,7 +65,7 @@ func newHarness(t *testing.T, decisions ...fake.Decision) *harness {
 		Name:    "dev",
 		Realm:   identity.Realm{Kind: "vm", Name: "dev", Peers: "opaque"},
 		Vault:   "common",
-		Secrets: static.New("common", store, static.Exposure{IDs: []string{"github-pat", "npm-token"}}, nil),
+		Secrets: static.NewVaults(static.New("common", store, static.Exposure{IDs: []string{"github-pat", "npm-token"}}, nil)),
 	}
 	svc := New(Options{Authenticator: auth, Audit: sink, PromptTimeout: time.Second, MaxQueue: 1, ShowClient: true,
 		SkipAncestors: []string{"bash", "zsh", "foca"}},
@@ -107,7 +107,7 @@ func code(err error) int {
 
 func TestApproveReadAudit(t *testing.T) {
 	h := newHarness(t, fake.Approve)
-	got, err := h.svc.ReadSecrets(context.Background(), h.call(), []string{"github-pat"})
+	got, err := h.svc.ReadSecrets(context.Background(), h.call(), []string{"common:github-pat"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,7 +121,7 @@ func TestApproveReadAudit(t *testing.T) {
 		read.Approval.Authenticator != "fake" {
 		t.Fatalf("read approval %+v", read.Approval)
 	}
-	if read.Instance != "dev" || read.Vault != "common" || read.Resource.ID != "github-pat" {
+	if read.Instance != "dev" || read.Vault != "common" || read.Resource.ID != "common:github-pat" {
 		t.Fatalf("read event %+v", read)
 	}
 	// Verified and reported identity are recorded separately.
@@ -138,7 +138,7 @@ func TestApproveReadAudit(t *testing.T) {
 
 func TestDenyIsAuditedAndReturnsNothing(t *testing.T) {
 	h := newHarness(t, fake.Deny)
-	got, err := h.svc.ReadSecrets(context.Background(), h.call(), []string{"github-pat", "npm-token"})
+	got, err := h.svc.ReadSecrets(context.Background(), h.call(), []string{"common:github-pat", "common:npm-token"})
 	if code(err) != protocol.CodeDenied || got != nil {
 		t.Fatalf("got %v, %v", got, err)
 	}
@@ -151,7 +151,7 @@ func TestDenyIsAuditedAndReturnsNothing(t *testing.T) {
 
 func TestBatchShowsOnePromptListingAllNames(t *testing.T) {
 	h := newHarness(t, fake.Approve)
-	got, err := h.svc.ReadSecrets(context.Background(), h.call(), []string{"github-pat", "npm-token", "github-pat"})
+	got, err := h.svc.ReadSecrets(context.Background(), h.call(), []string{"common:github-pat", "common:npm-token", "common:github-pat"})
 	if err != nil || len(got) != 2 {
 		t.Fatalf("got %v, %v", got, err)
 	}
@@ -170,7 +170,7 @@ func TestAuditFailureRefusesAccess(t *testing.T) {
 		t.Run(failType, func(t *testing.T) {
 			h := newHarness(t, fake.Approve)
 			h.sink.set(failType)
-			got, err := h.svc.ReadSecrets(context.Background(), h.call(), []string{"github-pat"})
+			got, err := h.svc.ReadSecrets(context.Background(), h.call(), []string{"common:github-pat"})
 			if code(err) != protocol.CodeAuditFailed || got != nil {
 				t.Fatalf("got %v, %v", got, err)
 			}
@@ -187,8 +187,8 @@ func TestAuditFailureRefusesAccess(t *testing.T) {
 
 func TestUnexposedLooksLikeMissingButIsAuditedWithReason(t *testing.T) {
 	h := newHarness(t, fake.Approve)
-	_, errUnexposed := h.svc.ReadSecrets(context.Background(), h.call(), []string{"prod-db"})
-	_, errMissing := h.svc.ReadSecrets(context.Background(), h.call(), []string{"nope"})
+	_, errUnexposed := h.svc.ReadSecrets(context.Background(), h.call(), []string{"common:prod-db"})
+	_, errMissing := h.svc.ReadSecrets(context.Background(), h.call(), []string{"common:nope"})
 	if code(errUnexposed) != protocol.CodeNotFound || code(errMissing) != protocol.CodeNotFound {
 		t.Fatalf("errors %v / %v", errUnexposed, errMissing)
 	}
@@ -207,7 +207,7 @@ func TestUnexposedLooksLikeMissingButIsAuditedWithReason(t *testing.T) {
 
 func TestPartialBatchNeverPrompts(t *testing.T) {
 	h := newHarness(t, fake.Approve)
-	_, err := h.svc.ReadSecrets(context.Background(), h.call(), []string{"github-pat", "prod-db"})
+	_, err := h.svc.ReadSecrets(context.Background(), h.call(), []string{"common:github-pat", "common:prod-db"})
 	if code(err) != protocol.CodeNotFound || len(h.auth.Requests()) != 0 {
 		t.Fatalf("err %v, prompts %d", err, len(h.auth.Requests()))
 	}
@@ -216,7 +216,7 @@ func TestPartialBatchNeverPrompts(t *testing.T) {
 func TestTimeoutAndUnavailable(t *testing.T) {
 	h := newHarness(t, fake.Hang)
 	h.svc.opts.PromptTimeout = 50 * time.Millisecond
-	_, err := h.svc.ReadSecrets(context.Background(), h.call(), []string{"github-pat"})
+	_, err := h.svc.ReadSecrets(context.Background(), h.call(), []string{"common:github-pat"})
 	if code(err) != protocol.CodeTimeout {
 		t.Fatalf("timeout: %v", err)
 	}
@@ -224,7 +224,7 @@ func TestTimeoutAndUnavailable(t *testing.T) {
 
 	h = newHarness(t, fake.Approve)
 	h.auth.SetUnavailable(true)
-	_, err = h.svc.ReadSecrets(context.Background(), h.call(), []string{"github-pat"})
+	_, err = h.svc.ReadSecrets(context.Background(), h.call(), []string{"common:github-pat"})
 	if code(err) != protocol.CodeAuthUnavailable {
 		t.Fatalf("unavailable: %v", err)
 	}
@@ -239,14 +239,14 @@ func TestQueueFullIsBusyAndAudited(t *testing.T) {
 	defer cancel()
 	// MaxQueue=1: one open prompt + one waiting; the third is refused.
 	for i := 0; i < 2; i++ {
-		go h.svc.ReadSecrets(ctx, h.call(), []string{"github-pat"})
+		go h.svc.ReadSecrets(ctx, h.call(), []string{"common:github-pat"})
 	}
 	<-h.auth.Started
 	deadline := time.Now().Add(2 * time.Second)
 	for h.svc.queue.pending() < 2 && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
 	}
-	_, err := h.svc.ReadSecrets(ctx, h.call(), []string{"github-pat"})
+	_, err := h.svc.ReadSecrets(ctx, h.call(), []string{"common:github-pat"})
 	if code(err) != protocol.CodeBusy {
 		t.Fatalf("third request: %v", err)
 	}
@@ -266,21 +266,21 @@ func TestAddSecretRequiresApprovalAndValidates(t *testing.T) {
 	c := h.call()
 	c.Origin = audit.OriginHostCLI
 	ns := NewSecret{ID: "new-token", DisplayName: "New token", Value: []byte("v")}
-	if err := h.svc.AddSecret(context.Background(), c, ns); code(err) != protocol.CodeDenied {
+	if _, err := h.svc.AddSecret(context.Background(), c, ns); code(err) != protocol.CodeDenied {
 		t.Fatalf("denied add: %v", err)
 	}
 	if _, _, err := h.store.Read(context.Background(), nil, "new-token"); err == nil {
 		t.Fatal("denied add was stored")
 	}
-	if err := h.svc.AddSecret(context.Background(), c, ns); err != nil {
+	if _, err := h.svc.AddSecret(context.Background(), c, ns); err != nil {
 		t.Fatal(err)
 	}
-	if err := h.svc.AddSecret(context.Background(), c, ns); code(err) != protocol.CodeInvalidParams {
+	if _, err := h.svc.AddSecret(context.Background(), c, ns); code(err) != protocol.CodeInvalidParams {
 		t.Fatalf("duplicate add: %v", err)
 	}
 	bad := ns
 	bad.ID, bad.DisplayName = "other", "evil‮eman"
-	if err := h.svc.AddSecret(context.Background(), c, bad); code(err) != protocol.CodeInvalidParams {
+	if _, err := h.svc.AddSecret(context.Background(), c, bad); code(err) != protocol.CodeInvalidParams {
 		t.Fatalf("bidi display name: %v", err)
 	}
 	wantTypes(t, h.sink.Events(), "approval.denied:denied", "secret.add:denied", "approval.granted:ok", "secret.add:ok")
@@ -289,7 +289,7 @@ func TestAddSecretRequiresApprovalAndValidates(t *testing.T) {
 func TestAddSecretRolledBackWhenAuditFails(t *testing.T) {
 	h := newHarness(t, fake.Approve)
 	h.sink.set(audit.TypeSecretAdd)
-	err := h.svc.AddSecret(context.Background(), h.call(), NewSecret{ID: "x", Value: []byte("v")})
+	_, err := h.svc.AddSecret(context.Background(), h.call(), NewSecret{ID: "x", Value: []byte("v")})
 	if code(err) != protocol.CodeAuditFailed {
 		t.Fatalf("got %v", err)
 	}
@@ -305,9 +305,9 @@ func TestOversizedBatchRefusedBeforePrompting(t *testing.T) {
 	for i := 0; i < 20; i++ {
 		id := fmt.Sprintf("tok-%02d", i)
 		h.store.Put(context.Background(), nil, plugin.SecretMeta{ID: id, DisplayName: "Token number " + id}, plugin.SecretValue{Bytes: []byte("v")})
-		names = append(names, id)
+		names = append(names, "common:"+id)
 	}
-	h.inst.Secrets = static.New("common", h.store, static.Exposure{All: true}, nil)
+	h.inst.Secrets = static.NewVaults(static.New("common", h.store, static.Exposure{All: true}, nil))
 	_, err := h.svc.ReadSecrets(context.Background(), h.call(), names)
 	var pe *protocol.Error
 	if !errors.As(err, &pe) || pe.Code != protocol.CodeInvalidParams {
@@ -327,7 +327,7 @@ func TestOversizedBatchRefusedBeforePrompting(t *testing.T) {
 func TestOneInstanceCantFillTheWholeQueue(t *testing.T) {
 	h := newHarness(t)
 	other := &Instance{Name: "work", Realm: identity.Realm{Kind: "vm", Name: "work", Peers: "opaque"}, Vault: "common",
-		Secrets: static.New("common", h.store, static.Exposure{All: true}, nil)}
+		Secrets: static.NewVaults(static.New("common", h.store, static.Exposure{All: true}, nil))}
 	auth := fake.New()
 	auth.Default = fake.Hang
 	auth.Started = make(chan plugin.ApprovalRequest, 8)
@@ -338,20 +338,20 @@ func TestOneInstanceCantFillTheWholeQueue(t *testing.T) {
 	defer cancel()
 	dev := h.call()
 	for i := 0; i < 2; i++ {
-		go svc.ReadSecrets(ctx, dev, []string{"github-pat"})
+		go svc.ReadSecrets(ctx, dev, []string{"common:github-pat"})
 	}
 	<-auth.Started
 	for deadline := time.Now().Add(2 * time.Second); svc.queue.pending() < 2 && time.Now().Before(deadline); {
 		time.Sleep(5 * time.Millisecond)
 	}
-	if _, err := svc.ReadSecrets(ctx, dev, []string{"github-pat"}); code(err) != protocol.CodeBusy {
+	if _, err := svc.ReadSecrets(ctx, dev, []string{"common:github-pat"}); code(err) != protocol.CodeBusy {
 		t.Fatalf("dev's third request: %v", err)
 	}
 	work := dev
 	work.Instance = other
 	done := make(chan error, 1)
 	wctx, wcancel := context.WithCancel(ctx)
-	go func() { _, err := svc.ReadSecrets(wctx, work, []string{"github-pat"}); done <- err }()
+	go func() { _, err := svc.ReadSecrets(wctx, work, []string{"common:github-pat"}); done <- err }()
 	for deadline := time.Now().Add(2 * time.Second); svc.queue.pending() < 3 && time.Now().Before(deadline); {
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -417,7 +417,7 @@ func TestCancelledAfterApprovalServesNothing(t *testing.T) {
 	h := newHarness(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	h.svc.opts.Authenticator = hangUpThenApprove{cancel}
-	_, err := h.svc.ReadSecrets(ctx, h.call(), []string{"github-pat"})
+	_, err := h.svc.ReadSecrets(ctx, h.call(), []string{"common:github-pat"})
 	if code(err) != protocol.CodeTimeout {
 		t.Fatalf("got %v", err)
 	}
@@ -436,45 +436,6 @@ func (hangUpThenApprove) Available(context.Context) (bool, string) { return true
 func (a hangUpThenApprove) Approve(context.Context, plugin.ApprovalRequest) (plugin.ApprovalResult, error) {
 	a.hangUp()
 	return plugin.ApprovalResult{Approved: true, Method: "fake"}, nil
-}
-
-// Adding a secret whose tags match another instance's selector widens what
-// that realm sees; the prompt and the audit event must say so.
-func TestAddNamesEveryRealmThatWillSeeTheSecret(t *testing.T) {
-	h := newHarness(t)
-	h.auth.Default = fake.Approve
-	byTag := static.Exposure{Tags: []string{"npm"}}
-	byID := static.Exposure{IDs: []string{"github-pat"}}
-	dev := &Instance{Name: "dev", Realm: identity.Realm{Kind: "vm", Name: "dev"}, Vault: "common", Exposes: byTag.Allows}
-	work := &Instance{Name: "work", Realm: identity.Realm{Kind: "vm", Name: "work"}, Vault: "common", Exposes: byID.Allows}
-	web := &Instance{Name: "web", Realm: identity.Realm{Kind: "container", Name: "web"}, Vault: "web", Exposes: static.Exposure{All: true}.Allows}
-	svc := New(Options{Authenticator: h.auth, Audit: h.sink, PromptTimeout: time.Second, MaxQueue: 1},
-		[]*Instance{dev, work, web}, map[string]plugin.SecretStore{"common": h.store, "web": memory.New()})
-	c := Call{RequestID: "r", Origin: audit.OriginHostCLI, Instance: dev}
-	ctx := context.Background()
-
-	if err := svc.AddSecret(ctx, c, NewSecret{ID: "npm-2", Tags: []string{"npm"}, Value: []byte("v")}); err != nil {
-		t.Fatal(err)
-	}
-	if err := svc.AddSecret(ctx, c, NewSecret{ID: "github-pat-2", Value: []byte("v")}); err != nil {
-		t.Fatal(err)
-	}
-	reqs := h.auth.Requests()
-	if got := reqs[len(reqs)-2].Prompt; got != "add npm-2 to vault common, visible in VM dev." {
-		t.Fatalf("prompt %q", got)
-	}
-	if got := reqs[len(reqs)-1].Prompt; got != "add github-pat-2 to vault common, visible to no instance." {
-		t.Fatalf("prompt %q", got)
-	}
-	var vis []string
-	for _, e := range h.sink.Events() {
-		if e.Type == audit.TypeSecretAdd && e.Outcome == audit.OutcomeOK {
-			vis = append(vis, e.Resource.ID+"="+e.Params["visible_to"])
-		}
-	}
-	if strings.Join(vis, " ") != "npm-2=dev github-pat-2=" {
-		t.Fatalf("audited visibility %v", vis)
-	}
 }
 
 // brokenStore fails List or Delete on demand.
@@ -505,7 +466,7 @@ func TestAddSecretHandlesStoreErrors(t *testing.T) {
 	ctx := context.Background()
 
 	// The duplicate check can't run, so the add doesn't either.
-	err := h.svc.AddSecret(ctx, h.call(), NewSecret{ID: "github-pat", Value: []byte("overwritten")})
+	_, err := h.svc.AddSecret(ctx, h.call(), NewSecret{ID: "github-pat", Value: []byte("overwritten")})
 	if code(err) != protocol.CodeInternal {
 		t.Fatalf("list failure: %v", err)
 	}
@@ -519,7 +480,7 @@ func TestAddSecretHandlesStoreErrors(t *testing.T) {
 	// Audit and rollback both fail: the error names what was left behind.
 	bs.failList, bs.failDelete = false, true
 	h.sink.set(audit.TypeSecretAdd)
-	err = h.svc.AddSecret(ctx, h.call(), NewSecret{ID: "x", Value: []byte("v")})
+	_, err = h.svc.AddSecret(ctx, h.call(), NewSecret{ID: "x", Value: []byte("v")})
 	if code(err) != protocol.CodeAuditFailed || !strings.Contains(err.Error(), `secret "x" is stored`) {
 		t.Fatalf("rollback failure: %v", err)
 	}

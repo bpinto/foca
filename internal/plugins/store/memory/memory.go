@@ -31,7 +31,7 @@ func (s *Store) List(_ context.Context, _ []byte) ([]plugin.SecretMeta, error) {
 	defer s.mu.Unlock()
 	out := make([]plugin.SecretMeta, 0, len(s.entries))
 	for _, e := range s.entries {
-		out = append(out, copyMeta(e.meta))
+		out = append(out, e.meta)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out, nil
@@ -44,7 +44,7 @@ func (s *Store) Read(_ context.Context, _ []byte, id string) (plugin.SecretMeta,
 	if !ok {
 		return plugin.SecretMeta{}, plugin.SecretValue{}, plugin.ErrNotFound
 	}
-	return copyMeta(e.meta), plugin.SecretValue{Bytes: append([]byte(nil), e.value...)}, nil
+	return e.meta, plugin.SecretValue{Bytes: append([]byte(nil), e.value...)}, nil
 }
 
 // Put stores a copy of v; the caller still owns and should zero v.
@@ -59,7 +59,7 @@ func (s *Store) Put(_ context.Context, _ []byte, meta plugin.SecretMeta, v plugi
 	} else {
 		meta.Created = now
 	}
-	s.entries[meta.ID] = entry{meta: copyMeta(meta), value: append([]byte(nil), v.Bytes...)}
+	s.entries[meta.ID] = entry{meta: meta, value: append([]byte(nil), v.Bytes...)}
 	return nil
 }
 
@@ -73,11 +73,6 @@ func (s *Store) Delete(_ context.Context, _ []byte, id string) error {
 	zero(e.value)
 	delete(s.entries, id)
 	return nil
-}
-
-func copyMeta(m plugin.SecretMeta) plugin.SecretMeta {
-	m.Tags = append([]string(nil), m.Tags...)
-	return m
 }
 
 func zero(b []byte) {

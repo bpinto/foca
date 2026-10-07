@@ -34,8 +34,12 @@ type Config struct {
 type Plugins struct {
 	Authenticator  string
 	SecretStore    string
+	KeyProtector   string
 	PeerIdentifier string
 	AuditSink      string
+	// InsecureFileProtector allows key_protector = "file", which keeps the
+	// key that unlocks the vault in a plain file next to it.
+	InsecureFileProtector bool
 }
 
 type Approval struct {
@@ -56,19 +60,42 @@ type Limits struct {
 }
 
 type Instance struct {
-	Name   string
-	Realm  identity.Realm
-	Vault  string
-	Expose Expose
-	// SharedVault is true when another instance uses the same vault.
-	SharedVault bool
+	Name  string
+	Realm identity.Realm
+	// Expose is what the instance may read, by vault (design §7.1). Its keys
+	// are exactly the vaults the instance reads.
+	Expose map[string]Expose
 }
 
-// Expose lists what an instance may see in its vault.
+// Expose is what an instance may read in one vault: all of it, or the
+// secrets it names.
 type Expose struct {
-	All  bool
-	IDs  []string
-	Tags []string
+	All bool
+	IDs []string
+}
+
+// Vaults returns the vaults the instance reads, sorted.
+func (i Instance) Vaults() []string {
+	out := make([]string, 0, len(i.Expose))
+	for v := range i.Expose {
+		out = append(out, v)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// Exposes reports whether the instance may read secret id in vault.
+func (i Instance) Exposes(vault, id string) bool {
+	e, ok := i.Expose[vault]
+	if !ok {
+		return false
+	}
+	for _, x := range e.IDs {
+		if x == id {
+			return true
+		}
+	}
+	return e.All
 }
 
 // Limits.
@@ -87,7 +114,6 @@ const (
 var (
 	namePattern      = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,31}$`)
 	secretIDPattern  = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
-	tagPattern       = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,64}$`)
 	realmNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$`)
 )
 
@@ -124,10 +150,12 @@ type rawFile struct {
 }
 
 type rawPlugins struct {
-	Authenticator  string `toml:"authenticator"`
-	SecretStore    string `toml:"secret_store"`
-	PeerIdentifier string `toml:"peer_identifier"`
-	AuditSink      string `toml:"audit_sink"`
+	Authenticator         string `toml:"authenticator"`
+	SecretStore           string `toml:"secret_store"`
+	KeyProtector          string `toml:"key_protector"`
+	PeerIdentifier        string `toml:"peer_identifier"`
+	AuditSink             string `toml:"audit_sink"`
+	InsecureFileProtector bool   `toml:"insecure_file_protector"`
 }
 
 type rawApproval struct {
@@ -146,7 +174,6 @@ type rawVault struct{}
 
 type rawInstance struct {
 	Realm  *rawRealm  `toml:"realm"`
-	Vault  string     `toml:"vault"`
 	Expose *rawExpose `toml:"expose"`
 }
 
@@ -167,43 +194,50 @@ func (d *duration) UnmarshalText(b []byte) error {
 	return nil
 }
 
-// rawExpose accepts either the string "*" or a list of ids and "tag:" selectors.
-type rawExpose struct{ Expose }
+// rawExpose is a list of "<vault>:*" and "<vault>:<secret>" selectors.
+type rawExpose struct{ m map[string]Expose }
 
 func (e *rawExpose) UnmarshalTOML(v any) error {
-	switch x := v.(type) {
-	case string:
-		if x != "*" {
-			return fmt.Errorf(`expose must be "*" or a list, got %q`, x)
-		}
-		e.All = true
-		return nil
-	case []any:
-		for _, item := range x {
-			s, ok := item.(string)
-			if !ok {
-				return fmt.Errorf("expose entries must be strings, got %T", item)
-			}
-			switch {
-			case s == "*":
-				return errors.New(`expose: use expose = "*" instead of a list containing "*"`)
-			case strings.HasPrefix(s, "tag:"):
-				tag := strings.TrimPrefix(s, "tag:")
-				if !tagPattern.MatchString(tag) {
-					return fmt.Errorf("expose: invalid tag %q", tag)
-				}
-				e.Tags = append(e.Tags, tag)
-			default:
-				if !secretIDPattern.MatchString(s) {
-					return fmt.Errorf("expose: invalid secret id %q", s)
-				}
-				e.IDs = append(e.IDs, s)
-			}
-		}
-		return nil
-	default:
-		return fmt.Errorf(`expose must be "*" or a list, got %T`, v)
+	list, ok := v.([]any)
+	if !ok {
+		return fmt.Errorf(`expose must be a list of "<vault>:*" and "<vault>:<secret>", got %T`, v)
 	}
+	if len(list) == 0 {
+		return errors.New("expose is empty; leave it out for the instance's own vault")
+	}
+	e.m = map[string]Expose{}
+	for _, item := range list {
+		s, ok := item.(string)
+		if !ok {
+			return fmt.Errorf("expose entries must be strings, got %T", item)
+		}
+		vault, sel, ok := strings.Cut(s, ":")
+		switch {
+		case !ok:
+			return fmt.Errorf(`expose: %q must be "<vault>:*" or "<vault>:<secret>"`, s)
+		case !namePattern.MatchString(vault):
+			return fmt.Errorf("expose: %q: invalid vault name %q", s, vault)
+		case sel != "*" && !secretIDPattern.MatchString(sel):
+			return fmt.Errorf("expose: %q: invalid secret name %q", s, sel)
+		}
+		x := e.m[vault]
+		listed := false
+		for _, id := range x.IDs {
+			listed = listed || id == sel
+		}
+		switch {
+		case sel == "*" && (x.All || len(x.IDs) > 0), sel != "*" && x.All:
+			return fmt.Errorf("expose: %q overlaps another entry for vault %s; %s:* already names all of it", s, vault, vault)
+		case listed:
+			return fmt.Errorf("expose: %q is listed twice", s)
+		case sel == "*":
+			x.All = true
+		default:
+			x.IDs = append(x.IDs, sel)
+		}
+		e.m[vault] = x
+	}
+	return nil
 }
 
 // ---- loading ----
@@ -261,9 +295,24 @@ func validate(raw *rawFile) (*Config, error) {
 		SecretStore:    orDefault(raw.Plugins.SecretStore, "memory"),
 		PeerIdentifier: orDefault(raw.Plugins.PeerIdentifier, "auto"),
 		AuditSink:      orDefault(raw.Plugins.AuditSink, "jsonl"),
+		KeyProtector:   raw.Plugins.KeyProtector,
+
+		InsecureFileProtector: raw.Plugins.InsecureFileProtector,
 	}
 	if c.Plugins.Authenticator == "" {
 		fail("plugins.authenticator is required")
+	}
+	switch {
+	case c.Plugins.SecretStore == "vault-file" && c.Plugins.KeyProtector == "":
+		fail("plugins.key_protector is required with secret_store = \"vault-file\"")
+	case c.Plugins.SecretStore != "vault-file" && c.Plugins.KeyProtector != "":
+		fail("plugins.key_protector is only used with secret_store = \"vault-file\"")
+	case c.Plugins.KeyProtector == "file" && !c.Plugins.InsecureFileProtector:
+		// The file protector keeps the key next to the vault, so anyone who
+		// can read the data dir can decrypt it. It must be asked for by name.
+		fail("plugins.key_protector = \"file\" keeps the vault key in a plain file; set insecure_file_protector = true to allow it")
+	case c.Plugins.InsecureFileProtector && c.Plugins.KeyProtector != "file":
+		fail("plugins.insecure_file_protector is set but key_protector is not \"file\"")
 	}
 
 	// approval
@@ -353,33 +402,31 @@ func validate(raw *rawFile) (*Config, error) {
 		}
 		inst.Realm = realm
 
-		inst.Vault = ri.Vault
-		if inst.Vault == "" {
-			// No vault key: a private vault named after the instance.
-			inst.Vault = name
-		} else if !declared[inst.Vault] {
-			fail("instances.%s.vault: vault %q is not declared in [vaults]", name, inst.Vault)
-		}
 		if ri.Expose != nil {
-			inst.Expose = ri.Expose.Expose
+			inst.Expose = ri.Expose.m
 			explicitExpose[name] = true
+		} else {
+			// No expose: all of a private vault named after the instance.
+			inst.Expose = map[string]Expose{name: {All: true}}
 		}
-		users[inst.Vault] = append(users[inst.Vault], name)
+		for _, v := range inst.Vaults() {
+			// An undeclared vault is the instance's own; any other must be
+			// declared, so sharing is never implied by a name.
+			if v != name && !declared[v] {
+				fail("instances.%s.expose: vault %q is not declared in [vaults]", name, v)
+			}
+			users[v] = append(users[v], name)
+		}
 		c.Instances = append(c.Instances, inst)
 	}
 
-	// Sharing is never implicit: every instance using a shared vault must say
-	// what it exposes.
+	// Sharing is never implicit: an instance whose own vault is shared must
+	// say what it reads.
 	for i := range c.Instances {
 		inst := &c.Instances[i]
-		shared := len(users[inst.Vault]) > 1
-		inst.SharedVault = shared
-		switch {
-		case shared && !explicitExpose[inst.Name]:
-			fail("instances.%s: vault %q is shared with %s, so expose must be set explicitly (use expose = \"*\" to share everything)",
-				inst.Name, inst.Vault, strings.Join(others(users[inst.Vault], inst.Name), ", "))
-		case !shared && !explicitExpose[inst.Name]:
-			inst.Expose = Expose{All: true}
+		if users := users[inst.Name]; len(users) > 1 && !explicitExpose[inst.Name] {
+			fail("instances.%s: vault %q is shared with %s, so expose must be set explicitly (use \"%s:*\" to read all of it)",
+				inst.Name, inst.Name, strings.Join(others(users, inst.Name), ", "), inst.Name)
 		}
 	}
 

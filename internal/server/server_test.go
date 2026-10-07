@@ -56,9 +56,9 @@ func startWith(t *testing.T, realm identity.Realm, ids plugin.PeerIdentifier, tw
 	store.Put(context.Background(), nil, plugin.SecretMeta{ID: "github-pat", DisplayName: "GitHub PAT"}, plugin.SecretValue{Bytes: []byte("ghp_secret")})
 	auth := fake.New()
 	sink := audit.NewMemory()
-	inst := config.Instance{Name: "dev", Realm: realm, Vault: "dev", Expose: config.Expose{All: true}}
+	inst := config.Instance{Name: "dev", Realm: realm, Expose: map[string]config.Expose{"dev": {All: true}}}
 	svc := core.New(core.Options{Authenticator: auth, Audit: sink, PromptTimeout: 2 * time.Second, MaxQueue: 4, ShowClient: true},
-		[]*core.Instance{{Name: "dev", Realm: realm, Vault: "dev", Secrets: static.New("dev", store, static.Exposure{All: true}, nil)}},
+		[]*core.Instance{{Name: "dev", Realm: realm, Vault: "dev", Secrets: static.NewVaults(static.New("dev", store, static.Exposure{All: true}, nil))}},
 		map[string]plugin.SecretStore{"dev": store})
 	if ids == nil {
 		ids = peer.NewLinux()
@@ -136,7 +136,7 @@ func TestRequestApprovalAuditOverRealSocket(t *testing.T) {
 	}
 
 	var res protocol.SecretReadResult
-	err := c.Call(ctx(t), protocol.MethodSecretRead, protocol.SecretReadParams{Names: []string{"github-pat"},
+	err := c.Call(ctx(t), protocol.MethodSecretRead, protocol.SecretReadParams{Names: []string{"dev:github-pat"},
 		Common: protocol.Common{Client: &identity.ClientInfo{PID: 99, Name: "gh\x1b"}}}, &res)
 	if err != nil {
 		t.Fatal(err)
@@ -171,10 +171,54 @@ func TestRequestApprovalAuditOverRealSocket(t *testing.T) {
 	}
 }
 
+// The command `foca run` will exec is decoded strictly, cleaned like any
+// claim, recorded under client.reported.target, and named in the prompt's
+// claims clause.
+func TestRunTargetIsAClaimRecordedAndShown(t *testing.T) {
+	e := start(t, vmRealm, &peer.Static{Peer: identity.VerifiedPeer{UID: os.Getuid(), PID: 1, Exe: "/usr/bin/ssh", Name: "ssh"}})
+	e.auth.Default = fake.Approve
+	c := dial(t, e.paths.ClientSocket("dev"))
+	reported := &identity.ClientInfo{Exe: "/usr/bin/foca", Target: &identity.Target{Exe: "/usr/bin/np\x1bm", Argv0: "npm"},
+		Parents: []identity.Proc{{Name: "bash"}, {Name: "claude"}}}
+	err := c.Call(ctx(t), protocol.MethodSecretRead, protocol.SecretReadParams{Names: []string{"dev:github-pat"},
+		Common: protocol.Common{Client: reported}}, &protocol.SecretReadResult{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var granted, read *audit.Event
+	for _, ev := range e.sink.Events() {
+		switch ev.Type {
+		case audit.TypeApprovalGranted:
+			granted = &ev
+		case audit.TypeSecretRead:
+			read = &ev
+		}
+	}
+	if read == nil || read.Client == nil || read.Client.Reported.Target == nil ||
+		*read.Client.Reported.Target != (identity.Target{Exe: "/usr/bin/npm", Argv0: "npm"}) {
+		t.Fatalf("read event %+v", read)
+	}
+	// No skip list here, so the CLI itself is named as via.
+	if granted == nil || !strings.HasSuffix(granted.Approval.PromptText, "VM claims: npm via foca.") {
+		t.Fatalf("approval %q", granted.Approval.PromptText)
+	}
+	b, _ := json.Marshal(read)
+	if !strings.Contains(string(b), `"target":{"exe":"/usr/bin/npm","argv0":"npm"}`) {
+		t.Fatalf("event json %s", b)
+	}
+
+	// A misspelt key inside it is refused like any other.
+	err = c.Call(ctx(t), protocol.MethodSecretRead, map[string]any{"names": []string{"dev:github-pat"},
+		"client": map[string]any{"target": map[string]any{"Exe": "/usr/bin/npm"}}}, nil)
+	if pe := callErr(err); pe == nil || pe.Code != protocol.CodeInvalidParams {
+		t.Fatalf("misspelt target key: %v", err)
+	}
+}
+
 func TestDeniedReadReturnsDenied(t *testing.T) {
 	e := start(t, hostRealm, nil)
 	c := dial(t, e.paths.ClientSocket("dev"))
-	err := c.Call(ctx(t), protocol.MethodSecretRead, protocol.SecretReadParams{Names: []string{"github-pat"}}, nil)
+	err := c.Call(ctx(t), protocol.MethodSecretRead, protocol.SecretReadParams{Names: []string{"dev:github-pat"}}, nil)
 	pe := callErr(err)
 	if pe == nil || pe.Code != protocol.CodeDenied || pe.Data.RequestID == "" || pe.Data.EventSeq == 0 {
 		t.Fatalf("got %v", err)
@@ -305,7 +349,7 @@ func TestBinaryValueRoundTrip(t *testing.T) {
 	e.auth.Default = fake.Approve
 	e.store.Put(context.Background(), nil, plugin.SecretMeta{ID: "bin"}, plugin.SecretValue{Bytes: []byte{0xff, 0x00}})
 	var res protocol.SecretReadResult
-	if err := dial(t, e.paths.ClientSocket("dev")).Call(ctx(t), protocol.MethodSecretRead, protocol.SecretReadParams{Names: []string{"bin"}}, &res); err != nil {
+	if err := dial(t, e.paths.ClientSocket("dev")).Call(ctx(t), protocol.MethodSecretRead, protocol.SecretReadParams{Names: []string{"dev:bin"}}, &res); err != nil {
 		t.Fatal(err)
 	}
 	if res.Secrets[0].Encoding != "base64" || res.Secrets[0].Value != "/wA=" {
@@ -333,7 +377,7 @@ func TestShutdownStopsCleanly(t *testing.T) {
 func TestStrictParamsAndProtocolVersion(t *testing.T) {
 	e := start(t, hostRealm, nil)
 	c := dial(t, e.paths.ClientSocket("dev"))
-	err := c.Call(ctx(t), protocol.MethodSecretRead, map[string]any{"names": []string{"github-pat"}, "scope": "instance"}, nil)
+	err := c.Call(ctx(t), protocol.MethodSecretRead, map[string]any{"names": []string{"dev:github-pat"}, "scope": "instance"}, nil)
 	if pe := callErr(err); pe == nil || pe.Code != protocol.CodeInvalidParams {
 		t.Fatalf("unknown field: %v", err)
 	}
@@ -410,7 +454,7 @@ func TestShutdownCancelsPendingApproval(t *testing.T) {
 	c := dial(t, e.paths.ClientSocket("dev"))
 	errc := make(chan error, 1)
 	go func() {
-		errc <- c.Call(context.Background(), protocol.MethodSecretRead, protocol.SecretReadParams{Names: []string{"github-pat"}}, nil)
+		errc <- c.Call(context.Background(), protocol.MethodSecretRead, protocol.SecretReadParams{Names: []string{"dev:github-pat"}}, nil)
 	}()
 	<-e.auth.Started
 	e.srv.Shutdown("test")
@@ -507,7 +551,7 @@ func TestIdleTimeoutDoesNotApplyWhileHandling(t *testing.T) {
 	c := dial(t, e.paths.ClientSocket("dev"))
 	done := make(chan error, 1)
 	go func() {
-		done <- c.Call(context.Background(), protocol.MethodSecretRead, protocol.SecretReadParams{Names: []string{"github-pat"}}, nil)
+		done <- c.Call(context.Background(), protocol.MethodSecretRead, protocol.SecretReadParams{Names: []string{"dev:github-pat"}}, nil)
 	}()
 	<-e.auth.Started
 	time.Sleep(300 * time.Millisecond)
@@ -525,7 +569,7 @@ func TestHangUpCancelsPendingApproval(t *testing.T) {
 	e.auth.Default = fake.Hang
 	e.auth.Started = make(chan plugin.ApprovalRequest, 1)
 	c := dial(t, e.paths.ClientSocket("dev"))
-	c.WriteRaw([]byte(`{"jsonrpc":"2.0","id":1,"method":"secret.read","params":{"names":["github-pat"]}}`))
+	c.WriteRaw([]byte(`{"jsonrpc":"2.0","id":1,"method":"secret.read","params":{"names":["dev:github-pat"]}}`))
 	<-e.auth.Started
 	start := time.Now()
 	c.Close()

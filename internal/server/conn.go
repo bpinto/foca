@@ -226,7 +226,7 @@ func (s *Server) dispatch(ctx context.Context, st *connState, call core.Call, re
 		}
 		out := protocol.SecretListResult{Secrets: []protocol.SecretInfo{}}
 		for _, r := range rs {
-			info := protocol.SecretInfo{Name: r.Ref.ID, Description: r.Description, Tags: r.Tags}
+			info := protocol.SecretInfo{Name: r.Ref.ID, Description: r.Description}
 			if r.Ref.Display != r.Ref.ID {
 				info.DisplayName = r.Ref.Display
 			}

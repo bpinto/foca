@@ -11,6 +11,10 @@ import (
 // persister is the storage half of a sink. All calls happen under the sink's
 // mutex, so implementations need no locking of their own.
 type persister interface {
+	// begin starts an append. It returns the highest seq already stored by
+	// anyone, so seqs stay unique when other processes append to the same
+	// file, and end, which must be called once the write is done.
+	begin() (lastSeq uint64, end func(), err error)
 	write(e *Event) error
 	// scan calls fn for each stored event in seq order until fn returns false.
 	scan(fn func(Event) bool) error
@@ -46,6 +50,14 @@ func (s *sink) Append(ctx context.Context, e *Event) (uint64, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	last, end, err := s.p.begin()
+	if err != nil {
+		return 0, err
+	}
+	defer end()
+	if last > s.seq {
+		s.seq = last
+	}
 	// Sequence numbers may have gaps after a failed write, never duplicates.
 	s.seq++
 	e.V = Version

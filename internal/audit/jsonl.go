@@ -9,11 +9,17 @@ import (
 	"io"
 	"os"
 	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 // JSONL is an append-only file sink: one JSON event per line, fsync'd before
 // Append returns. The file must be a regular file owned by the current user
 // with no group or other permissions.
+//
+// The service and the host CLI both append to the same file. Each append
+// holds an exclusive flock on it and first reads anything other processes
+// added, so sequence numbers stay unique across processes.
 type JSONL struct {
 	*sink
 }
@@ -34,6 +40,8 @@ type jsonlPersister struct {
 	// size is the end of the last complete, synced event. A failed write is
 	// cut back to it, so a torn line can never prefix a later event.
 	size int64
+	// lock takes the cross-process lock; nil in tests that inject a file.
+	lock func() (unlock func(), err error)
 	// broken is set once the file's state can't be trusted (a failed sync,
 	// or a torn write that couldn't be cut back). Every later append fails.
 	broken error
@@ -51,8 +59,14 @@ func OpenJSONL(path string) (*JSONL, error) {
 		f.Close()
 		return nil, fmt.Errorf("audit: %s: %w", path, err)
 	}
-	p := &jsonlPersister{path: path, f: f}
+	p := &jsonlPersister{path: path, f: f, lock: flockFile(f)}
+	unlock, err := p.lock()
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
 	last, err := p.recover()
+	unlock()
 	if err != nil {
 		f.Close()
 		return nil, err
@@ -186,3 +200,44 @@ func readLine(r *bufio.Reader) ([]byte, error) {
 }
 
 func (p *jsonlPersister) close() error { return p.f.Close() }
+
+func flockFile(f *os.File) func() (func(), error) {
+	return func() (func(), error) {
+		if err := unix.Flock(int(f.Fd()), unix.LOCK_EX); err != nil {
+			return nil, fmt.Errorf("audit: lock: %w", err)
+		}
+		return func() { unix.Flock(int(f.Fd()), unix.LOCK_UN) }, nil
+	}
+}
+
+// begin locks the file and catches up with events other processes appended
+// since this one last wrote, so the next seq is above all of them.
+func (p *jsonlPersister) begin() (uint64, func(), error) {
+	if p.broken != nil {
+		return 0, nil, p.broken
+	}
+	unlock := func() {}
+	if p.lock != nil {
+		u, err := p.lock()
+		if err != nil {
+			return 0, nil, err
+		}
+		unlock = u
+	}
+	fi, err := p.f.Stat()
+	if err != nil {
+		unlock()
+		return 0, nil, err
+	}
+	if fi.Size() == p.size {
+		return 0, unlock, nil
+	}
+	// Someone else appended (or, if smaller, rewrote) the file: rescan it.
+	// recover also ends a line another process left torn by a crash.
+	last, err := p.recover()
+	if err != nil {
+		unlock()
+		return 0, nil, err
+	}
+	return last, unlock, nil
+}

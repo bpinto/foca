@@ -294,3 +294,64 @@ func TestJSONLFailedSyncLatches(t *testing.T) {
 		t.Fatal("append accepted after a failed sync")
 	}
 }
+
+// The service and the host CLI each open the log and append concurrently.
+// Every event must get its own seq, and seqs must rise in file order.
+func TestJSONLSeqUniqueAcrossProcesses(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	service, err := OpenJSONL(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.Close()
+	cli, err := OpenJSONL(path) // its own open file, as another process has
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Close()
+
+	ctx := context.Background()
+	const n = 50
+	done := make(chan error, 2)
+	for _, s := range []*JSONL{service, cli} {
+		go func(s *JSONL) {
+			for range n {
+				if _, err := s.Append(ctx, &Event{Type: TypeSecretRead, Outcome: OutcomeOK}); err != nil {
+					done <- err
+					return
+				}
+			}
+			done <- nil
+		}(s)
+	}
+	for range 2 {
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	}
+	b, _ := os.ReadFile(path)
+	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
+	if len(lines) != 2*n {
+		t.Fatalf("%d lines, want %d", len(lines), 2*n)
+	}
+	var prev uint64
+	for i, l := range lines {
+		var e Event
+		if err := json.Unmarshal([]byte(l), &e); err != nil {
+			t.Fatalf("line %d: %v", i, err)
+		}
+		if e.Seq <= prev {
+			t.Fatalf("line %d: seq %d after %d", i, e.Seq, prev)
+		}
+		prev = e.Seq
+	}
+	// A CLI that opens after the service has written continues from it.
+	late, _ := OpenJSONL(path)
+	defer late.Close()
+	if seq, _ := late.Append(ctx, &Event{Type: TypeSecretAdd, Outcome: OutcomeOK}); seq != prev+1 {
+		t.Fatalf("late seq %d, want %d", seq, prev+1)
+	}
+	if seq, _ := service.Append(ctx, &Event{Type: TypeSecretRead, Outcome: OutcomeOK}); seq != prev+2 {
+		t.Fatalf("service seq after CLI write %d, want %d", seq, prev+2)
+	}
+}

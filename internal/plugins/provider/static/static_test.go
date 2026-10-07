@@ -13,15 +13,15 @@ func seeded(t *testing.T) *memory.Store {
 	t.Helper()
 	s := memory.New()
 	ctx := context.Background()
-	s.Put(ctx, nil, plugin.SecretMeta{ID: "github-pat", DisplayName: "GitHub PAT", Tags: []string{"github"}}, plugin.SecretValue{Bytes: []byte("ghp_x")})
-	s.Put(ctx, nil, plugin.SecretMeta{ID: "npm-token", Tags: []string{"npm"}}, plugin.SecretValue{Bytes: []byte("npm_y")})
+	s.Put(ctx, nil, plugin.SecretMeta{ID: "github-pat", DisplayName: "GitHub PAT"}, plugin.SecretValue{Bytes: []byte("ghp_x")})
+	s.Put(ctx, nil, plugin.SecretMeta{ID: "npm-token"}, plugin.SecretValue{Bytes: []byte("npm_y")})
 	s.Put(ctx, nil, plugin.SecretMeta{ID: "prod-db"}, plugin.SecretValue{Bytes: []byte("pw")})
 	return s
 }
 
 func TestExposureFiltersListResolveAndServe(t *testing.T) {
 	ctx := context.Background()
-	p := New("common", seeded(t), Exposure{IDs: []string{"github-pat"}, Tags: []string{"npm"}}, nil)
+	p := New("common", seeded(t), Exposure{IDs: []string{"github-pat", "npm-token"}}, nil)
 
 	list, err := p.List(ctx)
 	if err != nil || len(list) != 2 {

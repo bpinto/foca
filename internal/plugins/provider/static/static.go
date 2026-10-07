@@ -1,5 +1,6 @@
-// Package static exposes vault secrets as "secret:<id>" resources, filtered by
-// one instance's exposure rules.
+// Package static exposes vault secrets as "secret:<id>" resources: Provider
+// for one vault, filtered by one instance's exposure, and Vaults for every
+// vault an instance reads.
 package static
 
 import (
@@ -10,11 +11,11 @@ import (
 	"github.com/bpinto/foca/internal/plugin"
 )
 
-// Exposure decides which secrets of a vault one instance may see.
+// Exposure is what one instance may read in one vault: all of it, or the
+// secrets it names.
 type Exposure struct {
-	All  bool
-	IDs  []string
-	Tags []string
+	All bool
+	IDs []string
 }
 
 func (e Exposure) Allows(m plugin.SecretMeta) bool {
@@ -26,19 +27,11 @@ func (e Exposure) Allows(m plugin.SecretMeta) bool {
 			return true
 		}
 	}
-	for _, want := range e.Tags {
-		for _, t := range m.Tags {
-			if t == want {
-				return true
-			}
-		}
-	}
 	return false
 }
 
-// DEKFunc returns the vault's data key and a function that releases it.
-// The memory store doesn't encrypt, so a nil DEKFunc is allowed.
-type DEKFunc func(ctx context.Context) (dek []byte, release func(), err error)
+// DEKFunc is plugin.DEKFunc; nil means the store doesn't encrypt.
+type DEKFunc = plugin.DEKFunc
 
 type Provider struct {
 	vault  string
@@ -122,8 +115,8 @@ func (p *Provider) Serve(ctx context.Context, r plugin.Resource, _ map[string]st
 		if err != nil {
 			return err
 		}
-		// Exposure is re-checked at serve time in case the secret's tags
-		// changed between resolve and serve.
+		// Exposure is checked again, so Serve never returns a secret that
+		// Resolve wouldn't.
 		if !p.expose.Allows(meta) {
 			v.Zero()
 			return plugin.ErrNotExposed
@@ -141,6 +134,5 @@ func toResource(m plugin.SecretMeta) plugin.Resource {
 	return plugin.Resource{
 		Ref:         plugin.ResourceRef{Kind: "secret", ID: m.ID, Display: m.Display()},
 		Description: m.Description,
-		Tags:        append([]string(nil), m.Tags...),
 	}
 }

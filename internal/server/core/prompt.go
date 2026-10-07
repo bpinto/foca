@@ -27,8 +27,12 @@ type PromptInput struct {
 	// ShowClient=false leaves out program and agent names entirely.
 	ShowClient bool
 	Skip       []string
-	// VisibleTo, for secret.add, is every realm that will see the secret.
+	// VisibleTo is every realm that will see the secret after a secret.add
+	// or secret.update, or that uses the vault for vault.init.
 	VisibleTo []identity.Realm
+	// Hidden, for secret.remove, is every realm that sees the secret now and
+	// won't afterwards.
+	Hidden []identity.Realm
 }
 
 type trust int
@@ -73,6 +77,16 @@ func render(in PromptInput, a actor) string {
 	case "secret.add":
 		names := listNames(in.Resources)
 		return fmt.Sprintf("add %s to vault %s, %s.", names, in.Vault, visiblePhrase(in.VisibleTo))
+	case "secret.update":
+		return fmt.Sprintf("change %s in vault %s, %s.", listNames(in.Resources), in.Vault, visiblePhrase(in.VisibleTo))
+	case "secret.remove":
+		return fmt.Sprintf("remove %s from vault %s%s.", listNames(in.Resources), in.Vault, hiddenPhrase(", hiding it from ", in.Hidden))
+	case "vault.init":
+		users := ""
+		if len(in.VisibleTo) > 0 {
+			users = " for " + realmList(in.VisibleTo)
+		}
+		return fmt.Sprintf("create vault %s%s.", in.Vault, users)
 	default: // secret.read
 		creds := listNames(in.Resources)
 		switch a.trust {
@@ -121,8 +135,15 @@ func guestChain(g identity.GuestInfo) []identity.Proc {
 	return append([]identity.Proc{{Exe: g.Exe, Name: g.Name, Sealed: g.ExeSealed}}, g.Parents...)
 }
 
+// clientChain is the claimed caller and its parents, after the command it
+// says it will run, if any: for `foca run` that command is the program that
+// gets the values. Neither kernel can vouch for a process not yet started,
+// so the target only ever appears in a claim.
 func clientChain(c identity.ClientInfo) []identity.Proc {
 	chain := append([]identity.Proc{{Exe: c.Exe, Name: c.Name}}, c.Parents...)
+	if c.Target != nil {
+		chain = append([]identity.Proc{{Exe: c.Target.Exe, Name: c.Target.Argv0}}, chain...)
+	}
 	for i := range chain {
 		chain[i].Sealed = false // claims are never sealed, whatever they say
 	}
@@ -204,6 +225,18 @@ func visiblePhrase(rs []identity.Realm) string {
 	if len(rs) == 0 {
 		return "visible to no instance"
 	}
+	return "visible in " + realmList(rs)
+}
+
+func hiddenPhrase(lead string, rs []identity.Realm) string {
+	if len(rs) == 0 {
+		return ""
+	}
+	return lead + realmList(rs)
+}
+
+// realmList names realms as "VM dev, VM work and host laptop".
+func realmList(rs []identity.Realm) string {
 	labels := make([]string, len(rs))
 	for i, r := range rs {
 		if n := r.Noun(); n != "" {
@@ -213,9 +246,9 @@ func visiblePhrase(rs []identity.Realm) string {
 		}
 	}
 	if len(labels) == 1 {
-		return "visible in " + labels[0]
+		return labels[0]
 	}
-	return "visible in " + strings.Join(labels[:len(labels)-1], ", ") + " and " + labels[len(labels)-1]
+	return strings.Join(labels[:len(labels)-1], ", ") + " and " + labels[len(labels)-1]
 }
 
 func realmPhrase(r identity.Realm) string {
