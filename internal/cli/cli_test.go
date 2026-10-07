@@ -351,6 +351,7 @@ func TestPolicyExplain(t *testing.T) {
 	os.WriteFile(cfg, []byte(`version = 1
 [plugins]
 authenticator = "fake"
+secret_store = "memory"
 platform_events = "none"
 [vaults.common]
 [vaults.common.policy]

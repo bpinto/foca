@@ -1,11 +1,11 @@
 package svcctl
 
 import (
-	"bytes"
+	"errors"
 	"fmt"
 	"syscall"
 
-	"golang.org/x/sys/unix"
+	"github.com/bpinto/foca/internal/darwinproc"
 )
 
 type handle interface {
@@ -13,34 +13,45 @@ type handle interface {
 	close()
 }
 
-// macOS has no pidfd. The start-time check in verify still catches a pid
-// that was reused before we looked; the window between that check and kill
-// is accepted for now.
-type pidHandle struct{ pid int }
+// versionHandle pins the process by its pid version, which the kernel
+// changes when the pid is reused or the process execs. macOS has no pidfd,
+// so a narrow window between the last check and kill(2) remains.
+type versionHandle struct {
+	pid     int
+	version int32
+}
 
-func (h pidHandle) signal(sig syscall.Signal) error { return syscall.Kill(h.pid, sig) }
-func (h pidHandle) close()                          {}
+func (h versionHandle) signal(sig syscall.Signal) error {
+	v, err := darwinproc.PIDVersion(h.pid)
+	if err != nil || v != h.version {
+		return fmt.Errorf("%w (pid %d changed before it could be signalled)", ErrNotRunning, h.pid)
+	}
+	return syscall.Kill(h.pid, sig)
+}
+func (h versionHandle) close() {}
 
-func pin(pid int) (handle, error) { return pidHandle{pid}, nil }
+func pin(pid int) (handle, error) {
+	v, err := darwinproc.PIDVersion(pid)
+	if errors.Is(err, darwinproc.ErrNoProcess) {
+		return nil, fmt.Errorf("%w (pid %d is gone; stale pid file)", ErrNotRunning, pid)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return versionHandle{pid: pid, version: v}, nil
+}
 
-// inspect reads the process from the kernel. macOS gives the command name
-// (truncated to 16 bytes) rather than the executable path without cgo.
+// inspect reads the process from the kernel. The executable is the path the
+// kernel finds for the file it runs; if that can't be read, the command name
+// stands in.
 func inspect(pid int) (proc, error) {
-	kp, err := unix.SysctlKinfoProc("kern.proc.pid", pid)
+	p, err := darwinproc.Info(pid)
 	if err != nil {
 		return proc{}, err
 	}
-	if int(kp.Proc.P_pid) != pid {
-		return proc{}, fmt.Errorf("pid %d not found", pid)
+	exe, err := darwinproc.ExePath(pid)
+	if err != nil {
+		exe = p.Comm
 	}
-	comm := kp.Proc.P_comm[:]
-	if i := bytes.IndexByte(comm, 0); i >= 0 {
-		comm = comm[:i]
-	}
-	tv := kp.Proc.P_starttime
-	return proc{
-		uid:   int(kp.Eproc.Ucred.Uid),
-		start: uint64(tv.Sec)*1_000_000 + uint64(tv.Usec),
-		exe:   string(comm),
-	}, nil
+	return proc{uid: p.UID, start: p.StartTime, exe: exe}, nil
 }

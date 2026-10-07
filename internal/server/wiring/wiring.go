@@ -3,13 +3,19 @@
 package wiring
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/bpinto/foca/internal/audit"
 	"github.com/bpinto/foca/internal/config"
 	"github.com/bpinto/foca/internal/fsutil"
 	"github.com/bpinto/foca/internal/plugin"
+	"github.com/bpinto/foca/internal/plugin/helper"
 	keyfile "github.com/bpinto/foca/internal/plugins/keyprot/file"
 	"github.com/bpinto/foca/internal/plugins/provider/static"
 	"github.com/bpinto/foca/internal/plugins/store/memory"
@@ -19,9 +25,97 @@ import (
 	"github.com/bpinto/foca/internal/server/core"
 )
 
+// env is what plugin constructors may need. The darwin helper is opened
+// (trust-checked and asked for its kinds) once, on first use.
+type env struct {
+	cfg    *config.Config
+	log    *slog.Logger
+	darwin *helper.Helper
+}
+
+// The helper is fixed when foca is built, never configured or searched for
+// (design §5). The build pins its sha256, which is required: a foca built
+// without one runs no helper. scripts/build-darwin.sh sets it; packaging may
+// also set the path:
+//
+//	-ldflags "-X …/wiring.builtinHelperSHA256=<hex>
+//	          -X …/wiring.builtinHelperPath=/nix/store/…/bin/foca-darwin"
+//
+// Without a path, foca-darwin is expected next to the foca binary.
+var (
+	builtinHelperPath   string
+	builtinHelperSHA256 string
+)
+
+// darwinHelperPath is the built-in path, else foca-darwin in the directory
+// of the running binary, symlinks resolved.
+func darwinHelperPath() (string, error) {
+	if builtinHelperPath != "" {
+		return builtinHelperPath, nil
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return "", err
+	}
+	if exe, err = filepath.EvalSymlinks(exe); err != nil {
+		return "", err
+	}
+	return filepath.Join(filepath.Dir(exe), "foca-darwin"), nil
+}
+
+func (e *env) darwinHelper() (*helper.Helper, error) {
+	if e.darwin != nil {
+		return e.darwin, nil
+	}
+	need, uses := e.darwinKinds()
+	if builtinHelperSHA256 == "" {
+		return nil, fmt.Errorf("%s needs foca-darwin, but this foca was built without its sha256 pin, so it runs no helper; build with scripts/build-darwin.sh", strings.Join(uses, ", "))
+	}
+	path, err := darwinHelperPath()
+	if err != nil {
+		return nil, fmt.Errorf("can't locate foca-darwin: %w", err)
+	}
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+		where := "this build expects it there"
+		if builtinHelperPath == "" {
+			where = "install it next to foca"
+		}
+		return nil, fmt.Errorf("%s needs foca-darwin, which is not at %s; %s", strings.Join(uses, ", "), path, where)
+	}
+	h, err := helper.Open(context.Background(), helper.Config{Path: path, SHA256: builtinHelperSHA256, Log: e.log}, need...)
+	if err != nil {
+		return nil, err
+	}
+	e.darwin = h
+	return h, nil
+}
+
+// darwinKinds lists the helper kinds the config uses, and the settings that
+// use them.
+func (e *env) darwinKinds() (kinds, uses []string) {
+	if e.cfg.Plugins.Authenticator == "touchid" {
+		kinds, uses = append(kinds, helper.KindAuthenticator), append(uses, `authenticator = "touchid"`)
+	}
+	if e.cfg.Plugins.KeyProtector == "keychain" {
+		kinds, uses = append(kinds, helper.KindKeyProtector), append(uses, `key_protector = "keychain"`)
+	}
+	if e.cfg.PlatformEventsName() == "darwin" {
+		kinds, uses = append(kinds, helper.KindEvents), append(uses, `platform_events = "darwin"`)
+	}
+	return kinds, uses
+}
+
 // authenticators maps config names to constructors. Test-only entries are
 // added by files built with the foca_testing tag.
-var authenticators = map[string]func() (plugin.Authenticator, error){}
+var authenticators = map[string]func(*env) (plugin.Authenticator, error){
+	"touchid": func(e *env) (plugin.Authenticator, error) {
+		h, err := e.darwinHelper()
+		if err != nil {
+			return nil, err
+		}
+		return helper.NewAuthenticator(h, "touchid", e.cfg.TouchID.AllowPasswordFallback), nil
+	},
+}
 
 // testOnly lists names that exist only in test builds, for a clear error.
 var testOnly = map[string]bool{"fake": true}
@@ -30,11 +124,11 @@ var testOnly = map[string]bool{"fake": true}
 var TestBuild = false
 
 // planned lists names that are part of the design but not built yet.
-var planned = map[string]bool{"touchid": true, "polkit": true, "fido2": true, "pinentry": true}
+var planned = map[string]bool{"polkit": true, "fido2": true, "pinentry": true}
 
-func authenticator(name string) (plugin.Authenticator, error) {
+func authenticator(e *env, name string) (plugin.Authenticator, error) {
 	if mk, ok := authenticators[name]; ok {
-		return mk()
+		return mk(e)
 	}
 	if testOnly[name] {
 		return nil, fmt.Errorf("authenticator %q is only available in test builds (built with -tags foca_testing)", name)
@@ -47,13 +141,19 @@ func authenticator(name string) (plugin.Authenticator, error) {
 
 // plannedProtectors are key protectors the design names but foca doesn't
 // have yet.
-var plannedProtectors = map[string]bool{"keychain": true, "secure-enclave": true, "tpm": true, "libsecret": true, "keyring": true}
+var plannedProtectors = map[string]bool{"secure-enclave": true, "tpm": true, "libsecret": true, "keyring": true}
 
-func keyProtector(cfg *config.Config, paths config.Paths) (plugin.KeyProtector, error) {
-	switch name := cfg.Plugins.KeyProtector; name {
+func keyProtector(e *env, paths config.Paths) (plugin.KeyProtector, error) {
+	switch name := e.cfg.Plugins.KeyProtector; name {
 	case "file":
 		// config.validate has already required insecure_file_protector.
 		return keyfile.New(paths.KeysDir()), nil
+	case "keychain":
+		h, err := e.darwinHelper()
+		if err != nil {
+			return nil, err
+		}
+		return helper.NewKeyProtector(h, "keychain"), nil
 	default:
 		if plannedProtectors[name] {
 			return nil, fmt.Errorf("key_protector %q is not implemented yet", name)
@@ -70,7 +170,8 @@ type vaults struct {
 	protector plugin.KeyProtector
 }
 
-func openVaults(cfg *config.Config, paths config.Paths, log *slog.Logger) (*vaults, error) {
+func openVaults(e *env, paths config.Paths) (*vaults, error) {
+	cfg, log := e.cfg, e.log
 	v := &vaults{stores: map[string]plugin.SecretStore{}, keys: map[string]plugin.DEKFunc{}, files: map[string]*vaultfile.Store{}}
 	switch cfg.Plugins.SecretStore {
 	case "memory":
@@ -79,7 +180,7 @@ func openVaults(cfg *config.Config, paths config.Paths, log *slog.Logger) (*vaul
 			v.stores[name] = memory.New()
 		}
 	case "vault-file":
-		p, err := keyProtector(cfg, paths)
+		p, err := keyProtector(e, paths)
 		if err != nil {
 			return nil, err
 		}
@@ -144,14 +245,15 @@ type Built struct {
 
 // Build wires the service. It binds nothing; Server.Start does.
 func Build(cfg *config.Config, paths config.Paths, version string, log *slog.Logger) (*Built, error) {
-	auth, err := authenticator(cfg.Plugins.Authenticator)
+	e := &env{cfg: cfg, log: log}
+	auth, err := authenticator(e, cfg.Plugins.Authenticator)
 	if err != nil {
 		return nil, err
 	}
 	if TestBuild {
 		log.Warn("TEST BUILD: test-only plugins are available; never use this binary for real secrets")
 	}
-	v, err := openVaults(cfg, paths, log)
+	v, err := openVaults(e, paths)
 	if err != nil {
 		return nil, err
 	}
@@ -159,7 +261,7 @@ func Build(cfg *config.Config, paths config.Paths, version string, log *slog.Log
 	if err != nil {
 		return nil, err
 	}
-	events, err := platformEvents(cfg)
+	events, err := platformEvents(e)
 	if err != nil {
 		return nil, err
 	}
@@ -194,14 +296,15 @@ func BuildHost(cfg *config.Config, paths config.Paths, log *slog.Logger) (*Host,
 	if cfg.Plugins.SecretStore != "vault-file" {
 		return nil, fmt.Errorf("the host CLI manages vault files; secret_store is %q (set secret_store = \"vault-file\")", cfg.Plugins.SecretStore)
 	}
-	auth, err := authenticator(cfg.Plugins.Authenticator)
+	e := &env{cfg: cfg, log: log}
+	auth, err := authenticator(e, cfg.Plugins.Authenticator)
 	if err != nil {
 		return nil, err
 	}
 	if TestBuild {
 		log.Warn("TEST BUILD: test-only plugins are available; never use this binary for real secrets")
 	}
-	v, err := openVaults(cfg, paths, log)
+	v, err := openVaults(e, paths)
 	if err != nil {
 		return nil, err
 	}

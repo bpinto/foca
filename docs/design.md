@@ -216,8 +216,9 @@ type ApprovalResult struct {
 A good prompt answers three questions in one sentence: **which program**, **which
 credential**, and **on whose behalf**. macOS adds `"<process name>" is trying to` in front of
 the reason text itself, so the reason is a verb phrase. The helper must therefore show up as
-`foca`, not `foca-darwin`; whether that needs a bundle name or just the executable
-name is still to be checked on a Mac.
+`foca`, not `foca-darwin`. It carries an embedded `Info.plist` (`CFBundleName = foca`) for
+that; whether the dialog uses it or the executable name is still to be confirmed on a Mac.
+macOS also ends the text with its own full stop, so the helper drops the reason's last one.
 
 **Slots and where they come from**
 
@@ -330,7 +331,7 @@ type KeyRef struct {
   initialising a scratch vault can never overwrite another one. The account is keyed by a
   stable id, not the file path, so moving the file doesn't strand the key.
 - Implementations: `file` (KEK in a 0600 file; refused unless config sets
-  `insecure_file_protector = true`), `keychain` (helper), and later `secure-enclave`,
+  `insecure_file_protector = true`), `keychain` (helper, §5), and later `secure-enclave`,
   `tpm`, `libsecret`, `keyring`.
 
 ### 4.3 Secret store: "hold encrypted values and their metadata"
@@ -391,8 +392,11 @@ type PlatformEvent struct{ Kind EventKind; At time.Time; Source string }
 ```
 
 - `logind` (Linux; D-Bus `PrepareForSleep`, session `Lock` / `LockedHint`, and
-  `SessionRemoved` for the service user's own sessions), `darwin` (helper streaming JSON lines), `none`, and `fake` (test builds only). `auto` is `logind` on Linux and `none`
-  elsewhere until the darwin source exists.
+  `SessionRemoved` for the service user's own sessions), `darwin` (helper streaming JSON lines:
+  IOKit system-will-sleep, the `com.apple.screenIsLocked` notification and a fast-user-switch
+  away as screen lock, log-out or shutdown as session end), `none`, and `fake` (test builds
+  only). `auto` is `logind` on Linux, `darwin` on macOS
+  and `none` elsewhere.
 - `logind` matches only signals sent by `org.freedesktop.login1`, so another process on the bus
   can't fake an event. It reads the name's unique owner once, after subscribing to
   `NameOwnerChanged` for it, and any change of owner (logind restarting or going away) ends
@@ -433,11 +437,44 @@ type VerifiedPeer struct {
 
 - **Linux**: `SO_PEERCRED`; `SO_PEERPIDFD` where available, so pid reuse can't
   confuse it; `/proc/<pid>/exe`, `comm`, `stat` (sid). Pure Go via `golang.org/x/sys/unix`.
+  Only a kernel that doesn't know `SO_PEERPIDFD` (it answers `ENOPROTOOPT`) falls back to
+  checking the start time; any other error refuses the peer, which may already be gone.
+  - Sealing (§4.1.1) also reads `/proc/<pid>/environ` and `/proc/<pid>/maps`, after the
+    pidfd is taken and before it is checked, like everything else. Each file and
+    directory check is kept for the rest of the identification, keyed by the process's
+    mount namespace and root, so the peer and its parents share the work for the
+    libraries they all map and the `LD_LIBRARY_PATH` directories they all name. Overlayfs
+    shows the underlying file's device in `maps`, which stat doesn't report, so there the
+    inode number alone must match.
+  - The identifier also reads `/proc/<pid>/cgroup`, pinned the same way, for the container
+    id; the server keeps it only on a direct `container` realm. Only the shapes docker,
+    podman, containerd and CRI-O give a container's cgroup count: `docker-<id>.scope`,
+    `libpod-<id>.scope`, `crio-<id>.scope`, `cri-containerd-<id>.scope`, `libpod-<id>`,
+    `crio-<id>`, `/docker/<id>` and `/kubepods/…/pod<uid>/<id>`, where the id is 64
+    lowercase hex digits. A path naming two takes the outer one, since that is the
+    container the host runs, and cgroup v1 hierarchies that disagree give none. The id is
+    audited (§8.1), never shown in a prompt: the realm's name already says which
+    container it is.
 - **macOS**: `LOCAL_PEERCRED`, plus `LOCAL_PEERTOKEN` rather than `LOCAL_PEERPID`.
   The audit token carries a pid version as well as the pid, so after reading process
-  information (path from `sysctl KERN_PROCARGS2`) the identifier must confirm the version
-  still matches. If it can't, the peer is handled like Linux without a pidfd (below). Also
+  information (path from `proc_info(PROC_PIDPATHINFO)`, `kinfo_proc`, `getsid`) the identifier
+  confirms the version still matches, through `proc_info(PROC_PIDUNIQIDENTIFIERINFO)`. The
+  version also changes on exec, so a pid reused or an exec during identification is refused
+  like a process that changed. The token describes the peer as it is when read, not as it
+  was when it connected, so like a Linux pidfd it can't reveal an exec that came before
+  identification (§12.4, "Exec after connect"). If the version can't be read, the peer is handled like Linux without a pidfd (below). Also
   pure Go behind a `darwin` build tag, so it compiles anywhere but is only tested on a Mac.
+  - The path is the one the kernel finds for the running file (what `proc_pidpath` reports).
+    The exec path in `kern.procargs2` can't be used: it sits in the process's own memory,
+    which the process can rewrite at any time without changing its pid version. Any symlinks
+    on the path are followed one component at a time: the exe is the file reached, and it is
+    sealed only if every directory passed through, including those reached through a
+    symlink, is sealed. Whoever could rewrite a link on the way could have chosen the name
+    too.
+  - Nothing checks for code loaded next to the program. Another process's environment is
+    readable in pure Go only through `kern.procargs2`, which is the process's own memory and
+    so rewritable by whatever was loaded, and listing its loaded images needs its task port.
+    A sealed name on macOS therefore doesn't rule out `DYLD_INSERT_LIBRARIES` (§12.4).
 - **Pid pinning.** `VerifiedPeer.PIDStable` is true only when the kernel pinned the process
   (a pidfd, or a confirmed pid version). Without it, the pid could have been reused before the
   first read and the two reads would agree on the wrong process. Then no name is treated as
@@ -498,18 +535,28 @@ binary, `foca-darwin`.
 | Cross-compiling from the VM | `CGO_ENABLED=0` builds every Go binary for both OSes. | darwin daemon must be built on a Mac. |
 | **Keychain identity** | Keychain item ACLs attach to the code identity of the process that creates and reads the item. Ad-hoc signing makes that the binary's hash. The helper is small and rarely changes, so its identity is stable across core releases. | The identity is the whole daemon, so every core rebuild (and every Nix bump) changes it. That brings back "allow access" prompts or strands the item. |
 | Touch ID UI | Helper runs as a child of the launchd agent, inside the user's GUI session. | Same. |
-| Trust | Daemon must trust an extra executable. Mitigated: absolute path from host config only, ownership and mode checks, optional sha256 pin (below). | Nothing extra to trust. |
+| Trust | Daemon must trust an extra executable. Mitigated: a path fixed at build or install time, ownership and mode checks, a sha256 pin built into foca (below). | Nothing extra to trust. |
 | Latency | One process spawn per approval or unseal, about 5–30 ms. Negligible next to a human Touch ID touch (~1 s). Events helper is long-lived. | In-process. |
 | Failure modes | Helper missing, crashing or a protocol-version mismatch. Each fails closed with a clear error. | Fewer moving parts. |
 | Versioning | Helper protocol is versioned (`v`), and an `info` op reports capabilities. | n/a |
 
 **Helper trust rules**
 
-1. The path is absolute and comes from host config. `PATH` is never searched.
-2. At start-up and before each spawn, the file and every parent directory must be owned by
-   root or the service user and must not be group- or world-writable. Nix store paths pass
-   this check.
-3. Optional `sha256 = "…"` pin in config. On mismatch, refuse to start.
+1. The path is fixed when foca is built or installed, never configured: the path built in
+   with `-ldflags -X` (a package can set its install path), else `foca-darwin` in the
+   directory of the running `foca`, symlinks resolved. `PATH` is never searched. Anyone who
+   can write that directory can already replace `foca` itself.
+2. At start-up and before each spawn, the file and every directory on the way to it must be
+   owned by root or the service user and must not be group- or world-writable. The path is
+   walked one component at a time, so that includes the directories a symlink sits in and
+   those it leads through. A sticky directory such as `/tmp` passes, but a symlink in it
+   must be the user's or root's. Nix store paths pass this check. Config files, action
+   commands and foca's own directories are checked the same way.
+3. A sha256 pin, built into foca with `-ldflags -X`, is required: a foca built without one
+   runs no helper. It is checked before each spawn; on a mismatch the helper doesn't run.
+   `scripts/build-darwin.sh` builds the helper, signs it (ad-hoc, or with
+   `FOCA_SIGN_IDENTITY`), hashes the signed file and builds foca with the pin. Signing comes
+   before hashing because it rewrites the file.
 4. Minimal environment: `HOME`, `LANG`, `FOCA_HELPER_PROTOCOL=1`. No caller data except
    sanitised prompt text.
 5. Hard per-call timeout. The daemon sends SIGTERM, and the helper calls
@@ -519,18 +566,44 @@ binary, `foca-darwin`.
    `denied` and `timeout`, so the audit log can separate them.
 
 **Helper protocol v1.** One JSON object on stdin, one on stdout, logs on stderr. This is the
-same idea as git credential helpers, but JSON.
+same idea as git credential helpers, but JSON. Every one-shot kind, `info` included, uses the
+same envelope. Requests and responses are decoded strictly: an unknown field, a wrong `v` or
+an unknown op is an error (`bad_request`), never ignored.
 
 ```
 $ foca-darwin authenticator          # subcommand = plugin kind
-stdin : {"v":1,"op":"approve","params":{"reason":"…","timeout_ms":60000}}
+stdin : {"v":1,"op":"approve","params":{"reason":"…","timeout_ms":60000,"allow_password_fallback":false}}
 stdout: {"v":1,"ok":true,"result":{"approved":true,"method":"biometry"}}
-     or {"v":1,"ok":false,"error":{"code":"denied|unavailable|timeout|internal","message":"…"}}
+     or {"v":1,"ok":false,"error":{"code":"denied","message":"…"}}
 
-$ foca-darwin key-protector   ops: seal | unseal | destroy   (dek base64 in/out)
-$ foca-darwin events          long-lived; stdout = one JSON event per line
-$ foca-darwin info            {"v":1,"kinds":["authenticator","key-protector","events"]}
+$ foca-darwin info            op info → {"kinds":["authenticator","key-protector","events"],"version":"0.1.0"}
+$ foca-darwin authenticator   op available {allow_password_fallback} → {available, reason}  (no UI)
+                              op approve   {reason, timeout_ms, allow_password_fallback} → {approved, method}
+$ foca-darwin key-protector   ops seal {vault, vault_id, dek} → {sealed}
+                                   unseal {vault, vault_id, sealed} → {dek}
+                                   destroy {vault, vault_id, sealed?} → {}      (bytes are base64)
+$ foca-darwin events          long-lived (below)
 ```
+
+- Error codes: `denied` (the user refused), `unavailable`, `timeout` (the helper's own
+  deadline), `cancelled` (SIGTERM, or the system took the prompt down), `not_found`,
+  `exists`, `mismatch`, `bad_request`, `internal`. The adapter maps `denied` to a denial,
+  `unavailable` to `auth_unavailable`, and `timeout` or `cancelled` to a timeout. Anything it
+  can't read (a crash, a malformed or oversized response, another protocol version) is an
+  error, never an approval. A success answer counts only if the helper also exits 0; one
+  followed by a crash or a non-zero exit is an error.
+- The service runs `info` at start-up and refuses a helper that lacks a kind the config uses.
+- Keychain entries are generic passwords, service `foca`, account `foca:<vault>:<vault-id>`.
+  `sealed` is the account name. A seal never overwrites an existing entry (`exists`), and an
+  unseal or destroy whose `sealed` names another vault's entry is refused (`mismatch`), so an
+  edited vault header can't borrow another vault's key.
+- `events` reads `{"v":1,"op":"subscribe","params":{}}`, then writes
+  `{"v":1,"seq":N,"event":"ready|sleep|screen-lock|session-end"}` lines. The service answers a
+  sleep with `{"v":1,"op":"ack","params":{"seq":N}}` once the core has wiped the grants and
+  recorded the lock, or after 4 s, and the helper lets the machine sleep only then, or after
+  5 s. It exits when stdin closes or on
+  SIGTERM. A malformed line, an unknown event, a seq that doesn't increase or the helper
+  exiting ends the source, so the core wipes and turns reuse off until it is back (§4.5).
 
 The Go repo includes a **conformance test suite** for helpers. It runs on Linux against a
 Go fake helper, and on a Mac with `FOCA_HELPER=/path/to/foca-darwin go test
@@ -546,7 +619,10 @@ a Mac):
   the `keychain-access-groups` entitlement. That needs a provisioning profile, which can only
   be embedded in a signed `.app` bundle, and only that bundle's main executable may use it.
 - Under ad-hoc signing the Keychain protector is therefore a **plain** generic-password item,
-  with Touch ID enforced by our own LAContext check.
+  with Touch ID enforced by our own LAContext check. Its access rule names the helper's code
+  identity, so a rebuilt ad-hoc helper is asked once ("Always Allow") before it can read an
+  older entry. With a Developer ID the rule follows the signing identity, and helper updates
+  don't ask.
 - A later Secure Enclave protector would need `foca-darwin` shipped as the main
   executable of a signed `.app`. The helper model makes that possible without touching the Go
   daemon, which is one more reason for D2.
@@ -627,7 +703,9 @@ the host, working directly on host files:
   corrupt or plant secrets.
 - **Signals go only to a verified service.** The CLI finds the service through
   `$RUNTIME/foca/serve.pid` (0600, inside the 0700 runtime dir). Before signalling, it
-  checks that the pid's executable is foca and that it runs as the same uid.
+  pins the process (a pidfd on Linux, its pid version on macOS, checked again just before
+  `kill`), matches its start time, and checks that its executable is foca and that it runs
+  as the same uid.
 - **Concurrent writers.** The CLI and the service both append to the audit log. Each append
   takes an exclusive `flock` and reads the last `seq` under the lock, so sequence numbers stay
   unique across processes.
@@ -705,9 +783,10 @@ treated as config (rule 3).
   `[Plugins]` or `Approval = …` is an unknown key, not another spelling of a known one.
 - Durations parse as Go durations and must be within limits (§9.4). The service rejects
   out-of-range values; it never clamps them silently.
-- Helper paths must be absolute and pass the trust checks (§5).
 - Actions must use absolute command paths, and every placeholder must be declared (§11).
 - The exposure rules in §7.1 hold. For example, a vault can't be shared by accident.
+- `touchid`, `keychain` and `platform_events = "darwin"` are refused on any OS but macOS
+  (test builds excepted, so the fake helper can stand in on Linux).
 
 ### 7.1 Instances, vaults and exposure (D20)
 
@@ -801,10 +880,6 @@ secret_store    = "vault-file"     # the default; memory is for tests
 peer_identifier = "auto"           # by OS
 platform_events = "auto"           # darwin | logind | none
 audit_sink      = "jsonl"
-
-[helpers.darwin]
-path   = "/nix/store/…-foca-darwin/bin/foca-darwin"
-sha256 = "…"                       # optional pin
 
 [approval]
 prompt_timeout = "60s"
@@ -1613,9 +1688,12 @@ internal/server/core/     request → approval → audit pipeline, prompt text, 
                           grants, denial backoff, wipe controller and watchdog
 internal/server/wiring/   config → plugins; test-only plugins gated by the foca_testing tag
 internal/plugin/          plugin interfaces
+internal/plugin/helper/   helper adapter (authenticator, key protector, events over stdio), the Go fake
+                          helper and the conformance suite
+internal/darwinproc/      macOS process reads without cgo: audit token, pid version, exe path
 internal/policy/          approval-policy lattice: meet, effective policy, the code floor, reach wording
 internal/plugins/…        authn/fake, store/memory, store/vaultfile, keyprot/file, provider/static,
-                          peer (linux), events/logind; later darwin, keyprot/*, provider/command
+                          peer (linux, darwin), events/logind; later keyprot/*, provider/command
 internal/audit/           event types (v1) + sinks: memory, jsonl
 internal/config/          TOML load and validation, paths
 internal/identity/        host-verified, guest-verified and reported identity, one distinct type each
@@ -1676,7 +1754,7 @@ noted; packages are named as in `go test` output (`main` is `cmd/foca`, whose te
 | no secret in argv; no value written to a terminal | `cli.TestNoSecretInArgv`, `cli.TestGetRefusesTerminalBeforeAsking`, `main.TestBinaryServeGetReloadStop` |
 | formatters | `format.TestJSONGolden`, `format.TestEnvGolden`, `format.TestEnvRefusesWhatItCantHold` |
 | add, edit and remove name every realm affected | `core.TestAddNamesEveryRealmThatWillSeeTheSecret`, `core.TestEditNamesEveryRealmThatReadsIt`, `core.TestRemoveNamesRealmsThatLoseIt` |
-| signals only reach a verified service | `svcctl.TestSignalRefusesUnverifiedProcesses`, `svcctl.TestSignalRefusesOtherUID` |
+| signals only reach a verified service | `svcctl.TestSignalRefusesUnverifiedProcesses`, `svcctl.TestSignalRefusesOtherUID`, `svcctl.TestPinRefusesAChangedProcess` (macOS) |
 | key holders hide their memory | `main.TestBinaryKeyHoldersHideTheirMemory` |
 | `--only` never splits a vault; one process per instance | — |
 | **Policy, grants and wipes** | |
@@ -1698,8 +1776,8 @@ noted; packages are named as in `go test` output (`main` is `cmd/foca`, whose te
 | polkit shows nothing it can't control | — |
 | TPM: round trip, the key never on the bus in clear, a boot change refuses until `recover`, another TPM or storage key can't unseal | — |
 | recovery keys shown once; rekey leaves the old keys opening nothing | — |
-| helper: strict answers, trust checks, the pin, sleep acked only after the wipe | — |
-| helper conformance and the macOS peer identifier (on a Mac, in CI) | — |
+| helper: strict answers, trust checks, the pin, sleep acked only after the wipe | `helper.TestApproveAnswers`, `helper.TestDecodeResponseIsStrict`, `helper.TestHelperTrustChecks`, `wiring.TestDarwinHelperNeedsABuiltInPin`, `main.TestBinaryHelperPin`, `helper.TestSleepAckedOnlyAfterTheCoreHandledIt`, `main.TestBinaryDarwinHelper` |
+| helper conformance and the macOS peer identifier (on a Mac, in CI) | `internal/plugin/helper/conformance_test.go` against the signed `foca-darwin`, `peer.TestDarwinIdentifiesRealPeer`, `peer.TestDarwinPeerThatExecsIsNamedAfterItsNewProgram`, `peer.TestSealedPath` |
 | **Events** | |
 | paging and filters | — |
 | backfill + live with no gaps, across writers and rotations | `audit.TestJSONLSeqUniqueAcrossProcesses` |
@@ -1718,8 +1796,6 @@ noted; packages are named as in `go test` output (`main` is `cmd/foca`, whose te
 
 **Not built**
 
-- The `foca-darwin` helper (Touch ID, the Keychain protector, sleep and lock events) and
-  the macOS peer identifier: on macOS, `serve` has no authenticator and identifies no peer.
 - Actions: the command provider, `action.list` and `action.run`, `foca exec` and
   `foca actions`.
 - polkit and the TPM key protector, with `foca recover` and `foca rekey`: on Linux, `serve`
@@ -1730,11 +1806,19 @@ noted; packages are named as in `go test` output (`main` is `cmd/foca`, whose te
   error until then.
 - A command that opens a vault with its recovery passphrase: `init --recovery` writes the
   slot, but nothing reads it yet.
-- On macOS, `reload`, `lock` and `stop` match the service by its command name only, without
-  pinning its pid.
 - `foca reset` and its `vault.reset` event; `[approval] list_requires_approval` (D16); a
   custom `--format`; the `secure-enclave`, `libsecret` and `keyring` key protectors.
 - macOS container runtimes' proxies in the default `opaque_peers` (§2.1).
+
+**Not verified on real hardware or desktops**
+
+- On a Mac: the interactive helper tests (a real Touch ID approve and deny, a screen lock;
+  `FOCA_HELPER_INTERACTIVE=1`), whether the dialog says "foca" (§4.1.1), and NSWorkspace
+  session notifications under a launchd agent. CI's macOS runner has no Touch ID, so its
+  conformance run skips the prompt cases.
+- `darwinproc` reaches `getsockopt` and `proc_info` through `unix.Syscall6`, which goes
+  through libc's deprecated `syscall()`. It works on current macOS; if Apple removes it,
+  those two calls need another route.
 
 ---
 

@@ -14,7 +14,7 @@ import (
 
 // In a production build, no config can select the always-approving fake.
 func TestFakeAuthenticatorRefusedInProductionBuild(t *testing.T) {
-	cfg, err := config.Parse([]byte("version = 1\n[plugins]\nauthenticator = \"fake\"\n[instances.dev]\n"))
+	cfg, err := config.Parse([]byte("version = 1\n[plugins]\nauthenticator = \"fake\"\nsecret_store = \"memory\"\n[instances.dev]\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -30,21 +30,21 @@ func TestFakeAuthenticatorRefusedInProductionBuild(t *testing.T) {
 }
 
 func TestPlannedAuthenticatorsSayTheyAreNotImplemented(t *testing.T) {
-	_, err := authenticator("touchid")
+	_, err := authenticator(&env{}, "polkit")
 	if err == nil || !strings.Contains(err.Error(), "not implemented yet") {
 		t.Fatalf("got %v", err)
 	}
-	if _, err := authenticator("anything"); err == nil {
+	if _, err := authenticator(&env{}, "anything"); err == nil {
 		t.Fatal("unknown authenticator accepted")
 	}
 }
 
 func TestPlannedKeyProtectorsSayTheyAreNotImplemented(t *testing.T) {
-	cfg, err := config.Parse([]byte("version = 1\n[plugins]\nauthenticator = \"x\"\nsecret_store = \"vault-file\"\nkey_protector = \"keychain\"\n[instances.dev]\n"))
+	cfg, err := config.Parse([]byte("version = 1\n[plugins]\nauthenticator = \"x\"\nsecret_store = \"vault-file\"\nkey_protector = \"tpm\"\n[instances.dev]\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := keyProtector(cfg, config.Paths{}); err == nil || !strings.Contains(err.Error(), "not implemented yet") {
+	if _, err := keyProtector(&env{cfg: cfg}, config.Paths{}); err == nil || !strings.Contains(err.Error(), "not implemented yet") {
 		t.Fatalf("got %v", err)
 	}
 }

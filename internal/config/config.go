@@ -37,6 +37,8 @@ type Config struct {
 	VaultPolicies         map[string]policy.Policy
 	SecretPolicies        map[string]policy.Policy
 	AuthenticatorPolicies map[string]policy.Policy
+	// TouchID holds [authenticators.touchid] options.
+	TouchID TouchID
 }
 
 type Plugins struct {
@@ -50,6 +52,12 @@ type Plugins struct {
 	// InsecureFileProtector allows key_protector = "file", which keeps the
 	// key that unlocks the vault in a plain file next to it.
 	InsecureFileProtector bool
+}
+
+// TouchID options. The password fallback is off unless config opts in
+// (design §18).
+type TouchID struct {
+	AllowPasswordFallback bool
 }
 
 type Approval struct {
@@ -144,6 +152,10 @@ var DefaultOpaquePeers = []string{"ssh", "sshd", "sshd-session", "socat", "nc", 
 // goos is the OS the config is validated for; tests override it.
 var goos = runtime.GOOS
 
+// darwinPluginsAnywhere lets test builds (foca_testing) use the macOS plugins
+// on any OS, with the Go fake standing in for foca-darwin.
+var darwinPluginsAnywhere = false
+
 var defaultSkipAncestors = []string{
 	"sh", "bash", "zsh", "fish", "nu", "dash", "ksh", "tmux", "screen",
 	"sshd", "sshd-session", "login", "su", "sudo", "env", "nix", "direnv", "foca",
@@ -152,15 +164,15 @@ var defaultSkipAncestors = []string{
 // ---- raw file shape ----
 
 type rawFile struct {
-	Version        int                       `toml:"version"`
-	OpaquePeers    []string                  `toml:"opaque_peers"`
-	Plugins        rawPlugins                `toml:"plugins"`
-	Approval       rawApproval               `toml:"approval"`
-	Limits         rawLimits                 `toml:"limits"`
-	Vaults         map[string]rawVault       `toml:"vaults"`
-	Instances      map[string]rawInstance    `toml:"instances"`
-	Secrets        map[string]rawPolicyTable `toml:"secrets"`
-	Authenticators map[string]rawPolicyTable `toml:"authenticators"`
+	Version        int                         `toml:"version"`
+	OpaquePeers    []string                    `toml:"opaque_peers"`
+	Plugins        rawPlugins                  `toml:"plugins"`
+	Approval       rawApproval                 `toml:"approval"`
+	Limits         rawLimits                   `toml:"limits"`
+	Vaults         map[string]rawVault         `toml:"vaults"`
+	Instances      map[string]rawInstance      `toml:"instances"`
+	Secrets        map[string]rawPolicyTable   `toml:"secrets"`
+	Authenticators map[string]rawAuthenticator `toml:"authenticators"`
 }
 
 type rawPlugins struct {
@@ -193,6 +205,13 @@ type rawVault struct {
 // policy lives there; secret values and metadata stay in the vault.
 type rawPolicyTable struct {
 	Policy *rawPolicy `toml:"policy"`
+}
+
+// rawAuthenticator is [authenticators.<name>]: its policy level, plus options
+// for that authenticator.
+type rawAuthenticator struct {
+	Policy                *rawPolicy `toml:"policy"`
+	AllowPasswordFallback *bool      `toml:"allow_password_fallback"`
 }
 
 type rawPolicy struct {
@@ -322,7 +341,7 @@ func validate(raw *rawFile) (*Config, error) {
 	// plugins
 	c.Plugins = Plugins{
 		Authenticator:  raw.Plugins.Authenticator,
-		SecretStore:    orDefault(raw.Plugins.SecretStore, "memory"),
+		SecretStore:    orDefault(raw.Plugins.SecretStore, "vault-file"),
 		PeerIdentifier: orDefault(raw.Plugins.PeerIdentifier, "auto"),
 		AuditSink:      orDefault(raw.Plugins.AuditSink, "jsonl"),
 		PlatformEvents: orDefault(raw.Plugins.PlatformEvents, "auto"),
@@ -344,6 +363,11 @@ func validate(raw *rawFile) (*Config, error) {
 		fail("plugins.key_protector = \"file\" keeps the vault key in a plain file; set insecure_file_protector = true to allow it")
 	case c.Plugins.InsecureFileProtector && c.Plugins.KeyProtector != "file":
 		fail("plugins.insecure_file_protector is set but key_protector is not \"file\"")
+	}
+	if goos != "darwin" && !darwinPluginsAnywhere {
+		if uses := c.darwinPlugins(); len(uses) > 0 {
+			fail("plugins: %s only work on macOS", strings.Join(uses, ", "))
+		}
 	}
 
 	// approval
@@ -496,6 +520,12 @@ func validate(raw *rawFile) (*Config, error) {
 			fail("authenticators.%s.policy: %v", name, err)
 		}
 		c.AuthenticatorPolicies[name] = p
+		if ra.AllowPasswordFallback != nil {
+			if name != "touchid" {
+				fail("authenticators.%s.allow_password_fallback: only touchid has a password fallback", name)
+			}
+			c.TouchID.AllowPasswordFallback = *ra.AllowPasswordFallback
+		}
 	}
 	errs = append(errs, c.checkGuestScopes()...)
 
@@ -520,6 +550,38 @@ func validate(raw *rawFile) (*Config, error) {
 		return nil, errors.Join(errs...)
 	}
 	return c, nil
+}
+
+// PlatformEventsName resolves platform_events = "auto": logind on Linux,
+// the darwin helper on macOS, none elsewhere.
+func (c *Config) PlatformEventsName() string {
+	name := c.Plugins.PlatformEvents
+	if name != "auto" {
+		return name
+	}
+	switch goos {
+	case "linux":
+		return "logind"
+	case "darwin":
+		return "darwin"
+	}
+	return "none"
+}
+
+// darwinPlugins names the settings that need foca-darwin: Touch ID, the
+// Keychain and macOS events exist only on macOS.
+func (c *Config) darwinPlugins() []string {
+	var uses []string
+	if c.Plugins.Authenticator == "touchid" {
+		uses = append(uses, `authenticator = "touchid"`)
+	}
+	if c.Plugins.KeyProtector == "keychain" {
+		uses = append(uses, `key_protector = "keychain"`)
+	}
+	if c.Plugins.PlatformEvents == "darwin" {
+		uses = append(uses, `platform_events = "darwin"`)
+	}
+	return uses
 }
 
 func validateRealm(instance string, r *rawRealm) (identity.Realm, error) {

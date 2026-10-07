@@ -4,6 +4,8 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"os/exec"
@@ -267,4 +269,172 @@ func TestBinaryReuseLockAndExplain(t *testing.T) {
 	if !strings.Contains(p.auditTypes(), `"type":"lock","outcome":"ok","reason":"shutdown","count":1`) {
 		t.Fatalf("no shutdown wipe in:\n%s", p.auditTypes())
 	}
+}
+
+// The darwin plugins end to end, on Linux: touchid, keychain and darwin
+// events, all served by the Go stand-in for foca-darwin. Only the helper is
+// platform-specific, so everything else here is what runs on a Mac. The helper
+// is found where an install puts it: next to the foca binary.
+func TestBinaryDarwinHelper(t *testing.T) {
+	p := setup(t)
+	helper := filepath.Join(filepath.Dir(p.bin), "foca-darwin")
+	if out, err := exec.Command("go", "build", "-o", helper, "../../internal/plugin/helper/fakehelper").CombinedOutput(); err != nil {
+		t.Skipf("can't build the fake helper: %v\n%s", err, out)
+	}
+	buildPinned(t, p, pinOf(t, helper))
+	home := filepath.Join(p.base, "home")
+	os.Mkdir(home, 0o700)
+	p.env = append(p.env, "HOME="+home) // the helper's HOME: its script and "Keychain"
+	script := func(s string) { os.WriteFile(filepath.Join(home, "fake-helper.json"), []byte(s), 0o600) }
+	os.WriteFile(filepath.Join(p.base, "config.toml"), []byte(`version = 1
+[plugins]
+authenticator   = "touchid"
+secret_store    = "vault-file"
+key_protector   = "keychain"
+platform_events = "darwin"
+[instances.dev]
+realm = { kind = "host" }
+[instances.dev.policy]
+approval = "reuse"
+window   = "15m"
+`), 0o600)
+
+	p.ok("", "init")
+	keys, _ := filepath.Glob(filepath.Join(home, "keychain", "foca:dev:*"))
+	if len(keys) != 1 {
+		t.Fatalf("keychain entries %v", keys)
+	}
+	p.ok("ghp_123\n", "add", "dev:github-pat")
+	srv := p.serve()
+	count := func(s string) int { return strings.Count(p.auditTypes(), s) }
+	time.Sleep(200 * time.Millisecond) // the events helper reports ready
+
+	base := count(`"type":"approval.granted"`)
+	if out := p.ok("", "get", "dev:github-pat"); out != "ghp_123" {
+		t.Fatalf("get: %q", out)
+	}
+	p.ok("", "get", "dev:github-pat")
+	if g, r := count(`"type":"approval.granted"`)-base, count(`"type":"approval.reused"`); g != 1 || r != 1 {
+		t.Fatalf("granted %d, reused %d", g, r)
+	}
+	if !strings.Contains(p.auditTypes(), `"authenticator":"touchid","method":"biometry"`) {
+		t.Fatalf("approval not recorded as touchid biometry:\n%s", p.auditTypes())
+	}
+
+	// A screen lock reported by the helper wipes the grant.
+	if pid := findProc(t, helper, "events"); pid == 0 {
+		t.Fatal("events helper not running")
+	} else {
+		syscall.Kill(pid, syscall.SIGUSR1)
+	}
+	for i := 0; i < 100 && count(`"reason":"screen-lock"`) == 0; i++ {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !hasLine(p.auditTypes(), `"type":"lock"`, `"reason":"screen-lock"`, `"count":1`) {
+		t.Fatalf("no screen-lock wipe of one grant in:\n%s", p.auditTypes())
+	}
+
+	// A Touch ID cancel is a denial.
+	script(`{"approve":"deny"}`)
+	if _, errs, err := p.run("", "get", "dev:github-pat"); err == nil || !strings.Contains(errs, "denied") {
+		t.Fatalf("denied get: %v %s", err, errs)
+	}
+	if !strings.Contains(p.auditTypes(), `"type":"approval.denied","outcome":"denied"`) {
+		t.Fatalf("no denial in:\n%s", p.auditTypes())
+	}
+
+	p.ok("", "stop")
+	srv.Wait()
+	if pid := findProc(t, helper, "events"); pid != 0 {
+		t.Fatalf("events helper %d outlived the service", pid)
+	}
+}
+
+// findProc returns the pid of a live process running exe with arg, or 0.
+func findProc(t *testing.T, exe, arg string) int {
+	t.Helper()
+	dirs, _ := filepath.Glob("/proc/[0-9]*")
+	for _, d := range dirs {
+		if target, err := os.Readlink(d + "/exe"); err != nil || target != exe {
+			continue
+		}
+		cmdline, _ := os.ReadFile(d + "/cmdline")
+		if !strings.Contains(string(cmdline), "\x00"+arg+"\x00") {
+			continue
+		}
+		stat, _ := os.ReadFile(d + "/stat")
+		if i := bytes.LastIndexByte(stat, ')'); i > 0 && len(stat) > i+2 && stat[i+2] == 'Z' {
+			continue // exited, not yet reaped
+		}
+		pid := 0
+		fmt.Sscan(filepath.Base(d), &pid)
+		return pid
+	}
+	return 0
+}
+
+// hasLine reports whether one line of log contains every part.
+func hasLine(log string, parts ...string) bool {
+	for _, line := range strings.Split(log, "\n") {
+		all := true
+		for _, p := range parts {
+			all = all && strings.Contains(line, p)
+		}
+		if all {
+			return true
+		}
+	}
+	return false
+}
+
+// The build pins the helper's hash into foca with -ldflags -X. A foca built
+// without a pin runs no helper, and one that doesn't match is refused.
+func TestBinaryHelperPin(t *testing.T) {
+	p := setup(t)
+	helper := filepath.Join(filepath.Dir(p.bin), "foca-darwin")
+	if out, err := exec.Command("go", "build", "-o", helper, "../../internal/plugin/helper/fakehelper").CombinedOutput(); err != nil {
+		t.Skipf("can't build the fake helper: %v\n%s", err, out)
+	}
+	home := filepath.Join(p.base, "home")
+	os.Mkdir(home, 0o700)
+	p.env = append(p.env, "HOME="+home)
+	os.WriteFile(filepath.Join(p.base, "config.toml"), []byte(`version = 1
+[plugins]
+authenticator   = "touchid"
+secret_store    = "vault-file"
+key_protector   = "file"
+insecure_file_protector = true
+platform_events = "none"
+[instances.dev]
+realm = { kind = "host" }
+`), 0o600)
+
+	if _, errs, err := p.run("", "init"); err == nil || !strings.Contains(errs, "built without its sha256 pin") {
+		t.Fatalf("unpinned build: %v %s", err, errs)
+	}
+	buildPinned(t, p, strings.Repeat("0", 64))
+	if _, errs, err := p.run("", "init"); err == nil || !strings.Contains(errs, "doesn't match its sha256 pin") {
+		t.Fatalf("mismatched pin: %v %s", err, errs)
+	}
+	buildPinned(t, p, pinOf(t, helper))
+	p.ok("", "init")
+}
+
+// buildPinned rebuilds the test foca with the helper pin set as packaging
+// sets it.
+func buildPinned(t *testing.T, p *proc, sum string) {
+	t.Helper()
+	flag := "-X github.com/bpinto/foca/internal/server/wiring.builtinHelperSHA256=" + sum
+	if out, err := exec.Command("go", "build", "-tags", "foca_testing", "-ldflags", flag, "-o", p.bin, ".").CombinedOutput(); err != nil {
+		t.Fatalf("build: %v\n%s", err, out)
+	}
+}
+
+func pinOf(t *testing.T, path string) string {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
 }

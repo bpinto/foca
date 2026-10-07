@@ -14,7 +14,7 @@ import (
 // select it, so no config line can turn approval off.
 func init() {
 	TestBuild = true
-	authenticators["fake"] = func() (plugin.Authenticator, error) {
+	authenticators["fake"] = func(*env) (plugin.Authenticator, error) {
 		a := fake.New()
 		a.Default = fake.Approve
 		return a, nil
@@ -38,5 +38,5 @@ func (readyEvents) Run(ctx context.Context, out chan<- plugin.PlatformEvent) err
 }
 
 func init() {
-	eventSources["fake"] = func() plugin.PlatformEvents { return readyEvents{} }
+	eventSources["fake"] = func(*env) (plugin.PlatformEvents, error) { return readyEvents{}, nil }
 }

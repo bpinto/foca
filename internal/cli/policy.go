@@ -12,7 +12,6 @@ import (
 	"github.com/bpinto/foca/internal/policy"
 	"github.com/bpinto/foca/internal/protocol"
 	"github.com/bpinto/foca/internal/secretname"
-	"github.com/bpinto/foca/internal/server/wiring"
 	"github.com/bpinto/foca/internal/svcctl"
 )
 
@@ -62,7 +61,7 @@ func (c *PolicyExplainCmd) Run(g *Globals, e *Env) error {
 		instances = []config.Instance{inst}
 	}
 
-	events := wiring.PlatformEventsName(cfg)
+	events := cfg.PlatformEventsName()
 	reuse := events != "none"
 	if reuse {
 		fmt.Fprintf(e.Stdout, "Platform events: %s. Reuse applies only while it reports sleep and screen lock; otherwise every access asks.\n", events)

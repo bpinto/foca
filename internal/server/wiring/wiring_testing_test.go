@@ -22,7 +22,7 @@ import (
 func TestBuildFromConfigEndToEnd(t *testing.T) {
 	base, _ := os.MkdirTemp("", "tgw")
 	defer os.RemoveAll(base)
-	cfg, err := config.Parse([]byte("version = 1\n[plugins]\nauthenticator = \"fake\"\n[instances.dev]\n"))
+	cfg, err := config.Parse([]byte("version = 1\n[plugins]\nauthenticator = \"fake\"\nsecret_store = \"memory\"\nplatform_events = \"none\"\n[instances.dev]\n"))
 	if err != nil {
 		t.Fatal(err)
 	}

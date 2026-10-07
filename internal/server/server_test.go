@@ -1,7 +1,7 @@
 //go:build linux
 
 // These tests identify peers with SO_PEERCRED through peer.NewLinux, so they
-// run on Linux only.
+// run on Linux only. The darwin identifier has its own tests on a Mac.
 
 package server
 

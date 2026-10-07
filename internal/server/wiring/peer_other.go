@@ -1,4 +1,4 @@
-//go:build !linux
+//go:build !linux && !darwin
 
 package wiring
 
@@ -10,5 +10,5 @@ import (
 )
 
 func peerIdentifier(name string) (plugin.PeerIdentifier, error) {
-	return nil, fmt.Errorf("no peer identifier for %s yet", runtime.GOOS)
+	return nil, fmt.Errorf("no peer identifier for %s", runtime.GOOS)
 }

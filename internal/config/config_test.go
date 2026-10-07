@@ -15,6 +15,7 @@ const minimal = `
 version = 1
 [plugins]
 authenticator = "fake"
+secret_store = "memory"
 [instances.dev]
 realm = { kind = "vm" }
 `
@@ -41,8 +42,22 @@ func TestMinimalDefaults(t *testing.T) {
 	if c.Limits.MaxConnections != DefaultMaxConnections || c.Limits.IdleTimeout != DefaultIdleTimeout {
 		t.Fatalf("limit defaults %+v", c.Limits)
 	}
-	if c.Plugins.SecretStore != "memory" || c.Plugins.AuditSink != "jsonl" {
+	if c.Plugins.AuditSink != "jsonl" {
 		t.Fatalf("plugin defaults %+v", c.Plugins)
+	}
+}
+
+// The store defaults to the vault file the host CLI writes, so a config
+// that leaves it out can't serve an empty in-memory store by mistake. The
+// vault file still needs its key protector named.
+func TestSecretStoreDefaultsToVaultFile(t *testing.T) {
+	noStore := strings.Replace(minimal, "secret_store = \"memory\"\n", "", 1)
+	if _, err := Parse([]byte(noStore)); err == nil || !strings.Contains(err.Error(), "key_protector is required") {
+		t.Fatalf("no store and no protector: %v", err)
+	}
+	c, err := Parse([]byte(strings.Replace(noStore, "[plugins]", "[plugins]\nkey_protector = \"file\"\ninsecure_file_protector = true", 1)))
+	if err != nil || c.Plugins.SecretStore != "vault-file" {
+		t.Fatalf("store %q, %v", c.Plugins.SecretStore, err)
 	}
 }
 
@@ -54,7 +69,8 @@ func TestRejections(t *testing.T) {
 [instances.dev]`, "plugins.authenticator is required"},
 		"no instances": {`version = 1
 [plugins]
-authenticator = "fake"`, "at least one"},
+authenticator = "fake"
+secret_store = "memory"`, "at least one"},
 		"bad instance name":            {strings.Replace(minimal, "instances.dev", "instances.Dev", 1), "instance name"},
 		"timeout too long":             {minimal + "\n[approval]\nprompt_timeout = \"2h\"\n", "outside"},
 		"timeout typo":                 {minimal + "\n[approval]\nprompt_timeout = \"30\"\n", "missing unit"},
@@ -65,9 +81,9 @@ authenticator = "fake"`, "at least one"},
 		"no connections":               {minimal + "\n[limits]\nmax_connections = 0\n", "max_connections"},
 		"too many connections":         {minimal + "\n[limits]\nmax_connections = 5000\n", "max_connections"},
 		"idle timeout too short":       {minimal + "\n[limits]\nidle_timeout = \"1s\"\n", "idle_timeout"},
-		"vault-file without protector": {strings.Replace(minimal, "[plugins]", "[plugins]\nsecret_store = \"vault-file\"", 1), "key_protector is required"},
-		"file protector not opted in":  {strings.Replace(minimal, "[plugins]", "[plugins]\nsecret_store = \"vault-file\"\nkey_protector = \"file\"", 1), "insecure_file_protector = true"},
-		"opt-in without file":          {strings.Replace(minimal, "[plugins]", "[plugins]\nsecret_store = \"vault-file\"\nkey_protector = \"keychain\"\ninsecure_file_protector = true", 1), "not \"file\""},
+		"vault-file without protector": {strings.Replace(minimal, "secret_store = \"memory\"", "secret_store = \"vault-file\"", 1), "key_protector is required"},
+		"file protector not opted in":  {strings.Replace(minimal, "secret_store = \"memory\"", "secret_store = \"vault-file\"\nkey_protector = \"file\"", 1), "insecure_file_protector = true"},
+		"opt-in without file":          {strings.Replace(minimal, "secret_store = \"memory\"", "secret_store = \"vault-file\"\nkey_protector = \"keychain\"\ninsecure_file_protector = true", 1), "not \"file\""},
 		"protector without vault-file": {strings.Replace(minimal, "[plugins]", "[plugins]\nkey_protector = \"file\"", 1), "only used with"},
 	}
 	for name, tc := range cases {
@@ -276,7 +292,7 @@ func TestDirectContainerRefusedOnMacOS(t *testing.T) {
 }
 
 func TestFileProtectorWhenOptedIn(t *testing.T) {
-	c, err := Parse([]byte(strings.Replace(minimal, "[plugins]", "[plugins]\nsecret_store = \"vault-file\"\nkey_protector = \"file\"\ninsecure_file_protector = true", 1)))
+	c, err := Parse([]byte(strings.Replace(minimal, "secret_store = \"memory\"", "secret_store = \"vault-file\"\nkey_protector = \"file\"\ninsecure_file_protector = true", 1)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -318,10 +334,13 @@ func TestPolicyRejections(t *testing.T) {
 
 // The design's example config (§7.1) folds to the results it states.
 func TestPolicyFoldsLikeTheDesignExample(t *testing.T) {
+	defer func(old string) { goos = old }(goos)
+	goos = "darwin" // the example is a Mac host
 	cfg := `
 version = 1
 [plugins]
 authenticator = "touchid"
+key_protector = "keychain"
 [vaults.common]
 [vaults.common.policy]
 approval = "reuse"
@@ -377,5 +396,70 @@ func TestNoPolicyMeansEveryTime(t *testing.T) {
 	dev, _ := c.Instance("dev")
 	if got := c.SecretPolicy(dev, "common:anything"); got.Kind != policy.EveryTime {
 		t.Fatalf("got %v", got)
+	}
+}
+
+func TestPlatformEventsAuto(t *testing.T) {
+	defer func(old string) { goos = old }(goos)
+	for os, want := range map[string]string{"linux": "logind", "darwin": "darwin", "freebsd": "none"} {
+		goos = os
+		c, err := Parse([]byte(minimal))
+		if err != nil || c.PlatformEventsName() != want {
+			t.Errorf("%s: auto is %q (%v), want %q", os, c.PlatformEventsName(), err, want)
+		}
+	}
+	c, _ := Parse([]byte(strings.Replace(minimal, "[plugins]", "[plugins]\nplatform_events = \"none\"", 1)))
+	if c.PlatformEventsName() != "none" {
+		t.Fatal("explicit none not kept")
+	}
+}
+
+func TestTouchIDPasswordFallback(t *testing.T) {
+	defer func(old string) { goos = old }(goos)
+	goos = "darwin"
+	base := "version = 1\n[instances.dev]\n[plugins]\nauthenticator = \"touchid\"\nkey_protector = \"keychain\"\n"
+	c, err := Parse([]byte(base))
+	if err != nil || c.TouchID.AllowPasswordFallback {
+		t.Fatalf("password fallback on by default (%v)", err)
+	}
+	c, err = Parse([]byte(base + "[authenticators.touchid]\nallow_password_fallback = true\n"))
+	if err != nil || !c.TouchID.AllowPasswordFallback {
+		t.Fatalf("fallback: %v", err)
+	}
+	_, err = Parse([]byte(base + "[authenticators.polkit]\nallow_password_fallback = true\n"))
+	if err == nil || !strings.Contains(err.Error(), "only touchid") {
+		t.Fatalf("fallback on polkit: %v", err)
+	}
+	// The helper's location isn't configurable.
+	if _, err := Parse([]byte(base + "[helpers.darwin]\npath = \"/x\"\n")); err == nil || !strings.Contains(err.Error(), "unknown keys") {
+		t.Fatalf("helpers table accepted: %v", err)
+	}
+}
+
+// Touch ID, the Keychain and macOS events are refused on other systems with
+// a clear message, rather than failing later over a missing helper.
+func TestDarwinPluginsOnlyOnMacOS(t *testing.T) {
+	defer func(os string, anywhere bool) { goos, darwinPluginsAnywhere = os, anywhere }(goos, darwinPluginsAnywhere)
+	darwinPluginsAnywhere = false
+	base := "version = 1\n[instances.dev]\n[plugins]\n"
+	for _, plugins := range []string{
+		"authenticator = \"touchid\"\nsecret_store = \"memory\"",
+		"authenticator = \"fake\"\nkey_protector = \"keychain\"",
+		"authenticator = \"fake\"\nsecret_store = \"memory\"\nplatform_events = \"darwin\"",
+	} {
+		goos = "linux"
+		_, err := Parse([]byte(base + plugins))
+		if err == nil || !strings.Contains(err.Error(), "only work on macOS") {
+			t.Errorf("%s on linux: %v", plugins, err)
+		}
+		goos = "darwin"
+		if _, err := Parse([]byte(base + plugins)); err != nil {
+			t.Errorf("%s on macOS: %v", plugins, err)
+		}
+	}
+	// Test builds allow them anywhere, for the fake helper.
+	goos, darwinPluginsAnywhere = "linux", true
+	if _, err := Parse([]byte(base + "authenticator = \"touchid\"\nkey_protector = \"keychain\"")); err != nil {
+		t.Fatalf("test build: %v", err)
 	}
 }
