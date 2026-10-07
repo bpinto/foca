@@ -1,0 +1,91 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CGO_ENABLED: "0"
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      # dbus-daemon for the logind tests, which skip without it.
+      - run: sudo apt-get update && sudo apt-get install -y dbus
+      - run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - run: go vet ./... && go vet -tags foca_testing ./...
+      - run: go test -count=1 ./...
+      - run: CGO_ENABLED=1 go test -race -count=1 ./...
+      # Adds the CLI end-to-end and binary tests.
+      - run: go test -count=1 -tags foca_testing ./...
+      - name: cross-compile for macOS
+        run: |
+          GOOS=darwin GOARCH=arm64 go vet ./...
+          GOOS=darwin GOARCH=amd64 go vet ./...
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      # The release build: foca-darwin signed, then its sha256 pinned into foca.
+      - name: build
+        run: |
+          scripts/build-darwin.sh "$RUNNER_TEMP/bin"
+          codesign -dv "$RUNNER_TEMP/bin/foca-darwin"
+          echo "FOCA_HELPER_BIN=$RUNNER_TEMP/bin/foca-darwin" >> "$GITHUB_ENV"
+      # The helper stores vault keys in the default keychain. A runner's
+      # login keychain may be locked, so use a throwaway one.
+      - name: keychain
+        run: |
+          kc="$RUNNER_TEMP/foca-ci.keychain-db"
+          security create-keychain -p ci "$kc"
+          security set-keychain-settings "$kc"
+          security unlock-keychain -p ci "$kc"
+          existing=()
+          while IFS= read -r k; do existing+=("$(echo "$k" | xargs)"); done < <(security list-keychains -d user)
+          security list-keychains -d user -s "$kc" "${existing[@]}"
+          security default-keychain -d user -s "$kc"
+      - run: go vet ./... && go vet -tags foca_testing ./...
+      # Includes the darwin peer identifier tests; the helper tests run
+      # against the Go fake here.
+      - run: go test -count=1 ./...
+      - run: go test -count=1 -tags foca_testing ./...
+      # The conformance suite against the real helper. A runner has no
+      # Touch ID, so the interactive tests skip.
+      - name: helper conformance
+        run: FOCA_HELPER="$FOCA_HELPER_BIN" go test -count=1 -v ./internal/plugin/helper/...
+      # The pinned foca runs its helper. A runner has no Touch ID, so init
+      # gets as far as "no approval prompt can be shown"; a pin mismatch or
+      # a missing helper fails earlier with another message.
+      - name: pinned build runs its helper
+        run: |
+          d="$RUNNER_TEMP/smoke"
+          mkdir -m 700 "$d"
+          printf '%s\n' 'version = 1' '[plugins]' 'authenticator = "touchid"' \
+            'secret_store = "vault-file"' 'key_protector = "keychain"' 'platform_events = "none"' \
+            '[instances.dev]' 'realm = { kind = "host" }' > "$d/config.toml"
+          chmod 600 "$d/config.toml"
+          if out=$(FOCA_CONFIG="$d/config.toml" FOCA_DATA_DIR="$d/data" FOCA_RUNTIME_DIR="$d/run" \
+              "$RUNNER_TEMP/bin/foca" init 2>&1); then
+            echo "$out"
+          else
+            echo "$out"
+            echo "$out" | grep -q "no approval prompt can be shown"
+          fi
