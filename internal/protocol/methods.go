@@ -17,6 +17,8 @@ const (
 	MethodSecretRead   = "secret.read"
 	MethodGrantsStatus = "grants.status"
 	MethodGrantsDrop   = "grants.drop"
+	MethodActionList   = "action.list"
+	MethodActionRun    = "action.run"
 )
 
 // Common fields every request may carry. Embedded in each params type so
@@ -174,10 +176,14 @@ type GrantsStatusParams struct {
 
 // GrantInfo is one of the caller's live reuse grants.
 type GrantInfo struct {
-	Name       string    `json:"name"`
-	Scope      string    `json:"scope"`
-	ApprovalID string    `json:"approval_id"`
-	ExpiresAt  time.Time `json:"expires_at"`
+	Name string `json:"name"`
+	// Kind is "secret" or "action"; Params, for an action, are the values
+	// the grant covers.
+	Kind       string            `json:"kind,omitempty"`
+	Params     map[string]string `json:"params,omitempty"`
+	Scope      string            `json:"scope"`
+	ApprovalID string            `json:"approval_id"`
+	ExpiresAt  time.Time         `json:"expires_at"`
 }
 
 type GrantsStatusResult struct {
@@ -192,4 +198,66 @@ type GrantsDropParams struct {
 
 type GrantsDropResult struct {
 	Dropped int `json:"dropped"`
+}
+
+type ActionListParams struct {
+	Common
+}
+
+// ParamSchema describes one parameter an action needs.
+type ParamSchema struct {
+	Name             string   `json:"name"`
+	Description      string   `json:"description,omitempty"`
+	Allowed          []string `json:"allowed,omitempty"`
+	Pattern          string   `json:"pattern,omitempty"`
+	AllowLeadingDash bool     `json:"allow_leading_dash,omitempty"`
+}
+
+type ActionInfo struct {
+	Name        string        `json:"name"`
+	Description string        `json:"description,omitempty"`
+	Params      []ParamSchema `json:"params"`
+}
+
+type ActionListResult struct {
+	Actions []ActionInfo `json:"actions"`
+}
+
+type ActionRunParams struct {
+	Common
+	Name   string            `json:"name"`
+	Params map[string]string `json:"params,omitempty"`
+}
+
+// ActionRunResult is how the action's command exited. Stdout is left out
+// when it is withheld: a non-zero exit without return_on_failure.
+type ActionRunResult struct {
+	ExitCode       int    `json:"exit_code"`
+	Stdout         string `json:"stdout,omitempty"`
+	StdoutEncoding string `json:"stdout_encoding,omitempty"`
+	StderrTail     string `json:"stderr_tail,omitempty"`
+	StderrEncoding string `json:"stderr_encoding,omitempty"`
+}
+
+// ActionRunLen is the length of the encoded action.run result, measured
+// without copying the output. A nil stdout is one that is withheld.
+func ActionRunLen(exitCode int, stdout, stderrTail []byte) int {
+	r := ActionRunResult{ExitCode: exitCode}
+	n := 0
+	// Empty strings are left out, so each part adds its key too.
+	if stdout != nil {
+		r.StdoutEncoding = valueEncoding(stdout)
+		if len(stdout) > 0 {
+			n += len(`,"stdout":`) + ValueLen(stdout)
+		}
+	}
+	if len(stderrTail) > 0 {
+		r.StderrEncoding = valueEncoding(stderrTail)
+		n += len(`,"stderr_tail":`) + ValueLen(stderrTail)
+	}
+	b, err := Marshal(r)
+	if err != nil {
+		return MaxMessage + 1
+	}
+	return len(b) + n
 }

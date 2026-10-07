@@ -23,6 +23,8 @@ var clientMethods = map[string]bool{
 	protocol.MethodSecretRead:   true,
 	protocol.MethodGrantsStatus: true,
 	protocol.MethodGrantsDrop:   true,
+	protocol.MethodActionList:   true,
+	protocol.MethodActionRun:    true,
 }
 
 // managementMethods are host CLI operations. They exist on no socket; a realm
@@ -247,7 +249,7 @@ func (s *Server) dispatch(ctx context.Context, st *connState, call core.Call, re
 		}
 		return protocol.HelloResult{
 			Protocol: protocol.Version, Instance: st.inst.Name, Realm: st.inst.Realm,
-			ServerVersion: s.opts.Version, Features: []string{protocol.MethodSecretList, protocol.MethodSecretRead, protocol.MethodGrantsStatus, protocol.MethodGrantsDrop},
+			ServerVersion: s.opts.Version, Features: features,
 		}, nil
 
 	case protocol.MethodSecretList:
@@ -291,9 +293,13 @@ func (s *Server) dispatch(ctx context.Context, st *connState, call core.Call, re
 		if e := s.decode(&call, req.Params, &p); e != nil {
 			return nil, e
 		}
+		gs, err := s.opts.Core.Grants(ctx, call)
+		if err != nil {
+			return nil, asProtocol(err)
+		}
 		out := protocol.GrantsStatusResult{Grants: []protocol.GrantInfo{}}
-		for _, g := range s.opts.Core.Grants(call) {
-			out.Grants = append(out.Grants, protocol.GrantInfo{Name: g.Resource.ID, Scope: g.Scope, ApprovalID: g.ApprovalID, ExpiresAt: g.ExpiresAt})
+		for _, g := range gs {
+			out.Grants = append(out.Grants, protocol.GrantInfo{Name: g.Resource.ID, Kind: g.Resource.Kind, Params: g.Params, Scope: g.Scope, ApprovalID: g.ApprovalID, ExpiresAt: g.ExpiresAt})
 		}
 		return out, nil
 
@@ -307,6 +313,45 @@ func (s *Server) dispatch(ctx context.Context, st *connState, call core.Call, re
 			return nil, asProtocol(err)
 		}
 		return protocol.GrantsDropResult{Dropped: n}, nil
+
+	case protocol.MethodActionList:
+		var p protocol.ActionListParams
+		if e := s.decode(&call, req.Params, &p); e != nil {
+			return nil, e
+		}
+		rs, err := s.opts.Core.ListActions(ctx, call)
+		if err != nil {
+			return nil, asProtocol(err)
+		}
+		out := protocol.ActionListResult{Actions: []protocol.ActionInfo{}}
+		for _, r := range rs {
+			info := protocol.ActionInfo{Name: r.Ref.ID, Description: r.Description, Params: []protocol.ParamSchema{}}
+			for _, pa := range r.Params {
+				info.Params = append(info.Params, protocol.ParamSchema{Name: pa.Name, Description: pa.Description,
+					Allowed: pa.Allowed, Pattern: pa.Pattern, AllowLeadingDash: pa.AllowLeadingDash})
+			}
+			out.Actions = append(out.Actions, info)
+		}
+		return out, nil
+
+	case protocol.MethodActionRun:
+		var p protocol.ActionRunParams
+		if e := s.decode(&call, req.Params, &p); e != nil {
+			return nil, e
+		}
+		o, err := s.opts.Core.RunAction(ctx, call, p.Name, p.Params)
+		if err != nil {
+			return nil, asProtocol(err)
+		}
+		defer o.Zero()
+		out := protocol.ActionRunResult{ExitCode: o.ExitCode}
+		if o.Stdout != nil {
+			out.Stdout, out.StdoutEncoding = protocol.EncodeValue(o.Stdout)
+		}
+		if len(o.StderrTail) > 0 {
+			out.StderrTail, out.StderrEncoding = protocol.EncodeValue(o.StderrTail)
+		}
+		return out, nil
 	}
 	return nil, protocol.NewError(protocol.CodeMethodNotFound, "unknown method %q", req.Method)
 }
@@ -359,3 +404,7 @@ func zero(b []byte) {
 		b[i] = 0
 	}
 }
+
+// features are the methods server.hello advertises.
+var features = []string{protocol.MethodSecretList, protocol.MethodSecretRead, protocol.MethodGrantsStatus,
+	protocol.MethodGrantsDrop, protocol.MethodActionList, protocol.MethodActionRun}

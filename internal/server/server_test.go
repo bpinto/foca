@@ -132,7 +132,7 @@ func TestRequestApprovalAuditOverRealSocket(t *testing.T) {
 	if err := c.Call(ctx(t), protocol.MethodHello, protocol.HelloParams{Protocol: 1}, &hello); err != nil {
 		t.Fatal(err)
 	}
-	if hello.Instance != "dev" || hello.Protocol != 1 || len(hello.Features) != 4 {
+	if hello.Instance != "dev" || hello.Protocol != 1 || len(hello.Features) != 6 {
 		t.Fatalf("hello %+v", hello)
 	}
 

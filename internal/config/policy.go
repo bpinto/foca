@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 
@@ -86,6 +87,15 @@ func (c *Config) checkGuestScopes() []error {
 	for _, id := range sortedKeys(c.SecretPolicies) {
 		check("secrets."+id+".policy", c.SecretPolicies[id], c.Instances)
 	}
+	for _, id := range sortedKeys(c.ActionPolicies) {
+		var users []Instance
+		for _, inst := range c.Instances {
+			if slices.Contains(inst.Actions, id) {
+				users = append(users, inst)
+			}
+		}
+		check("actions."+id+".policy", c.ActionPolicies[id], users)
+	}
 	if p, ok := c.AuthenticatorPolicies[c.Plugins.Authenticator]; ok {
 		check("authenticators."+c.Plugins.Authenticator+".policy", p, c.Instances)
 	}
@@ -114,4 +124,23 @@ func sortedKeys[V any](m map[string]V) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// ActionPolicy is the policy for inst running action id (design §11.1): the
+// action's own levels (instance, action, the configured authenticator, the
+// floor) met with the policy of every secret it uses, so a strict secret
+// can't be loosened by putting it inside an action. Vault levels count only
+// through those secrets.
+func (c *Config) ActionPolicy(inst Instance, id string) policy.Policy {
+	p := policy.Effective(
+		inst.Policy,
+		c.ActionPolicies[id],
+		c.AuthenticatorPolicies[c.Plugins.Authenticator],
+	)
+	if s := c.Actions[id]; s != nil {
+		for _, sid := range s.SecretIDs() {
+			p = policy.Meet(p, c.SecretPolicy(inst, sid))
+		}
+	}
+	return p
 }

@@ -64,6 +64,11 @@ type Instance struct {
 	// Policy is the folded config policy for reading a secret, by its full
 	// name (design §9.2). nil means every-time.
 	Policy func(name string) policy.Policy
+	// Actions are the actions offered to this instance (design §11); nil
+	// means none. ActionPolicy is the folded policy for running one, the
+	// secrets it uses included; nil means every-time.
+	Actions      plugin.Provider
+	ActionPolicy func(actionID string) policy.Policy
 }
 
 // visibleTo lists the realms of every instance that may read secret id in
@@ -93,6 +98,9 @@ type Service struct {
 	grants  map[grantKey]*grant
 	denials map[denialKey]*denial
 	strikes map[string][]strike // per instance, oldest first
+	// running counts the actions each instance has in flight, from before
+	// their approval until their command has exited.
+	running map[string]int
 	// healthy: platform events are reporting, so grants can be wiped on
 	// sleep and lock. Reuse is off while it is false (design D13).
 	healthy bool
@@ -136,7 +144,7 @@ func New(opts Options, instances []*Instance, stores map[string]plugin.SecretSto
 	}
 	s := &Service{opts: opts, instances: map[string]*Instance{}, stores: stores, queue: newPromptQueue(opts.MaxQueue, len(instances)),
 		rej: rejections{windows: map[string]*rejWindow{}}, grants: map[grantKey]*grant{}, denials: map[denialKey]*denial{},
-		strikes: map[string][]strike{}}
+		strikes: map[string][]strike{}, running: map[string]int{}}
 	for _, i := range instances {
 		s.instances[i.Name] = i
 	}
@@ -387,6 +395,12 @@ func (s *Service) internal(ctx context.Context, c Call, typ, id string, err erro
 	if id != "" {
 		e.Resource = &audit.Resource{Kind: "secret", ID: id}
 	}
+	return s.internalEvent(ctx, c, e, err)
+}
+
+// internalEvent records e as a failure with err and returns the error for
+// the caller.
+func (s *Service) internalEvent(ctx context.Context, c Call, e *audit.Event, err error) error {
 	if errors.Is(err, plugin.ErrNotInitialized) {
 		e.Error = &audit.ErrorInfo{Code: protocol.CodeName(protocol.CodeNotInitialized), Message: err.Error()}
 		seq, aerr := s.record(ctx, c, e)

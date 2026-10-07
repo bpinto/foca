@@ -187,3 +187,42 @@ func TestRequestEnvelopeRejectsDuplicates(t *testing.T) {
 		t.Fatalf("valid request: %+v %v", req, err)
 	}
 }
+
+// Two parsers must never read different params out of one action.run: a
+// repeated param name is refused, not resolved to its last value.
+func TestActionRunParamsAreStrict(t *testing.T) {
+	var p ActionRunParams
+	if err := DecodeParams([]byte(`{"name":"aws","params":{"profile":"dev-admin"}}`), &p); err != nil || p.Params["profile"] != "dev-admin" {
+		t.Fatalf("%v %+v", err, p)
+	}
+	for _, bad := range []string{
+		`{"name":"aws","params":{"profile":"dev-admin","profile":"prod-admin"}}`,
+		`{"name":"aws","params":{"profile":1}}`,
+		`{"name":"aws","command":"/bin/sh"}`,
+		`{"Name":"aws"}`,
+	} {
+		var p ActionRunParams
+		if err := DecodeParams([]byte(bad), &p); err == nil {
+			t.Errorf("accepted %s", bad)
+		}
+	}
+}
+
+// The measured length of an action.run result is what the encoder writes,
+// with stdout withheld, empty or present.
+func TestActionRunLenMatchesTheEncoder(t *testing.T) {
+	for _, c := range []struct {
+		stdout, stderr []byte
+	}{{nil, nil}, {[]byte{}, nil}, {[]byte("out\n"), nil}, {nil, []byte("warn")}, {[]byte{0xff}, []byte("e\x01")}} {
+		r := ActionRunResult{ExitCode: 3}
+		if c.stdout != nil {
+			r.Stdout, r.StdoutEncoding = EncodeValue(c.stdout)
+		}
+		if len(c.stderr) > 0 {
+			r.StderrTail, r.StderrEncoding = EncodeValue(c.stderr)
+		}
+		if b, _ := Marshal(r); len(b) != ActionRunLen(3, c.stdout, c.stderr) {
+			t.Errorf("%q %q: ActionRunLen %d, encoded %d (%s)", c.stdout, c.stderr, ActionRunLen(3, c.stdout, c.stderr), len(b), b)
+		}
+	}
+}

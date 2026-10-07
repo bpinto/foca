@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"text/tabwriter"
+	"unicode"
 
 	"github.com/bpinto/foca/internal/client"
 	"github.com/bpinto/foca/internal/config"
@@ -201,16 +202,25 @@ func (ListCmd) Run(g *Globals, e *Env) error {
 		if s.DisplayName != "" {
 			desc = strings.TrimSpace(s.DisplayName + ": " + desc)
 		}
-		fmt.Fprintf(w, "%s\t%s\n", s.Name, clean(desc))
+		fmt.Fprintf(w, "%s\t%s\n", clean(s.Name), clean(desc))
 	}
 	return w.Flush()
 }
 
-// clean keeps service-supplied text from moving the terminal cursor or
-// breaking the table.
-func clean(s string) string {
+// clean keeps service-supplied text from moving the terminal cursor,
+// reordering what is shown (bidi overrides) or breaking the table.
+func clean(s string) string { return sanitize(s, false) }
+
+// cleanLines is clean for text that runs over lines, such as an action's
+// stderr or an error message: line breaks and tabs are kept.
+func cleanLines(s string) string { return sanitize(s, true) }
+
+func sanitize(s string, lines bool) string {
 	return strings.Map(func(r rune) rune {
-		if r < 0x20 || r == 0x7f || (r >= 0x80 && r < 0xa0) {
+		if lines && (r == '\n' || r == '\t') {
+			return r
+		}
+		if r < 0x20 || r == 0x7f || (r >= 0x80 && r < 0xa0) || unicode.Is(unicode.Cf, r) {
 			return -1
 		}
 		return r

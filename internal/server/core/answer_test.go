@@ -33,3 +33,27 @@ func TestReadThatCantBeAnsweredIsRefusedNotServed(t *testing.T) {
 		t.Fatalf("600 KiB value: %v", err)
 	}
 }
+
+// bigOutput makes every run's stdout too large for one answer.
+type bigOutput struct{ plugin.Provider }
+
+func (b bigOutput) Serve(ctx context.Context, r plugin.Resource, params map[string]string) (plugin.Result, error) {
+	res, err := b.Provider.Serve(ctx, r, params)
+	res.Value = bytes.Repeat([]byte{0xff}, 800<<10)
+	return res, err
+}
+
+func TestRunWhoseOutputCantBeAnsweredReturnsNothing(t *testing.T) {
+	h := newHarness(t, fake.Approve)
+	withActions(t, h)
+	h.inst.Actions = bigOutput{h.inst.Actions}
+	out, err := h.run(t, h.call(), "aws", map[string]string{"profile": "dev-admin"})
+	if out != nil || code(err) != protocol.CodeInternal {
+		t.Fatalf("got %+v, %v", out, err)
+	}
+	evs := h.sink.Events()
+	wantTypes(t, evs, "approval.granted:ok", "action.run:error")
+	if r := evs[1]; r.Reason != "response_too_large" || r.Run == nil || r.Run.StdoutReturned {
+		t.Fatalf("run recorded as %+v", r)
+	}
+}

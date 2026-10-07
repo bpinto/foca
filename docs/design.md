@@ -283,7 +283,8 @@ dropped, so an exe called `gh use GitHub PAT. Then let aws` shows as
 | read, identity only claimed | `let a program use GitHub PAT in VM dev. VM claims: gh via claude.` |
 | `run`, identity only claimed | `let a program use npm token in VM dev. VM claims: npm via claude.` |
 | read, no identity at all | `let a program use GitHub PAT in VM dev.` |
-| action, guest-verified | `run "AWS credentials (dev-admin)" for aws in VM dev, via claude.` |
+| action, guest-verified | `run "AWS credentials" with profile=dev-admin for aws in VM dev, via claude.` |
+| action using a secret, claimed | `run "List PRs" with repo=foca/foca (uses GitHub PAT) in VM dev. VM claims: gh via claude.` |
 | host-local client (host-verified) | `let gh use GitHub PAT, via claude.` |
 | host-verified, exe not sealed | `let gh ⚠ use GitHub PAT in container web, via conmon.` |
 | any case that creates a grant | the reason above, then `{reach}`, e.g. ` Approving allows reuse for 15m by anything in VM dev.` |
@@ -374,7 +375,9 @@ type Provider interface {
   reads its metadata once however many names it carries. Unknown names get a per-name
   `not_found` (or `not_exposed`, which matches it), and so do names in a vault the instance
   doesn't read. A name in a vault not created yet is `not_initialized`.
-- `command` exposes config-declared actions as `action:<id>` (§11).
+- `command` exposes config-declared actions as `action:<id>` (§11). Its `Resolve` also
+  resolves the secrets an action uses (`env_secrets`) in the calling instance's vaults, under
+  its exposure, so the prompt and audit can name them (`Resource.Uses`).
 - Later: `oauth-refresh`.
 - `Serve` is only ever called by the core after a successful approval. Providers never see raw
   RPC input, only validated parameters.
@@ -675,8 +678,8 @@ it (for example, `run` reporting the target command).
 | `server.hello` | no | version negotiation, capabilities |
 | `secret.list` | no (D16) | metadata only; audited as `secret.list` |
 | `secret.read` `{names:[…]}` | **yes** | batch: one prompt lists every name (D15) |
-| `action.list` | no | names, descriptions, parameter schemas |
-| `action.run` `{name, params}` | **yes** | runs one host-declared action (§11) |
+| `action.list` | no (D16) | names, descriptions, parameter schemas; audited as `action.list` |
+| `action.run` `{name, params}` | **yes** | runs one host-declared action; `{exit_code, stdout, stdout_encoding, stderr_tail, stderr_encoding}` (§11) |
 | `grants.status` | no | caller's live reuse grants (none by default): the ones a request from this caller would reuse; not audited, since it changes nothing and returns no secret material; `foca grants` |
 | `grants.drop` `{names?}` | no | drop caller's grants, all or by name; tightening is always allowed; audited as `grants.drop`; `foca grants --drop` |
 
@@ -783,7 +786,9 @@ treated as config (rule 3).
   `[Plugins]` or `Approval = …` is an unknown key, not another spelling of a known one.
 - Durations parse as Go durations and must be within limits (§9.4). The service rejects
   out-of-range values; it never clamps them silently.
-- Actions must use absolute command paths, and every placeholder must be declared (§11).
+- Actions must use absolute command paths, every placeholder must be declared and every
+  declared param used (§11). An offered action's command must pass the helper trust check at
+  start-up.
 - The exposure rules in §7.1 hold. For example, a vault can't be shared by accident.
 - `touchid`, `keychain` and `platform_events = "darwin"` are refused on any OS but macOS
   (test builds excepted, so the fake helper can stand in on Linux).
@@ -1022,8 +1027,17 @@ continues.
   the secrets a `secret.list` returned. **`coalesced`** appears only on an event that stands
   for a burst of others like it (§9.6), e.g. `"coalesced": {"count": 41, "after_seq": 1042}`:
   how many were folded into it, and the seq of the event, written in full, that they followed.
+  Where several reasons share a window (§9.6), it also says how many had each, e.g.
+  `"reasons": {"unknown": 30, "not_exposed": 11}`, and its own `reason` is the shared one.
+- **`uses`** lists the secrets an action reads on the host (`env_secrets`), on its approval
+  and `action.run` events. **`run`** records how the command ran: `exit_code` (-1 if killed by
+  a signal), `duration_ms`, `stdout_bytes`, `stdout_returned`, `stderr_bytes`,
+  `stderr_sha256`, `masked` and `timed_out`.
 - Never logged: secret values, action stdout, action env, and DEKs. Action stderr is logged
-  only as length plus sha256.
+  only as length plus sha256, and only as length for an action that uses secrets: a hash of
+  output that may hold one would let anyone with the log test guesses of it. A rejected
+  param value appears only quoted and cut to 64 bytes inside `error.message`, never in
+  `params`, which holds validated values only.
 
 ### 8.2 Event types
 
@@ -1037,8 +1051,8 @@ grants dropped) · `request.rejected`.
 `request.rejected` covers every request the socket refuses before it reaches the pipeline,
 with `reason` set to `forbidden_on_socket`, `parse_error`, `invalid_request` (including
 notifications), `method_not_found`, `invalid_params`, `protocol_unsupported`,
-`message_too_large`, `busy`, `rate_limited`, `prompt_too_long`, `denial_backoff`,
-`prompt_cooldown`, or a connection-level reason (`too_many_connections`,
+`message_too_large`, `busy`, `rate_limited`, `too_many_running` (§11), `prompt_too_long`,
+`denial_backoff`, `prompt_cooldown`, or a connection-level reason (`too_many_connections`,
 `too_many_pipelined`, `connection_closed` for requests a client left queued when it hung up,
 and the identification refusals of §2.1). The method name a client sent is kept to
 method-name characters, at most 64 bytes. Bursts are coalesced (§9.6).
@@ -1191,8 +1205,10 @@ What follows:
 
 - A successful fresh approval under a `Reuse` policy creates a grant:
   `{approval_id, resource, scope_key, expires_at = now + window}`. Grants are per resource, so
-  approving `github-pat` doesn't cover `npm-token`. Host CLI operations never create or reuse
-  grants.
+  approving `github-pat` doesn't cover `npm-token`. An action's grant also covers only the
+  validated params it was approved with: approving `aws-creds` with `profile=dev-admin` never
+  covers `profile=prod-admin`, and an action grant never covers a read of a secret it uses.
+  Host CLI operations never create or reuse grants.
 - **Scope keys.** `connection` is keyed on the connection, `peer-session` on the peer's durable
   session (§4.6), and both on the instance. If the caller lacks a component, for example a peer
   whose pid isn't pinned or has no session, that read is `EveryTime`: no grant is made or
@@ -1269,7 +1285,12 @@ a second Ctrl-C ends it at once.
 
 **Unapproved events are coalesced in the audit log.** These are the events a realm can cause
 without any approval: `request.rejected` (`busy`, `forbidden_on_socket`, refused connections
-and so on), `secret.read` with outcome `not_found`, and `secret.list`. Bursts are folded per
+and so on), `secret.read` with outcome `not_found`, `secret.list`, `action.list`,
+`action.run` refused before approval (`not_found`, a secret it uses that the instance can't
+read, `param_rejected`), and a `grants.drop` that dropped nothing. A request for which no
+prompt was ever shown is one of them too: when no prompt can be shown here (a headless polkit,
+a closed laptop) it is a `request.rejected` with `reason: auth_unavailable`, and when its client
+left while it waited, one with `reason: cancelled`. Bursts are folded per
 **instance, type and reason**, not per peer, because a caller can fork new processes but can't
 change its realm. The first event in a 10 s window is written at once and in full, with the
 name it asked for. Later ones are counted, and the count is written as one event of the same
@@ -1375,32 +1396,84 @@ planned but not built (§17).
 
 ### D14: Allowlisted actions — no shell, placeholders that never split or join arguments, constrained parameters, clean environment
 
-- **Actions exist only in host config.** The caller sends `{name, params}`. Unknown names or
-  unknown params are refused with `param_rejected`, which is audited.
-- **`command` is an absolute path, checked like a helper path.** It is run with `execve`
-  directly, never through a shell.
+- **Actions exist only in host config.** The caller sends `{name, params}`. An unknown name, or
+  an action the instance isn't offered, is `not_found`. Unknown, missing or failing params are
+  refused with `param_rejected`. Both are audited (coalesced, §9.6) before any prompt.
+- **`command` is an absolute, clean path, checked like a helper path** (§5): the file and
+  every directory above it owned by root or the user and not group- or world-writable, and the
+  file executable. The check runs at start-up for every offered action (the service refuses
+  to start otherwise) and again before every run. The resolved path is what runs; `argv[0]`
+  is the configured path, so multi-call binaries still see their name. It is run with
+  `execve` directly, never through a shell.
 - **Placeholders are `{param}` inside `args` elements.** Partial interpolation like
   `--profile={profile}` is allowed because there is no shell. One argv element always stays
-  one argv element: substitution never splits words.
-- Each parameter must declare exactly one constraint:
+  one argv element: substitution never splits or joins words. `{{` and `}}` are literal
+  braces; any other brace is a config error.
+- **Every declared param is required and used.** A placeholder that isn't declared, or a
+  declared param no argument uses, is a config error: an unused param would be on the
+  prompt and do nothing. Names match `^[a-z][a-z0-9_]{0,31}$`; an action has at most 16.
+- Each parameter must declare exactly one constraint, plus an optional `description`:
   - `allowed = [...]`: exact match.
-  - `pattern = "^[a-z0-9-]{1,64}$"`: anchored RE2 regex, always fully matched.
+  - `pattern = "^[a-z0-9-]{1,64}$"`: RE2, always fully matched: the service wraps it as
+    `^(?:…)$`, so a missing anchor can't let anything through around the part that matched.
+    It must compile on its own first: an unbalanced pattern such as `[a-z]+)|(.*` would
+    otherwise close the wrapping group and match anything.
   - Values starting with `-` are refused unless `allow_leading_dash = true`, to stop option
-    injection.
-  - NUL and control characters are always refused.
-- **Environment is exactly `env` from config** plus `FOCA_ACTION=<name>`. Nothing is
-  inherited from the caller. stdin is `/dev/null`.
+    injection. An `allowed` entry starting with `-` without it is a config error.
+  - Whatever the constraint: values are non-empty, at most 256 bytes, valid UTF-8, and hold
+    no control, Unicode format or separator characters other than a plain space (newlines,
+    NUL, escapes, bidi overrides, line and paragraph separators, no-break and other spaces).
+  - Only a leading `-` is refused for every param. Other characters mean something to many
+    commands at the start of a value: `@file` (`curl -d @file`, `gh api -F key=@file`, response
+    files), `+` and `<`. Inside a larger argument (`--opt=key={value}`), `,` and `=` can add
+    sub-options. Give such a param an `allowed` list, or a pattern that refuses them, for
+    example `pattern = "[A-Za-z0-9_][A-Za-z0-9_./:-]{0,63}"`.
+- **Environment is exactly `env` from config** plus `FOCA_ACTION=<name>` (and `env_secrets`,
+  §11.1). Nothing is inherited from the caller or the service, not even `PATH`. stdin is
+  `/dev/null` and the working directory is `/`.
 - **Limits.**
-  - `timeout`: the process group is killed when it passes.
-  - `output.max_bytes`.
-  - Optional `output.format` validator (`aws-credential-process`, `json`, `text`). If
+  - `timeout` (default 60s, 1s–30m): when it passes, the process group gets SIGTERM, then
+    SIGKILL 2 s later if the command is still running. The command runs in its own process
+    group. After a timeout or a cancel, whatever is left of the group is killed as soon as
+    the command exits, children that ignored SIGTERM included. A client that hangs up during
+    a run cancels it the same way. After a normal exit, the rest of the group is killed too
+    when the action has `env_secrets`, so no child keeps them (§11.1). The group of an
+    action without them is left alone, since `granted sso login` may leave a browser running
+    in it; a child still holding the command's stdout or stderr gets 2 s before the pipes are
+    closed. The group is signalled only while the command is still unreaped, so its id can't
+    have been reused by another group. A child that calls `setsid()` or `setpgid()` leaves
+    the group and is not killed (§12.4).
+  - `output.max_bytes` (default 64 KiB, at most 512 KiB, so a result fits in one message):
+    passing it stops the command and the result is `error`.
+  - Optional `output.format` validator: `aws-credential-process` (a JSON object with
+    `Version` 1, non-empty `AccessKeyId` and `SecretAccessKey`, optional `SessionToken`, and
+    an RFC 3339 `Expiration` if present), `json` (one valid JSON value) or `text` (UTF-8 with
+    no control characters but tab, CR and LF). It checks stdout on exit 0, after masking. If
     validation fails, the result is `error` and nothing is returned.
-- **Result:** `{exit_code, stdout(base64|utf8), stderr_tail(≤4 KiB)}`. stdout is returned
-  only on exit 0, unless `return_on_failure = true`.
+  - At most 4 actions per instance are in flight at once, from before their approval until
+    their command exits; more are refused as `busy` (`too_many_running`).
+- **Result:** `{exit_code, stdout, stdout_encoding, stderr_tail, stderr_encoding}`, with
+  `utf8` or `base64` encodings as for secrets, and `stderr_tail` the last 4 KiB. stdout is
+  returned only on exit 0, unless `return_on_failure = true`. A timeout is `timeout`; an
+  output that is too large or fails its format, a command that fails its trust check or can't
+  start, or a secret that can't be read is an error, and nothing is returned. So is a result
+  that wouldn't fit in one message (`response_too_large`, an `internal` error to the
+  client). The `action.run` event records which (§8.1).
+- **Policy.** `[actions.<id>.policy]` is the resource level (§9.2). The action's policy folds
+  instance, action and authenticator levels and the floor; then it is met with the policy of
+  each secret it uses (§11.1). A grant covers only the params it was approved with (§9.5).
+- **CLI.** `foca exec <action> [-p name=value]…` writes stdout to stdout and the stderr tail
+  to stderr, and exits with the action's exit code. Like `get`, it refuses to write a non-empty
+  stdout to a terminal (the action has run by then; its stderr is still shown). The stderr
+  tail and the service's error messages are printed without control or format characters,
+  keeping line breaks and tabs.
+  `foca actions` lists what the realm is offered. `foca policy explain` shows each instance's
+  actions.
 - **First targets** (replacing aws-cred-broker):
 
 ```toml
 [actions.aws-creds]
+description = "AWS credentials"
 command = "/…/granted"
 args    = ["credential-process", "--profile", "{profile}"]
 output  = { format = "aws-credential-process" }
@@ -1423,6 +1496,7 @@ environment, so the VM gets only the result:
 
 ```toml
 [actions.gh-pr-list]
+description  = "List PRs"
 command      = "/…/bin/gh"
 args         = ["pr", "list", "--repo", "{repo}"]
 env_secrets  = { GH_TOKEN = "common:github-pat" }   # vault secret → child env, on the host
@@ -1431,14 +1505,35 @@ mask_output  = true                          # default true when env_secrets is 
   pattern = "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
 ```
 
-- The approval prompt and the audit event list both the action and every secret it uses.
-  The effective policy is the `meet` of the action's policy and each secret's policy (§9), so
-  a strict secret can't be loosened by putting it inside an action.
-- Masking replaces the value, and its base64, hex and URL-encoded forms, with
-  `[hidden:<id>]` in stdout and stderr. Masking is **best effort**: a host-declared command
-  is trusted not to deliberately re-encode its secrets. The real guarantee is that the
-  command and its arguments are fixed by host config.
-- Secrets are decrypted only for the life of the child process, then zeroed.
+- **The secrets come from the calling instance's vaults, under its exposure.** An action
+  can't use a secret the instance couldn't read: such a run is `not_found` and audited as
+  `action.run` with `reason: uses_unexposed_secret` (or `uses_unknown_secret`).
+  `env_secrets` names each secret in full (`common:github-pat`), so config loading already
+  refuses an offered action whose secret the instance's `expose` leaves out; whether a secret
+  in a vault the instance reads whole exists is checked at run time.
+- The approval prompt and the audit event list both the action and every secret it uses
+  (`uses`). The action's policy is met with each secret's policy (§9), so a strict secret
+  can't be loosened by putting it inside an action. A vault's policy counts only through
+  the secrets an action uses: it never makes an action's reuse opt-in on its own.
+- Masking replaces the value, and its base64 (standard and URL alphabets, padded or not),
+  hex (either case), URL-encoded (query and path) and JSON-string-escaped (with and without
+  escaping `&`, `<` and `>`, and with `/` written as is or as `\/`) forms, with
+  `[hidden:<vault>:<id>]` in stdout and stderr. All matches are found before any is replaced;
+  matches that overlap, of one secret or of several, are hidden as one range, under the mark
+  of the match that starts first. The stderr tail is masked over enough bytes before it that
+  a value reaching into the tail is seen whole, so no part of one shows. If
+  marks make stdout grow past 512 KiB, the result is refused. Masking is **best effort**: a
+  value inside a longer base64 blob at another alignment, or JSON-escaped by an encoder that
+  writes other characters as `\u` escapes (every non-ASCII one, say), gets through. A
+  host-declared command is trusted not to deliberately re-encode its secrets. The real
+  guarantee is that the command and its arguments are fixed by host config.
+  `mask_output = true` without `env_secrets` is a config error; `mask_output = false` turns
+  masking off.
+- Secrets are decrypted only once the run is approved, and only for the life of the command:
+  whatever is left of its process group is killed when it exits (§11; a child that leaves
+  the group survives, §12.4), and the service's copies are then zeroed. The copy in the
+  child's environment block is a Go string, which can't be zeroed (§12.4). A value holding a
+  NUL can't be put in an environment variable, and the run fails.
 
 ---
 
@@ -1516,6 +1611,10 @@ Secret values; the DEK; the ability to run host actions; config integrity; audit
   `.app`.
 - **Go memory hygiene.** Values are kept as `[]byte` and zeroed after use, but the GC may have
   copied them, and the JSON encoder makes intermediate copies. This is best effort.
+- **Children that leave an action's process group.** foca kills what is left of the group
+  after a timeout, a cancel, or the exit of an action with `env_secrets` (§11). A child that
+  calls `setsid()` or `setpgid()` is no longer in it, and keeps running with whatever
+  secrets are in its environment. A host-declared command is trusted not to do that.
 - **Client-reported identity.** It can be forged. It is labelled, never trusted, and kept
   separate.
 - **Sealed names on Nix.** Any user who can reach the Nix daemon can add a root-owned file with
@@ -1692,8 +1791,9 @@ internal/plugin/helper/   helper adapter (authenticator, key protector, events o
                           helper and the conformance suite
 internal/darwinproc/      macOS process reads without cgo: audit token, pid version, exe path
 internal/policy/          approval-policy lattice: meet, effective policy, the code floor, reach wording
+internal/action/          action specs: param checks, argument templates, output formats, masking
 internal/plugins/…        authn/fake, store/memory, store/vaultfile, keyprot/file, provider/static,
-                          peer (linux, darwin), events/logind; later keyprot/*, provider/command
+                          provider/command, peer (linux, darwin), events/logind; later keyprot/*
 internal/audit/           event types (v1) + sinks: memory, jsonl
 internal/config/          TOML load and validation, paths
 internal/identity/        host-verified, guest-verified and reported identity, one distinct type each
@@ -1743,7 +1843,7 @@ noted; packages are named as in `go test` output (`main` is `cmd/foca`, whose te
 | uid mismatch, wrong kind of peer, and every other refusal audited | `server.TestUIDMismatchIsRefusedAndAudited`, `server.TestNonProxyPeerRefusedOnOpaqueRealm`, `server.TestProxyPeerRefusedOnDirectRealm`, `server.TestEveryRefusedRequestIsAudited` |
 | verified, guest-verified and reported identity kept apart | `audit.TestVerifiedAndReportedStaySeparateOnTheWire`, `core.TestIdentityLevelsHaveDistinctTypes` |
 | prompts: claims never stated as fact, unsealed names marked, no name elided | `core.TestPromptWording`, `core.TestPromptNeverElidesCredentials`, `core.TestOversizedBatchRefusedBeforePrompting`, `peer.TestMountsCantLendASealedName`, `peer.TestLoadedCodeMustBeSealedToo` |
-| a realm can't exhaust the service or flood the log | `server.TestConnectionCapPerInstance`, `core.TestReadsAndListsAreRateLimited`, `core.TestUnapprovedEventsAreCoalesced` |
+| a realm can't exhaust the service or flood the log | `server.TestConnectionCapPerInstance`, `core.TestReadsAndListsAreRateLimited`, `core.TestUnapprovedEventsAreCoalesced`, `core.TestTooManyRunningIsBusy` |
 | config rejections and file trust | `config.TestRejections`, `config.TestPolicyRejections`, `config.TestLoadChecksFileTrust` |
 | test-only plugins unreachable in a production build | `wiring.TestFakeAuthenticatorRefusedInProductionBuild`, `cli.TestServiceDoesNotImportCLIUI` |
 | **Vaults, exposure and the host CLI** | |
@@ -1760,17 +1860,17 @@ noted; packages are named as in `go test` output (`main` is `cmd/foca`, whose te
 | **Policy, grants and wipes** | |
 | lattice laws; no setting loosens; the 8 h cap | `policy.TestLatticeLaws`, `policy.TestEffectiveNeverLoosens`, `policy.TestLooseningAttempts`, `core.TestEightHourCap` |
 | a grant key that differs in any component never reuses | `core.TestGrantKeyMismatchNeverReuses` |
-| sleep-jump watchdog; a missed sleep caught before reuse | `core.TestSleepJumpWatchdog` |
+| sleep-jump watchdog; a missed sleep caught before reuse | `core.TestSleepJumpWatchdog`, `core.TestMissedSleepIsCaughtBeforeReuse` |
 | wipe on every event kind; a wipe during a prompt makes no grant | `core.TestWipeOnEveryEventKind`, `logind.TestLogindReportsEveryEventKind`, `core.TestWipeDuringPromptCreatesNoGrant` |
 | unhealthy or no events → every-time; only logind's signals count | `core.TestUnhealthyEventsMeanEveryTime`, `core.TestNoEventsSourceMeansEveryTime`, `logind.TestLogindIgnoresSignalsFromOthers`, `sysbus.TestSystemBusMustBeServedByRoot` |
 | cooldown, the pause after a closing prompt, one prompt across processes | `core.TestCooldownAfterThreeUnapprovedPrompts`, `core.TestPromptPauseHoldsTheSlot`, `core.TestPromptLockIsSharedAcrossServices` |
 | **Actions** | |
-| injection attempts and unknown params refused before any prompt | — |
-| timeout, cancel and hang-up kill the group | — |
-| environment is exactly config; stdin `/dev/null`, cwd `/` | — |
-| output validation | — |
-| masked output holds no encoding of a secret | — |
-| an action can't loosen its secrets; a grant covers only its params | — |
+| injection attempts and unknown params refused before any prompt | `action.TestValidateRefusesInjectionAttempts`, `action.TestArgvKeepsOneElementPerTemplateElement`, `command.TestParamsReachArgvWithoutAShell`, `protocol.TestActionRunParamsAreStrict`, `core.TestUnknownActionsAndParamsAreRefusedAndAudited` |
+| timeout, cancel and hang-up kill the group | `command.TestTimeoutKillsTheProcessGroup`, `command.TestCancelKillsTheProcessGroup`, `command.TestSecretsActionLeavesNoChildBehind`, `server.TestHangUpDuringRunKillsTheGroup` |
+| environment is exactly config; stdin `/dev/null`, cwd `/` | `command.TestEnvironmentIsExactlyConfig`, `command.TestStdinIsDevNullAndCwdIsRoot` |
+| output validation | `action.TestValidateOutput`, `command.TestOutputValidation` |
+| masked output holds no encoding of a secret | `action.TestMaskTailNeverShowsAPartialSecret`, `action.TestOverlappingSecretsAreMaskedTogether`, `command.TestMaskedOutputContainsNoSecretEncoding` |
+| an action can't loosen its secrets; a grant covers only its params | `config.TestActionPolicyMeetsItsSecrets`, `core.TestActionGrantCoversOnlyItsParams` |
 | **Authenticators and key protectors** | |
 | authenticator conformance (`authntest`) | — |
 | polkit shows nothing it can't control | — |
@@ -1796,8 +1896,6 @@ noted; packages are named as in `go test` output (`main` is `cmd/foca`, whose te
 
 **Not built**
 
-- Actions: the command provider, `action.list` and `action.run`, `foca exec` and
-  `foca actions`.
 - polkit and the TPM key protector, with `foca recover` and `foca rekey`: on Linux, `serve`
   and the host commands have no real authenticator and run only in `foca_testing` builds.
 - Audit log rotation, and `foca events query` and `follow`.
@@ -1816,6 +1914,8 @@ noted; packages are named as in `go test` output (`main` is `cmd/foca`, whose te
   `FOCA_HELPER_INTERACTIVE=1`), whether the dialog says "foca" (§4.1.1), and NSWorkspace
   session notifications under a launchd agent. CI's macOS runner has no Touch ID, so its
   conformance run skips the prompt cases.
+- Actions against the real `granted` and `gh`; the AWS targets are tested through config
+  and the `aws-credential-process` validator.
 - `darwinproc` reaches `getsockopt` and `proc_info` through `unix.Syscall6`, which goes
   through libc's deprecated `syscall()`. It works on current macOS; if Apple removes it,
   those two calls need another route.

@@ -3,12 +3,15 @@ package core
 import (
 	"context"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/bpinto/foca/internal/audit"
 	"github.com/bpinto/foca/internal/plugin"
+	"github.com/bpinto/foca/internal/protocol"
+	"github.com/bpinto/foca/internal/secretname"
 )
 
 // Wipe reasons, recorded in the lock event (design §8.2).
@@ -242,8 +245,13 @@ func (s *Service) handle(ctx context.Context, ev plugin.PlatformEvent, log *slog
 }
 
 // DropGrants drops the caller's grants, all of them or those for names.
-// Tightening is always allowed. It is recorded as grants.drop.
+// Tightening is always allowed. It is recorded as grants.drop. A drop needs
+// no approval, so it costs a token, and one that dropped nothing is
+// coalesced like the other events a realm can cause freely (design §9.6).
 func (s *Service) DropGrants(ctx context.Context, c Call, names []string) (int, error) {
+	if err := s.limit(ctx, c, protocol.MethodGrantsDrop); err != nil {
+		return 0, err
+	}
 	if len(names) > 0 {
 		var perr error
 		if names, perr = s.checkNamesErr(c, names); perr != nil {
@@ -272,16 +280,29 @@ func (s *Service) DropGrants(ctx context.Context, c Call, names []string) (int, 
 	if len(names) > 0 {
 		e.Params = map[string]string{"names": strings.Join(names, ",")}
 	}
-	if _, aerr := s.record(ctx, c, e); aerr != nil {
+	record := s.record
+	if n == 0 {
+		record = s.recordCoalesced
+	}
+	if _, aerr := record(ctx, c, e); aerr != nil {
 		return 0, aerr
 	}
 	return n, nil
 }
 
 func (s *Service) checkNamesErr(c Call, names []string) ([]string, error) {
-	out, perr := s.checkNames(c, names)
-	if perr != nil {
-		return nil, perr
+	if len(names) > maxBatch {
+		return nil, s.fail(c, protocol.CodeInvalidParams, 0, "at most %d names per request", maxBatch)
+	}
+	var out []string
+	for _, n := range names {
+		// Secrets by full name, actions by id.
+		if _, _, ok := secretname.Split(n); !ok && !validSecretID(n) {
+			return nil, s.fail(c, protocol.CodeInvalidParams, 0, "invalid name %q", n)
+		}
+		if !slices.Contains(out, n) {
+			out = append(out, n)
+		}
 	}
 	return out, nil
 }

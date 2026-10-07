@@ -1,6 +1,6 @@
 // Package cli is the foca command line: the service (serve), host
 // management (init, add, edit, remove, reload, stop) and the socket client
-// (list, get, run, grants) that also runs inside realms.
+// (list, get, run, exec, actions, grants) that also runs inside realms.
 //
 // Interaction rules (design D21): prompts appear only when stdin and stderr
 // are terminals, and draw on stderr so stdout stays clean. Secret values are
@@ -103,6 +103,8 @@ type CLI struct {
 	List    ListCmd    `cmd:"" aliases:"ls" help:"List the secrets this realm can see."`
 	Get     GetCmd     `cmd:"" help:"Read secrets to a pipe or a file."`
 	Run     RunCmd     `cmd:"" help:"Run a command with secrets in its environment."`
+	Exec    ExecCmd    `cmd:"" help:"Run an action the host config offers here."`
+	Actions ActionsCmd `cmd:"" help:"List the actions this realm can run."`
 	Reload  ReloadCmd  `cmd:"" help:"Make the running service reload its config (host)."`
 	Lock    LockCmd    `cmd:"" help:"Drop every reuse grant now, so the next access asks again (host)."`
 	Stop    StopCmd    `cmd:"" help:"Stop the running service (host)."`
@@ -155,7 +157,11 @@ func Main(args []string, e *Env, version string) (code int) {
 		}
 	}
 	if err := kctx.Run(&cli.Globals, e); err != nil {
-		fmt.Fprintln(e.Stderr, "foca:", err)
+		if code, ok := asExit(err); ok {
+			return code
+		}
+		// Errors can carry the service's own message.
+		fmt.Fprintln(e.Stderr, "foca:", cleanLines(err.Error()))
 		return 1
 	}
 	return 0

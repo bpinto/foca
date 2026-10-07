@@ -1,11 +1,13 @@
 package core
 
 import (
+	"context"
 	"sort"
 	"time"
 
 	"github.com/bpinto/foca/internal/audit"
 	"github.com/bpinto/foca/internal/policy"
+	"github.com/bpinto/foca/internal/protocol"
 )
 
 // ScopeKey is what a grant is matched on. Every component comes from the
@@ -63,10 +65,12 @@ func (k ScopeKey) audit() *audit.ScopeKey {
 type grant struct {
 	approvalID string
 	resource   audit.Resource
-	scope      policy.Scope
-	key        ScopeKey
-	grantedAt  time.Time
-	expiresAt  time.Time
+	// params are the validated params an action grant was approved with.
+	params    map[string]string
+	scope     policy.Scope
+	key       ScopeKey
+	grantedAt time.Time
+	expiresAt time.Time
 }
 
 func (g *grant) approval(authenticator string) *audit.Approval {
@@ -81,13 +85,17 @@ func (g *grant) approval(authenticator string) *audit.Approval {
 // approval replaces an older one.
 type grantKey struct {
 	resource audit.Resource
-	scope    policy.Scope
-	key      ScopeKey
+	// params is an action's params in canonical form: approving one set of
+	// values never covers another.
+	params string
+	scope  policy.Scope
+	key    ScopeKey
 }
 
 // GrantInfo describes a live grant to the caller it belongs to.
 type GrantInfo struct {
 	Resource   audit.Resource
+	Params     map[string]string
 	Scope      string
 	ApprovalID string
 	ExpiresAt  time.Time
@@ -100,7 +108,7 @@ func (s *Service) wall() time.Time { return s.opts.Now().UTC().Round(0) }
 
 // findGrant returns a live grant that covers resource for the caller under p.
 // Caller holds s.mu.
-func (s *Service) findGrant(c Call, r audit.Resource, p policy.Policy, now time.Time) *grant {
+func (s *Service) findGrant(c Call, r audit.Resource, params string, p policy.Policy, now time.Time) *grant {
 	if p.Kind != policy.Reuse || !s.healthy {
 		return nil
 	}
@@ -108,7 +116,7 @@ func (s *Service) findGrant(c Call, r audit.Resource, p policy.Policy, now time.
 	if !ok {
 		return nil
 	}
-	g := s.grants[grantKey{resource: r, scope: p.Scope, key: k}]
+	g := s.grants[grantKey{resource: r, params: params, scope: p.Scope, key: k}]
 	if g == nil || !now.Before(g.expiresAt) {
 		return nil
 	}
@@ -116,16 +124,24 @@ func (s *Service) findGrant(c Call, r audit.Resource, p policy.Policy, now time.
 }
 
 // Grants lists the caller's live grants: those a request from it would reuse.
-func (s *Service) Grants(c Call) []GrantInfo {
+// It needs no approval and isn't recorded, but it costs a token like a
+// listing.
+func (s *Service) Grants(ctx context.Context, c Call) ([]GrantInfo, error) {
+	if err := s.limit(ctx, c, protocol.MethodGrantsStatus); err != nil {
+		return nil, err
+	}
+	if _, err := s.checkClock(ctx); err != nil {
+		return nil, s.fail(c, protocol.CodeAuditFailed, 0, "could not record the request; refusing it")
+	}
 	now := s.wall()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var out []GrantInfo
 	for gk, g := range s.grants {
 		if k, ok := keyFor(gk.scope, c); ok && k == gk.key && now.Before(g.expiresAt) {
-			out = append(out, GrantInfo{Resource: g.resource, Scope: g.scope.String(), ApprovalID: g.approvalID, ExpiresAt: g.expiresAt})
+			out = append(out, GrantInfo{Resource: g.resource, Params: g.params, Scope: g.scope.String(), ApprovalID: g.approvalID, ExpiresAt: g.expiresAt})
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Resource.ID < out[j].Resource.ID })
-	return out
+	return out, nil
 }

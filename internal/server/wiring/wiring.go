@@ -9,14 +9,17 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
+	"github.com/bpinto/foca/internal/action"
 	"github.com/bpinto/foca/internal/audit"
 	"github.com/bpinto/foca/internal/config"
 	"github.com/bpinto/foca/internal/fsutil"
 	"github.com/bpinto/foca/internal/plugin"
 	"github.com/bpinto/foca/internal/plugin/helper"
 	keyfile "github.com/bpinto/foca/internal/plugins/keyprot/file"
+	"github.com/bpinto/foca/internal/plugins/provider/command"
 	"github.com/bpinto/foca/internal/plugins/provider/static"
 	"github.com/bpinto/foca/internal/plugins/store/memory"
 	"github.com/bpinto/foca/internal/plugins/store/vaultfile"
@@ -218,12 +221,22 @@ func newCore(cfg *config.Config, paths config.Paths, auth plugin.Authenticator, 
 			e := ic.Expose[name]
 			vaults = append(vaults, static.New(name, v.stores[name], static.Exposure{All: e.All, IDs: e.IDs}, v.keys[name]))
 		}
-		instances = append(instances, &core.Instance{
+		secrets := static.NewVaults(vaults...)
+		inst := &core.Instance{
 			Name: ic.Name, Realm: ic.Realm, Vaults: ic.Vaults(),
-			Secrets: static.NewVaults(vaults...),
+			Secrets: secrets,
 			Exposes: ic.Exposes,
 			Policy:  func(name string) policy.Policy { return cfg.SecretPolicy(ic, name) },
-		})
+		}
+		if len(ic.Actions) > 0 {
+			specs := make([]*action.Spec, len(ic.Actions))
+			for i, id := range ic.Actions {
+				specs[i] = cfg.Actions[id]
+			}
+			inst.Actions = command.New(specs, secrets)
+			inst.ActionPolicy = func(id string) policy.Policy { return cfg.ActionPolicy(ic, id) }
+		}
+		instances = append(instances, inst)
 	}
 	return core.New(core.Options{
 		Authenticator: auth, Audit: sink, Keys: v.keys,
@@ -252,6 +265,9 @@ func Build(cfg *config.Config, paths config.Paths, version string, log *slog.Log
 	}
 	if TestBuild {
 		log.Warn("TEST BUILD: test-only plugins are available; never use this binary for real secrets")
+	}
+	if err := checkActions(cfg); err != nil {
+		return nil, err
 	}
 	v, err := openVaults(e, paths)
 	if err != nil {
@@ -313,4 +329,32 @@ func BuildHost(cfg *config.Config, paths config.Paths, log *slog.Logger) (*Host,
 		return nil, err
 	}
 	return &Host{Core: newCore(cfg, paths, auth, sink, v), Audit: sink, Vaults: v.files, Protector: v.protector}, nil
+}
+
+// checkActions runs the command trust checks for every action an instance
+// is offered, at start-up as for helpers (design §5). They run again before
+// every run, so a command replaced later is refused then.
+func checkActions(cfg *config.Config) error {
+	var errs []error
+	for _, id := range sortedActionIDs(cfg) {
+		if _, err := command.CheckCommand(cfg.Actions[id].Command); err != nil {
+			errs = append(errs, fmt.Errorf("actions.%s: %w", id, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func sortedActionIDs(cfg *config.Config) []string {
+	seen := map[string]bool{}
+	var ids []string
+	for _, inst := range cfg.Instances {
+		for _, id := range inst.Actions {
+			if !seen[id] {
+				seen[id] = true
+				ids = append(ids, id)
+			}
+		}
+	}
+	sort.Strings(ids)
+	return ids
 }

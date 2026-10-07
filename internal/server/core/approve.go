@@ -5,6 +5,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/bpinto/foca/internal/action"
 	"github.com/bpinto/foca/internal/audit"
 	"github.com/bpinto/foca/internal/identity"
 	"github.com/bpinto/foca/internal/ids"
@@ -18,6 +19,10 @@ type ask struct {
 	op         string // prompt template: "secret.read", "secret.add", …
 	accessType string // per-resource event type recorded on denial
 	refs       []plugin.ResourceRef
+	// uses are the secrets an action reads on the host, and params its
+	// validated params. Both are on the prompt and in every event.
+	uses   []plugin.ResourceRef
+	params map[string]string
 	// visible and hidden name the realms a host operation affects.
 	visible, hidden []identity.Realm
 	// policy, when Reuse, makes approving create grants under key.
@@ -41,7 +46,7 @@ func (s *Service) promptFor(c Call, a ask) (string, bool) {
 	return BuildPrompt(PromptInput{
 		Operation: a.op, Realm: c.Instance.Realm, Vault: c.Instance.Vault, Resources: a.refs,
 		Requester: c.requester(), ShowClient: s.opts.ShowClient, Skip: s.opts.SkipAncestors,
-		VisibleTo: a.visible, Hidden: a.hidden,
+		VisibleTo: a.visible, Hidden: a.hidden, Uses: a.uses, Params: a.params,
 		Reach: policy.Reach(a.policy, c.Instance.Realm), Denials: a.denials, Unanswered: a.unanswered,
 	})
 }
@@ -54,6 +59,10 @@ func (s *Service) refuseTooLong(ctx context.Context, c Call, a ask) error {
 	seq, err := s.RecordRejection(ctx, e)
 	if err != nil {
 		return s.fail(c, protocol.CodeAuditFailed, 0, "could not record the request; refusing it")
+	}
+	if a.op == "action.run" {
+		// Every value must be on screen, so long ones are refused.
+		return s.fail(c, protocol.CodeParamRejected, seq, "the action's params don't fit in its approval prompt; use shorter values")
 	}
 	return s.fail(c, protocol.CodeInvalidParams, seq, "these names don't fit in one approval prompt; split the request")
 }
@@ -75,6 +84,8 @@ func (s *Service) deny(ctx context.Context, c Call, a ask, base audit.Approval, 
 	e := s.Event(c, typ, outcome)
 	setVault(e, a.refs...)
 	e.Resources = resources
+	e.Uses = refsToAudit(a.uses)
+	e.Params = copyParams(a.params)
 	e.Reason = reason
 	ap := base
 	e.Approval = &ap
@@ -87,6 +98,8 @@ func (s *Service) deny(ctx context.Context, c Call, a ask, base audit.Approval, 
 		setVault(ae, a.refs[i])
 		r := r
 		ae.Resource = &r
+		ae.Uses = refsToAudit(a.uses)
+		ae.Params = copyParams(a.params)
 		ae.Reason = reason
 		ap := base
 		ae.Approval = &ap
@@ -180,7 +193,7 @@ func (s *Service) ask(ctx context.Context, c Call, a ask, release func()) (*audi
 	pctx, cancel := context.WithTimeout(ctx, s.opts.PromptTimeout)
 	res, err := s.opts.Authenticator.Approve(pctx, plugin.ApprovalRequest{
 		ID: base.ID, Instance: c.Instance.Name, Realm: c.Instance.Realm, Operation: a.op,
-		Resources: a.refs, Requester: c.requester(), Prompt: text, Timeout: s.opts.PromptTimeout,
+		Resources: a.refs, Params: copyParams(a.params), Requester: c.requester(), Prompt: text, Timeout: s.opts.PromptTimeout,
 	})
 	timedOut := pctx.Err() != nil
 	cancel()
@@ -207,6 +220,8 @@ func (s *Service) ask(ctx context.Context, c Call, a ask, release func()) (*audi
 		e := s.Event(c, audit.TypeApprovalGranted, audit.OutcomeOK)
 		setVault(e, a.refs...)
 		e.Resources = a.resources()
+		e.Uses = refsToAudit(a.uses)
+		e.Params = copyParams(a.params)
 		e.Approval = &ap
 		if _, aerr := s.record(ctx, c, e); aerr != nil {
 			// Not recorded means not approved.
@@ -252,24 +267,38 @@ func (s *Service) approveVisible(ctx context.Context, c Call, op string, refs []
 	return s.ask(ctx, c, a, release)
 }
 
-// ---- reads: reuse ----
+// ---- accesses: reuse ----
 
-// planned is one resource of a read and how it will be approved.
+// access is what a request asks to have approved: reads of secrets, or one
+// run of an action with its validated params.
+type access struct {
+	op         string // prompt template and per-resource event type
+	accessType string
+	params     map[string]string
+}
+
+var readAccess = access{op: "secret.read", accessType: audit.TypeSecretRead}
+
+// planned is one resource of a request and how it will be approved.
 type planned struct {
 	res    plugin.Resource
 	policy policy.Policy
 	grant  *grant // a copy of the live grant that covers it, if any
 }
 
-// policyFor is the policy a read of r runs under right now. It is
+// policyFor is the policy an access to r runs under right now. It is
 // every-time while platform events aren't healthy, and when the caller has
 // no key for the scope (no wider scope is used instead). Caller holds s.mu.
 func (s *Service) policyFor(c Call, r plugin.Resource) policy.Policy {
 	every := policy.Policy{Kind: policy.EveryTime}
-	if c.Instance.Policy == nil || !s.healthy {
+	fn := c.Instance.Policy
+	if r.Ref.Kind == "action" {
+		fn = c.Instance.ActionPolicy
+	}
+	if fn == nil || !s.healthy {
 		return every
 	}
-	p := c.Instance.Policy(r.Ref.ID)
+	p := fn(r.Ref.ID)
 	if p.Kind != policy.Reuse {
 		return every
 	}
@@ -279,32 +308,38 @@ func (s *Service) policyFor(c Call, r plugin.Resource) policy.Policy {
 	return p
 }
 
-// plan splits a read into resources live grants cover and those that need a
-// prompt.
-func (s *Service) plan(c Call, rs []plugin.Resource) (covered, todo []planned) {
+// plan splits a request into resources live grants cover and those that
+// need a prompt. It checks the clock first, as the watchdog does, so a
+// grant is never reused after a missed sleep while the next tick is due.
+func (s *Service) plan(ctx context.Context, c Call, acc access, rs []plugin.Resource) (covered, todo []planned, err error) {
+	if _, err := s.checkClock(ctx); err != nil {
+		return nil, nil, s.fail(c, protocol.CodeAuditFailed, 0, "could not record the request; refusing it")
+	}
 	now := s.wall()
+	params := action.CanonicalParams(acc.params)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, r := range rs {
 		p := s.policyFor(c, r)
-		if g := s.findGrant(c, audit.Resource{Kind: r.Ref.Kind, ID: r.Ref.ID}, p, now); g != nil {
+		if g := s.findGrant(c, audit.Resource{Kind: r.Ref.Kind, ID: r.Ref.ID}, params, p, now); g != nil {
 			cp := *g
 			covered = append(covered, planned{res: r, policy: p, grant: &cp})
 		} else {
 			todo = append(todo, planned{res: r, policy: p})
 		}
 	}
-	return covered, todo
+	return covered, todo, nil
 }
 
-// readAsk is the one prompt for the resources no grant covers. A batch is
+// accessAsk is the one prompt for the resources no grant covers. A batch is
 // one approval, so it runs under the meet of their policies: the prompt's
 // reach sentence is then true for every name on it.
-func (s *Service) readAsk(c Call, todo []planned) ask {
-	a := ask{op: "secret.read", accessType: audit.TypeSecretRead}
+func (s *Service) accessAsk(c Call, acc access, todo []planned) ask {
+	a := ask{op: acc.op, accessType: acc.accessType, params: acc.params}
 	p := policy.Policy{}
 	for _, t := range todo {
 		a.refs = append(a.refs, t.res.Ref)
+		a.uses = append(a.uses, t.res.Uses...)
 		p = policy.Meet(p, t.policy)
 	}
 	if p.Kind == policy.Reuse {
@@ -328,20 +363,27 @@ func unapproved(rs []plugin.Resource, out map[string]*audit.Approval) []plugin.R
 	return left
 }
 
-// approveRead decides a batch read: resources covered by live grants are
-// reused, the rest get one prompt. It returns each resource's approval by id.
+func (s *Service) approveRead(ctx context.Context, c Call, rs []plugin.Resource) (map[string]*audit.Approval, error) {
+	return s.approve(ctx, c, readAccess, rs)
+}
+
+// approve decides a request: resources covered by live grants are reused,
+// the rest get one prompt. It returns each resource's approval by id.
 //
 // The queue wait and the prompt can each take minutes, and grants are made,
 // wiped and expire meanwhile. So whatever isn't approved yet is planned again
 // after each: once the request reaches the front of the queue, so concurrent
-// reads coalesce after one approval, and once the prompt closes, so a grant
-// that ended while it was open is never reused. Its names are asked for in
-// a new prompt.
-func (s *Service) approveRead(ctx context.Context, c Call, rs []plugin.Resource) (map[string]*audit.Approval, error) {
+// requests coalesce after one approval, and once the prompt closes, so a
+// grant that ended while it was open is never reused. Its names are asked
+// for in a new prompt.
+func (s *Service) approve(ctx context.Context, c Call, acc access, rs []plugin.Resource) (map[string]*audit.Approval, error) {
 	out := map[string]*audit.Approval{}
-	covered, todo := s.plan(c, rs)
+	covered, todo, err := s.plan(ctx, c, acc, rs)
+	if err != nil {
+		return nil, err
+	}
 	for len(todo) > 0 {
-		a := s.readAsk(c, todo)
+		a := s.accessAsk(c, acc, todo)
 		if err := s.mayPrompt(ctx, c, a); err != nil {
 			return nil, err
 		}
@@ -349,11 +391,16 @@ func (s *Service) approveRead(ctx context.Context, c Call, rs []plugin.Resource)
 		if err != nil {
 			return nil, err
 		}
-		if covered, todo = s.plan(c, unapproved(rs, out)); len(todo) == 0 {
+		covered, todo, err = s.plan(ctx, c, acc, unapproved(rs, out))
+		if err != nil {
+			release()
+			return nil, err
+		}
+		if len(todo) == 0 {
 			release()
 			break
 		}
-		a = s.readAsk(c, todo)
+		a = s.accessAsk(c, acc, todo)
 		if err := s.mayPrompt(ctx, c, a); err != nil {
 			release()
 			return nil, err
@@ -365,13 +412,17 @@ func (s *Service) approveRead(ctx context.Context, c Call, rs []plugin.Resource)
 		for _, t := range todo {
 			out[t.res.Ref.ID] = ap
 		}
-		covered, todo = s.plan(c, unapproved(rs, out))
+		if covered, todo, err = s.plan(ctx, c, acc, unapproved(rs, out)); err != nil {
+			return nil, err
+		}
 	}
 	for _, p := range covered {
 		ap := p.grant.approval(s.opts.Authenticator.Name())
 		e := s.Event(c, audit.TypeApprovalReused, audit.OutcomeOK)
 		setVault(e, p.res.Ref)
 		e.Resource = &p.grant.resource
+		e.Uses = refsToAudit(p.res.Uses)
+		e.Params = copyParams(acc.params)
 		e.Approval = ap
 		if _, aerr := s.record(ctx, c, e); aerr != nil {
 			return nil, aerr
@@ -379,6 +430,28 @@ func (s *Service) approveRead(ctx context.Context, c Call, rs []plugin.Resource)
 		out[p.res.Ref.ID] = ap
 	}
 	return out, nil
+}
+
+func refsToAudit(refs []plugin.ResourceRef) []audit.Resource {
+	if len(refs) == 0 {
+		return nil
+	}
+	out := make([]audit.Resource, len(refs))
+	for i, r := range refs {
+		out[i] = audit.Resource{Kind: r.Kind, ID: r.ID}
+	}
+	return out
+}
+
+func copyParams(p map[string]string) map[string]string {
+	if len(p) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(p))
+	for k, v := range p {
+		out[k] = v
+	}
+	return out
 }
 
 // ---- grants and wipes ----
@@ -411,10 +484,11 @@ func (s *Service) approved(c Call, a ask, ap *audit.Approval, grants bool) {
 	if !grants {
 		return
 	}
+	params := action.CanonicalParams(a.params)
 	for _, r := range a.refs {
 		res := audit.Resource{Kind: r.Kind, ID: r.ID}
-		s.grants[grantKey{resource: res, scope: a.policy.Scope, key: a.key}] = &grant{
-			approvalID: ap.ID, resource: res, scope: a.policy.Scope, key: a.key,
+		s.grants[grantKey{resource: res, params: params, scope: a.policy.Scope, key: a.key}] = &grant{
+			approvalID: ap.ID, resource: res, params: copyParams(a.params), scope: a.policy.Scope, key: a.key,
 			grantedAt: *ap.GrantedAt, expiresAt: *ap.ExpiresAt,
 		}
 	}

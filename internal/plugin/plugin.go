@@ -147,10 +147,84 @@ type SecretStore interface {
 type Resource struct {
 	Ref         ResourceRef
 	Description string
+	// Params is an action's parameter schema, for action.list.
+	Params []ParamInfo
+	// Uses lists the secrets an action reads on the host (env_secrets),
+	// resolved for the calling instance. The prompt and audit name them.
+	Uses []ResourceRef
+}
+
+// ParamInfo describes one parameter a caller must supply.
+type ParamInfo struct {
+	Name             string
+	Description      string
+	Allowed          []string
+	Pattern          string
+	AllowLeadingDash bool
 }
 
 type Result struct {
 	Value []byte // owned by the caller, who must zero it
+	// Run is set by action providers, also alongside an error when the
+	// command ran but its result can't be returned.
+	Run *RunInfo
+}
+
+// UseError: an action uses a secret the calling instance can't read. Err
+// is ErrNotFound or ErrNotExposed.
+type UseError struct {
+	Secret string
+	Err    error
+}
+
+func (e *UseError) Error() string {
+	return fmt.Sprintf("uses secret %s: %v", e.Secret, e.Err)
+}
+
+func (e *UseError) Unwrap() error { return e.Err }
+
+// Reasons an action's run fails, as RunError.Reason. Each is the audit
+// reason too.
+const (
+	RunTimeout          = "timeout"
+	RunCancelled        = "cancelled"
+	RunOutputTooLarge   = "output_too_large"
+	RunOutputInvalid    = "output_invalid"
+	RunCommandUntrusted = "command_untrusted"
+	RunStartFailed      = "start_failed"
+	RunSecretUnreadable = "secret_unreadable"
+)
+
+// RunError is an action that failed to run, or whose result can't be
+// returned.
+type RunError struct {
+	Reason string
+	Err    error
+}
+
+func (e *RunError) Error() string { return e.Reason + ": " + e.Err.Error() }
+func (e *RunError) Unwrap() error { return e.Err }
+
+// RunInfo is how an action's command ran. Value holds stdout when it is
+// returned.
+type RunInfo struct {
+	// ExitCode is -1 when the command was killed by a signal or never ran.
+	ExitCode    int
+	Duration    time.Duration
+	StdoutBytes int64
+	StderrBytes int64
+	// StderrSHA256 is empty when the action uses secrets: a hash of
+	// output that may hold one would let anyone with the audit log test
+	// guesses of it.
+	StderrSHA256 string
+	// StderrTail is the end of stderr (masked when masking is on), for the
+	// caller. It is never logged.
+	StderrTail []byte
+	// StdoutReturned is false when stdout is withheld: a non-zero exit
+	// without return_on_failure.
+	StdoutReturned bool
+	Masked         bool
+	TimedOut       bool
 }
 
 // Provider defines what a credential is and how an approved request is

@@ -22,6 +22,8 @@ const (
 	TypeApprovalReused  = "approval.reused"
 	TypeApprovalTimeout = "approval.timeout"
 	TypeSecretList      = "secret.list"
+	TypeActionList      = "action.list"
+	TypeActionRun       = "action.run"
 	TypeSecretRead      = "secret.read"
 	TypeSecretAdd       = "secret.add"
 	TypeSecretUpdate    = "secret.update"
@@ -69,13 +71,17 @@ type Event struct {
 	Origin    string    `json:"origin,omitempty"` // client-socket | host-cli
 	// Resource is set on per-resource events; Resources on approval events
 	// that cover a batch.
-	Resource  *Resource         `json:"resource,omitempty"`
-	Resources []Resource        `json:"resources,omitempty"`
-	Params    map[string]string `json:"params,omitempty"`
-	Approval  *Approval         `json:"approval,omitempty"`
-	Peer      *Peer             `json:"peer,omitempty"`
-	Client    *Client           `json:"client,omitempty"`
-	Error     *ErrorInfo        `json:"error,omitempty"`
+	Resource  *Resource  `json:"resource,omitempty"`
+	Resources []Resource `json:"resources,omitempty"`
+	// Uses lists the secrets an action reads on the host (env_secrets).
+	Uses     []Resource        `json:"uses,omitempty"`
+	Params   map[string]string `json:"params,omitempty"`
+	Approval *Approval         `json:"approval,omitempty"`
+	Peer     *Peer             `json:"peer,omitempty"`
+	Client   *Client           `json:"client,omitempty"`
+	Error    *ErrorInfo        `json:"error,omitempty"`
+	// Run says how an action's command ran. Never its output.
+	Run *Run `json:"run,omitempty"`
 	// Count is what the event itself counts: the grants a lock or
 	// grants.drop removed, the secrets a secret.list returned.
 	Count int `json:"count,omitempty"`
@@ -92,6 +98,20 @@ type Coalesced struct {
 	// Reasons counts the folded events by their own reason, when reasons
 	// that a realm must not tell apart share one window (design §9.6).
 	Reasons map[string]int `json:"reasons,omitempty"`
+}
+
+// Run is an action's process, without its output (design §8.1): stdout is
+// never logged, and stderr only as its length and, for actions that use no
+// secrets, its sha256.
+type Run struct {
+	ExitCode       int    `json:"exit_code"`
+	DurationMS     int64  `json:"duration_ms"`
+	StdoutBytes    int64  `json:"stdout_bytes"`
+	StdoutReturned bool   `json:"stdout_returned"`
+	StderrBytes    int64  `json:"stderr_bytes"`
+	StderrSHA256   string `json:"stderr_sha256,omitempty"`
+	Masked         bool   `json:"masked,omitempty"`
+	TimedOut       bool   `json:"timed_out,omitempty"`
 }
 
 type Resource struct {

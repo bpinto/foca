@@ -105,6 +105,16 @@ func (r *rig) read(t *testing.T, c Call, ids ...string) error {
 
 func (r *rig) prompts() int { return len(r.auth.Requests()) }
 
+// grants is grants.status for c.
+func (r *rig) grants(t *testing.T, c Call) []GrantInfo {
+	t.Helper()
+	gs, err := r.svc.Grants(context.Background(), c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return gs
+}
+
 func (r *rig) events(typ string) []audit.Event {
 	var out []audit.Event
 	for _, e := range r.sink.Events() {
@@ -815,7 +825,7 @@ func TestGrantsStatusAndDrop(t *testing.T) {
 	r.read(t, c, "github-pat", "npm-token")
 	r.read(t, other, "github-pat")
 
-	got := r.svc.Grants(c)
+	got := r.grants(t, c)
 	if len(got) != 2 || got[0].Resource.ID != "common:github-pat" || got[1].Resource.ID != "common:npm-token" || got[0].Scope != "peer-session" {
 		t.Fatalf("status %+v", got)
 	}
@@ -827,7 +837,7 @@ func TestGrantsStatusAndDrop(t *testing.T) {
 		t.Fatalf("drop all: %d", n)
 	}
 	// The other caller's grant is untouched.
-	if len(r.svc.Grants(other)) != 1 || len(r.svc.Grants(c)) != 0 {
+	if len(r.grants(t, other)) != 1 || len(r.grants(t, c)) != 0 {
 		t.Fatal("drop reached another caller's grants")
 	}
 	drops := r.events(audit.TypeGrantsDrop)
@@ -862,5 +872,88 @@ func TestQueuedReadAfterDenialBacksOff(t *testing.T) {
 	}
 	if rej := r.events(audit.TypeRequestRejected); len(rej) != 1 || rej[0].Reason != "denial_backoff" {
 		t.Fatalf("rejections %+v", rej)
+	}
+}
+
+// grants.drop and grants.status need no approval, so they cost a token
+// like a listing, and a drop that removed nothing is coalesced: repeating
+// one can't fill the audit log. A drop that removed grants is recorded in
+// full.
+func TestGrantsDropAndStatusCantFloodTheLog(t *testing.T) {
+	r := newRig(t, all(reuse(time.Hour, policy.ScopePeerSession)), fake.Approve)
+	ctx := context.Background()
+	c := r.from("c1", "sid:10:100")
+	r.read(t, c, "github-pat")
+	if n, err := r.svc.DropGrants(ctx, c, nil); err != nil || n != 1 {
+		t.Fatalf("drop: %d, %v", n, err)
+	}
+	// The longest request a drop can carry: 32 names of 128 bytes.
+	var names []string
+	for i := 0; i < maxBatch; i++ {
+		names = append(names, "common:"+strings.Repeat("x", 127)+"abcdefghijklmnopqrstuvwxyzABCDEF"[i:i+1])
+	}
+	busy, dropped := 0, 0
+	for i := 0; i < 100; i++ {
+		if i%10 == 0 {
+			if _, err := r.svc.Grants(ctx, c); code(err) == protocol.CodeBusy {
+				busy++
+			}
+		}
+		_, err := r.svc.DropGrants(ctx, c, names)
+		switch code(err) {
+		case 0:
+			dropped++
+		case protocol.CodeBusy:
+			busy++
+		default:
+			t.Fatalf("drop %d: %v", i, err)
+		}
+	}
+	if busy == 0 {
+		t.Fatal("no drop or status was rate-limited")
+	}
+	r.svc.FlushRejections(ctx)
+	drops := r.events(audit.TypeGrantsDrop)
+	if len(drops) != 3 || drops[0].Count != 1 || drops[1].Count != 0 || drops[1].Params["names"] == "" ||
+		drops[2].Coalesced == nil || drops[2].Params != nil {
+		t.Fatalf("drop events %+v", drops)
+	}
+	// Every drop that wasn't refused is in the full event or the count.
+	if drops[2].Coalesced.Count != dropped-1 {
+		t.Fatalf("count %d for %d empty drops", drops[2].Coalesced.Count, dropped)
+	}
+}
+
+// A sleep whose event was missed is caught by the request that would reuse
+// a grant, not only by the watchdog's next tick: up to WatchEvery after
+// waking, the grant would otherwise still be reused.
+func TestMissedSleepIsCaughtBeforeReuse(t *testing.T) {
+	r := newRig(t, all(reuse(time.Hour, policy.ScopePeerSession)), fake.Approve, fake.Approve)
+	c := r.from("c1", "sid:10:100")
+	r.read(t, c, "github-pat")
+	r.clk.advance(time.Minute)
+	r.read(t, c, "github-pat")
+	if r.prompts() != 1 {
+		t.Fatal("not reused while awake")
+	}
+	// No watchdog runs here, so nothing ticks between the sleep and the read.
+	r.clk.sleep(40 * time.Second)
+	if err := r.read(t, c, "github-pat"); err != nil {
+		t.Fatal(err)
+	}
+	if r.prompts() != 2 {
+		t.Fatal("a grant was reused after a missed sleep")
+	}
+	locks := r.events(audit.TypeLock)
+	if len(locks) != 1 || locks[0].Reason != WipeSleep || locks[0].Count != 1 || locks[0].Params["clock_jump"] != "40s" {
+		t.Fatalf("lock events %+v", locks)
+	}
+	if gs := r.grants(t, c); len(gs) != 1 {
+		t.Fatalf("grants after the new approval: %+v", gs)
+	}
+	// grants.status checks the clock too.
+	r.clk.sleep(40 * time.Second)
+	if gs := r.grants(t, c); len(gs) != 0 {
+		t.Fatalf("grants listed after a missed sleep: %+v", gs)
 	}
 }

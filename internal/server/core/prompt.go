@@ -2,8 +2,10 @@ package core
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
+	"github.com/bpinto/foca/internal/action"
 	"github.com/bpinto/foca/internal/identity"
 	"github.com/bpinto/foca/internal/plugin"
 )
@@ -40,6 +42,10 @@ type PromptInput struct {
 	Reach      string
 	Denials    int
 	Unanswered int
+	// Params are an action's validated params, and Uses the secrets it
+	// reads on the host. Both are trusted and never dropped.
+	Params map[string]string
+	Uses   []plugin.ResourceRef
 }
 
 type trust int
@@ -94,6 +100,16 @@ func render(in PromptInput, a actor) string {
 			users = " for " + realmList(in.VisibleTo)
 		}
 		return fmt.Sprintf("create vault %s%s.", in.Vault, users)
+	case "action.run":
+		what := runPhrase(in)
+		switch a.trust {
+		case trustVerified:
+			return fmt.Sprintf("run %s for %s%s%s.", what, named(a.program, a.programSealed), realm, viaPhrase(named(a.via, a.viaSealed)))
+		case trustClaimed:
+			return fmt.Sprintf("run %s%s. %s claims: %s%s.", what, realm, claimant(in.Realm), a.program, plainVia(a.via))
+		default:
+			return fmt.Sprintf("run %s%s.", what, realm)
+		}
 	default: // secret.read
 		creds := listNames(in.Resources)
 		switch a.trust {
@@ -226,6 +242,20 @@ func listNames(rs []plugin.ResourceRef) string {
 	default:
 		return strings.Join(names[:len(names)-1], ", ") + " and " + names[len(names)-1]
 	}
+}
+
+// runPhrase names an action as the host describes it, with the values it
+// runs with and the secrets it reads on the host:
+// `"List PRs" with repo=foca/foca (uses GitHub PAT)`.
+func runPhrase(in PromptInput) string {
+	s := strconv.Quote(listNames(in.Resources))
+	if len(in.Params) > 0 {
+		s += " with " + action.DescribeParams(in.Params)
+	}
+	if len(in.Uses) > 0 {
+		s += " (uses " + listNames(in.Uses) + ")"
+	}
+	return s
 }
 
 func visiblePhrase(rs []identity.Realm) string {

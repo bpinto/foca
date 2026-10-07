@@ -17,6 +17,7 @@ import (
 
 	"github.com/BurntSushi/toml"
 
+	"github.com/bpinto/foca/internal/action"
 	"github.com/bpinto/foca/internal/fsutil"
 	"github.com/bpinto/foca/internal/identity"
 	"github.com/bpinto/foca/internal/policy"
@@ -37,6 +38,9 @@ type Config struct {
 	VaultPolicies         map[string]policy.Policy
 	SecretPolicies        map[string]policy.Policy
 	AuthenticatorPolicies map[string]policy.Policy
+	ActionPolicies        map[string]policy.Policy
+	// Actions are the host commands of [actions.<id>], checked, by id.
+	Actions map[string]*action.Spec
 	// TouchID holds [authenticators.touchid] options.
 	TouchID TouchID
 }
@@ -83,6 +87,9 @@ type Instance struct {
 	// Expose is what the instance may read, by vault (design §7.1). Its keys
 	// are exactly the vaults the instance reads.
 	Expose map[string]Expose
+	// Actions are the ids of the actions offered to this instance, sorted.
+	// None unless the instance lists them (design §7.1, rule 4).
+	Actions []string
 	// Policy is the instance level ([instances.<name>.policy]).
 	Policy policy.Policy
 }
@@ -173,6 +180,34 @@ type rawFile struct {
 	Instances      map[string]rawInstance      `toml:"instances"`
 	Secrets        map[string]rawPolicyTable   `toml:"secrets"`
 	Authenticators map[string]rawAuthenticator `toml:"authenticators"`
+	Actions        map[string]rawAction        `toml:"actions"`
+}
+
+// rawAction is [actions.<id>] (design §11).
+type rawAction struct {
+	Description     string              `toml:"description"`
+	Command         string              `toml:"command"`
+	Args            []string            `toml:"args"`
+	Timeout         *duration           `toml:"timeout"`
+	Output          *rawOutput          `toml:"output"`
+	Env             map[string]string   `toml:"env"`
+	EnvSecrets      map[string]string   `toml:"env_secrets"`
+	MaskOutput      *bool               `toml:"mask_output"`
+	ReturnOnFailure bool                `toml:"return_on_failure"`
+	Params          map[string]rawParam `toml:"params"`
+	Policy          *rawPolicy          `toml:"policy"`
+}
+
+type rawOutput struct {
+	Format   string `toml:"format"`
+	MaxBytes *int   `toml:"max_bytes"`
+}
+
+type rawParam struct {
+	Description      string   `toml:"description"`
+	Allowed          []string `toml:"allowed"`
+	Pattern          string   `toml:"pattern"`
+	AllowLeadingDash bool     `toml:"allow_leading_dash"`
 }
 
 type rawPlugins struct {
@@ -221,9 +256,41 @@ type rawPolicy struct {
 }
 
 type rawInstance struct {
-	Realm  *rawRealm  `toml:"realm"`
-	Expose *rawExpose `toml:"expose"`
-	Policy *rawPolicy `toml:"policy"`
+	Realm   *rawRealm   `toml:"realm"`
+	Expose  *rawExpose  `toml:"expose"`
+	Actions *rawActions `toml:"actions"`
+	Policy  *rawPolicy  `toml:"policy"`
+}
+
+// rawActions accepts either the string "*" or a list of action ids.
+type rawActions struct {
+	all bool
+	ids []string
+}
+
+func (a *rawActions) UnmarshalTOML(v any) error {
+	switch x := v.(type) {
+	case string:
+		if x != "*" {
+			return fmt.Errorf(`actions must be "*" or a list, got %q`, x)
+		}
+		a.all = true
+		return nil
+	case []any:
+		for _, item := range x {
+			s, ok := item.(string)
+			if !ok {
+				return fmt.Errorf("actions entries must be strings, got %T", item)
+			}
+			if s == "*" {
+				return errors.New(`actions: use actions = "*" instead of a list containing "*"`)
+			}
+			a.ids = append(a.ids, s)
+		}
+		return nil
+	default:
+		return fmt.Errorf(`actions must be "*" or a list, got %T`, v)
+	}
 }
 
 type rawRealm struct {
@@ -431,6 +498,21 @@ func validate(raw *rawFile) (*Config, error) {
 		declared[name] = true
 	}
 
+	// actions (design §11)
+	c.Actions = map[string]*action.Spec{}
+	c.ActionPolicies = map[string]policy.Policy{}
+	for id, ra := range raw.Actions {
+		s, err := parseAction(id, ra)
+		if err != nil {
+			fail("actions.%s: %v", id, err)
+			continue
+		}
+		c.Actions[id] = s
+		if c.ActionPolicies[id], err = parsePolicy(ra.Policy); err != nil {
+			fail("actions.%s.policy: %v", id, err)
+		}
+	}
+
 	// instances
 	if len(raw.Instances) == 0 {
 		fail("at least one [instances.<name>] is required")
@@ -475,6 +557,23 @@ func validate(raw *rawFile) (*Config, error) {
 		if inst.Policy, err = parsePolicy(ri.Policy); err != nil {
 			fail("instances.%s.policy: %v", name, err)
 		}
+		if ri.Actions != nil {
+			if ri.Actions.all {
+				inst.Actions = sortedKeys(c.Actions)
+			}
+			for _, id := range ri.Actions.ids {
+				_, ok := raw.Actions[id]
+				switch {
+				case !ok && !action.ValidID(id):
+					fail("instances.%s.actions: invalid action id %q", name, id)
+				case !ok:
+					fail("instances.%s.actions: action %q is not declared in [actions]", name, id)
+				case !slices.Contains(inst.Actions, id):
+					inst.Actions = append(inst.Actions, id)
+				}
+			}
+			sort.Strings(inst.Actions)
+		}
 		c.Instances = append(c.Instances, inst)
 	}
 
@@ -485,6 +584,19 @@ func validate(raw *rawFile) (*Config, error) {
 		if users := users[inst.Name]; len(users) > 1 && !explicitExpose[inst.Name] {
 			fail("instances.%s: vault %q is shared with %s, so expose must be set explicitly (use \"%s:*\" to read all of it)",
 				inst.Name, inst.Name, strings.Join(others(users, inst.Name), ", "), inst.Name)
+		}
+		// An action can only use secrets the instance can read. Whether one
+		// in a vault the instance reads whole exists is checked when it runs.
+		for _, id := range inst.Actions {
+			s := c.Actions[id]
+			if s == nil {
+				continue
+			}
+			for _, sid := range s.SecretIDs() {
+				if vault, bare, _ := secretname.Split(sid); !inst.Exposes(vault, bare) {
+					fail("instances.%s: action %q uses secret %q, which the instance's expose list leaves out", inst.Name, id, sid)
+				}
+			}
 		}
 	}
 

@@ -41,7 +41,10 @@ type world struct {
 	paths config.Paths
 }
 
-func newWorld(t *testing.T) *world {
+func newWorld(t *testing.T) *world { return newWorldWith(t, func(string) string { return e2eConfig }) }
+
+// newWorldWith writes the config cfg returns for the world's base directory.
+func newWorldWith(t *testing.T, cfg func(base string) string) *world {
 	// Short base dir: socket paths must fit in sun_path.
 	base, err := os.MkdirTemp("", "fe2e")
 	if err != nil {
@@ -50,7 +53,7 @@ func newWorld(t *testing.T) *world {
 	t.Cleanup(func() { os.RemoveAll(base) })
 	os.Chmod(base, 0o700)
 	cfgPath := filepath.Join(base, "config.toml")
-	os.WriteFile(cfgPath, []byte(e2eConfig), 0o600)
+	os.WriteFile(cfgPath, []byte(cfg(base)), 0o600)
 	w := &world{t: t, vars: map[string]string{
 		"FOCA_CONFIG": cfgPath, "FOCA_DATA_DIR": filepath.Join(base, "d"), "FOCA_RUNTIME_DIR": filepath.Join(base, "r"),
 		"HOME": base,

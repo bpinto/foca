@@ -2,12 +2,14 @@ package cli
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"syscall"
 	"text/tabwriter"
 	"time"
 
+	"github.com/bpinto/foca/internal/action"
 	"github.com/bpinto/foca/internal/config"
 	"github.com/bpinto/foca/internal/policy"
 	"github.com/bpinto/foca/internal/protocol"
@@ -41,7 +43,7 @@ type PolicyCmd struct {
 }
 
 type PolicyExplainCmd struct {
-	Names []string `arg:"" optional:"" help:"Secrets to explain, <vault>:<secret> (default: every secret with its own policy)."`
+	Names []string `arg:"" optional:"" help:"Secrets (<vault>:<secret>) and actions to explain (default: every secret with its own policy, and every action)."`
 }
 
 // Run reads only the config, so a policy can be checked before anything is
@@ -69,13 +71,19 @@ func (c *PolicyExplainCmd) Run(g *Globals, e *Env) error {
 		fmt.Fprintln(e.Stdout, "Platform events: none. Grants can't be wiped on sleep or lock, so reuse is off and every access asks.")
 	}
 
+	var ids, actionIDs []string
 	for _, n := range c.Names {
-		if _, _, ok := secretname.Split(n); !ok {
-			return fmt.Errorf("invalid secret name %q: name secrets <vault>:<secret>", n)
+		// A name that names an action is explained as the action.
+		if cfg.Actions[n] != nil {
+			actionIDs = append(actionIDs, n)
+			continue
 		}
+		if _, _, ok := secretname.Split(n); !ok {
+			return fmt.Errorf("invalid name %q: name secrets <vault>:<secret>, or name an action", n)
+		}
+		ids = append(ids, n)
 	}
-	ids := c.Names
-	if len(ids) == 0 {
+	if len(c.Names) == 0 {
 		for id := range cfg.SecretPolicies {
 			ids = append(ids, id)
 		}
@@ -112,6 +120,21 @@ func (c *PolicyExplainCmd) Run(g *Globals, e *Env) error {
 			}
 			fmt.Fprintf(w, "  %s\t%s\n", name, describe(name))
 		}
+		shown := inst.Actions
+		if len(c.Names) > 0 {
+			shown = actionIDs
+		}
+		for _, id := range shown {
+			if !slices.Contains(inst.Actions, id) {
+				fmt.Fprintf(w, "  action %s\tnot offered to this instance\n", id)
+				continue
+			}
+			p := cfg.ActionPolicy(inst, id)
+			if !reuse {
+				p = policy.Policy{Kind: policy.EveryTime}
+			}
+			fmt.Fprintf(w, "  action %s\t%s\n", id, policy.Describe(p, inst.Realm))
+		}
 		w.Flush()
 	}
 	return nil
@@ -128,7 +151,7 @@ func realmLabel(inst config.Instance) string {
 
 type GrantsCmd struct {
 	Drop  bool     `help:"Drop grants instead of listing them: the named ones, or all of yours."`
-	Names []string `arg:"" optional:"" help:"Secrets whose grants to drop (with --drop)."`
+	Names []string `arg:"" optional:"" help:"Secrets or actions whose grants to drop (with --drop)."`
 }
 
 // Run lists or drops the caller's own reuse grants. Dropping is tightening,
@@ -162,7 +185,14 @@ func (c *GrantsCmd) Run(g *Globals, e *Env) error {
 	w := tabwriter.NewWriter(e.Stdout, 0, 4, 2, ' ', 0)
 	fmt.Fprintln(w, "NAME\tSCOPE\tEXPIRES")
 	for _, gr := range res.Grants {
-		fmt.Fprintf(w, "%s\t%s\t%s\n", clean(gr.Name), clean(gr.Scope), gr.ExpiresAt.Local().Format(time.DateTime))
+		name := gr.Name
+		if gr.Kind == "action" {
+			name = "action " + name
+			if len(gr.Params) > 0 {
+				name += " (" + action.DescribeParams(gr.Params) + ")"
+			}
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\n", clean(name), clean(gr.Scope), gr.ExpiresAt.Local().Format(time.DateTime))
 	}
 	return w.Flush()
 }
