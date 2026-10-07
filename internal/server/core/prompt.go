@@ -33,6 +33,13 @@ type PromptInput struct {
 	// Hidden, for secret.remove, is every realm that sees the secret now and
 	// won't afterwards.
 	Hidden []identity.Realm
+	// Reach, if approving creates a grant, says how far it reaches
+	// (policy.Reach). Denials is how many times this was denied recently,
+	// and Unanswered how many of the instance's recent prompts timed out or
+	// were cancelled. All are trusted and never dropped.
+	Reach      string
+	Denials    int
+	Unanswered int
 }
 
 type trust int
@@ -64,7 +71,7 @@ func BuildPrompt(in PromptInput) (prompt string, ok bool) {
 		func(a *actor) { *a = actor{} },
 	} {
 		step(&a)
-		if s := render(in, a); len(s) <= maxPromptLen {
+		if s := render(in, a) + suffix(in); len(s) <= maxPromptLen {
 			return s, true
 		}
 	}
@@ -278,4 +285,24 @@ func plainVia(v string) string {
 		return ""
 	}
 	return " via " + v
+}
+
+// suffix is the trusted text after the sentence: how far approving reaches,
+// how often this was denied lately, and how many of the instance's prompts
+// went unanswered.
+func suffix(in PromptInput) string {
+	s := ""
+	if in.Reach != "" {
+		s += " " + in.Reach
+	}
+	switch {
+	case in.Denials == 1:
+		s += " (denied once)"
+	case in.Denials > 1:
+		s += fmt.Sprintf(" (denied %d times)", in.Denials)
+	}
+	if in.Unanswered > 0 {
+		s += fmt.Sprintf(" (%d unanswered)", in.Unanswered)
+	}
+	return s
 }

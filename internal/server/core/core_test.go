@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -198,10 +199,11 @@ func TestUnexposedLooksLikeMissingButIsAuditedWithReason(t *testing.T) {
 	if len(h.auth.Requests()) != 0 {
 		t.Fatal("prompted for a secret that doesn't resolve")
 	}
+	h.svc.FlushRejections(context.Background())
 	evs := h.sink.Events()
 	wantTypes(t, evs, "secret.read:not_found", "secret.read:not_found")
-	if evs[0].Reason != "not_exposed" || evs[1].Reason != "unknown" {
-		t.Fatalf("reasons %q %q", evs[0].Reason, evs[1].Reason)
+	if evs[0].Reason != "not_exposed" || evs[1].Coalesced == nil || evs[1].Coalesced.Reasons["unknown"] != 1 {
+		t.Fatalf("reasons %q %+v", evs[0].Reason, evs[1].Coalesced)
 	}
 }
 
@@ -228,7 +230,12 @@ func TestTimeoutAndUnavailable(t *testing.T) {
 	if code(err) != protocol.CodeAuthUnavailable {
 		t.Fatalf("unavailable: %v", err)
 	}
-	wantTypes(t, h.sink.Events(), "approval.denied:error", "secret.read:denied")
+	// No prompt was shown: one coalesced rejection, not an approval event.
+	evs := h.sink.Events()
+	wantTypes(t, evs, "request.rejected:rejected")
+	if evs[0].Reason != "auth_unavailable" || len(evs[0].Resources) != 1 {
+		t.Fatalf("event %+v", evs[0])
+	}
 }
 
 func TestQueueFullIsBusyAndAudited(t *testing.T) {
@@ -403,11 +410,121 @@ func TestRejectionBurstsAreCoalesced(t *testing.T) {
 	}
 	var got []string
 	for _, e := range h.sink.Events() {
-		got = append(got, fmt.Sprintf("%s/%d", e.Reason, e.Count))
+		got = append(got, fmt.Sprintf("%s/%d", e.Reason, folded(e)))
 	}
 	want := "busy/0 forbidden_on_socket/0 busy/99 busy/0"
 	if strings.Join(got, " ") != want {
 		t.Fatalf("events %v, want %s", got, want)
+	}
+}
+
+// A realm can read unknown names and list without approval. Bursts of those
+// events are folded per instance, type and reason like rejections, so a
+// flood can't fill the disk. The first of each burst is kept in full.
+// Unknown and unexposed names share a window, and the count keeps them apart.
+func TestUnapprovedEventsAreCoalesced(t *testing.T) {
+	h := newHarness(t)
+	now := time.Unix(1000, 0)
+	h.svc.opts.Now = func() time.Time { return now }
+	ctx := context.Background()
+	for i := 0; i < 5; i++ {
+		if _, err := h.svc.ReadSecrets(ctx, h.call(), []string{"common:nope", "common:prod-db", "common:other"}); code(err) != protocol.CodeNotFound {
+			t.Fatalf("read: %v", err)
+		}
+		if _, err := h.svc.ListSecrets(ctx, h.call()); err != nil {
+			t.Fatal(err)
+		}
+		now = now.Add(time.Second)
+	}
+	if err := h.svc.FlushRejections(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// A folded event names the full one it followed, and keeps count for
+	// what the event itself counts: a fold of listings lists nothing.
+	var got []string
+	full := map[string]uint64{}
+	for _, e := range h.sink.Events() {
+		s := fmt.Sprintf("%s/%s/%d", e.Type, e.Reason, e.Count)
+		if e.Resource != nil {
+			s += "/" + e.Resource.ID
+		}
+		if e.Coalesced == nil {
+			full[e.Type] = e.Seq
+		} else {
+			s += fmt.Sprintf("/coalesced %d", e.Coalesced.Count)
+			if r := e.Coalesced.Reasons; r != nil {
+				s += fmt.Sprintf(" unknown %d not_exposed %d", r["unknown"], r["not_exposed"])
+			}
+			if e.Coalesced.AfterSeq != full[e.Type] || e.Params != nil {
+				t.Errorf("%s: coalesced %+v, params %v; want after seq %d", s, *e.Coalesced, e.Params, full[e.Type])
+			}
+		}
+		got = append(got, s)
+	}
+	sort.Strings(got)
+	want := []string{
+		"secret.list//0/coalesced 4", "secret.list//2",
+		"secret.read/not_found/0/coalesced 14 unknown 9 not_exposed 5", "secret.read/unknown/0/common:nope",
+	}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Fatalf("events\n got %v\nwant %v", got, want)
+	}
+}
+
+// Reads and listings are rate-limited per instance before any work is done
+// for them: a burst of 30, then 5 a second. Refusals are busy and coalesced.
+func TestReadsAndListsAreRateLimited(t *testing.T) {
+	h := newHarness(t)
+	now := time.Unix(1000, 0)
+	h.svc.opts.Now = func() time.Time { return now }
+	unseals := 0
+	h.inst.Secrets = static.New("common", h.store, static.Exposure{All: true}, func(context.Context) ([]byte, func(), error) {
+		unseals++
+		return nil, func() {}, nil
+	})
+	ctx := context.Background()
+	list := func() error { _, err := h.svc.ListSecrets(ctx, h.call()); return err }
+	read := func() error { _, err := h.svc.ReadSecrets(ctx, h.call(), []string{"common:nope"}); return err }
+	for i := 0; i < 30; i++ {
+		if err := []func() error{list, read}[i%2](); code(err) == protocol.CodeBusy {
+			t.Fatalf("request %d refused within the burst", i)
+		}
+	}
+	before := unseals
+	for _, f := range []func() error{list, read, read} {
+		if err := f(); code(err) != protocol.CodeBusy {
+			t.Fatalf("over the burst: %v", err)
+		}
+	}
+	if unseals != before {
+		t.Fatal("a refused request unsealed the data key")
+	}
+	now = now.Add(time.Second) // five more
+	for i := 0; i < 5; i++ {
+		if err := list(); err != nil {
+			t.Fatalf("refill %d: %v", i, err)
+		}
+	}
+	if err := list(); code(err) != protocol.CodeBusy {
+		t.Fatalf("over the refill: %v", err)
+	}
+	// Another instance has its own bucket.
+	other := *h.inst
+	other.Name = "work"
+	c := h.call()
+	c.Instance = &other
+	if _, err := h.svc.ListSecrets(ctx, c); err != nil {
+		t.Fatalf("other instance: %v", err)
+	}
+	h.svc.FlushRejections(ctx)
+	n := 0
+	for _, e := range h.sink.Events() {
+		if e.Type == audit.TypeRequestRejected && e.Reason == "rate_limited" {
+			n += max(folded(e), 1)
+		}
+	}
+	if n != 4 {
+		t.Fatalf("%d rate_limited rejections recorded, want 4", n)
 	}
 }
 
@@ -483,5 +600,118 @@ func TestAddSecretHandlesStoreErrors(t *testing.T) {
 	_, err = h.svc.AddSecret(ctx, h.call(), NewSecret{ID: "x", Value: []byte("v")})
 	if code(err) != protocol.CodeAuditFailed || !strings.Contains(err.Error(), `secret "x" is stored`) {
 		t.Fatalf("rollback failure: %v", err)
+	}
+}
+
+// folded is how many events e stands for besides itself: zero unless it is
+// a coalesced one.
+func folded(e audit.Event) int {
+	if e.Coalesced == nil {
+		return 0
+	}
+	return e.Coalesced.Count
+}
+
+// Once the sink stops taking writes, a request whose event would only be
+// counted into an open window is refused too, as every other request is
+// (design D10). It is never answered on the strength of an earlier write.
+func TestCoalescedRequestsAreRefusedOnceTheSinkFails(t *testing.T) {
+	h := newHarness(t)
+	now := time.Unix(1000, 0)
+	h.svc.opts.Now = func() time.Time { return now }
+	ctx := context.Background()
+	if _, err := h.svc.ListSecrets(ctx, h.call()); err != nil {
+		t.Fatal(err)
+	}
+	// A failed fsync stops the sink: every later append fails.
+	h.sink.SetFailure(errors.New("sync failed"))
+	if _, err := h.svc.ReadSecrets(ctx, h.call(), []string{"common:github-pat"}); code(err) != protocol.CodeAuditFailed {
+		t.Fatalf("read: %v", err)
+	}
+	now = now.Add(time.Second) // still inside the listing's window
+	if _, err := h.svc.ListSecrets(ctx, h.call()); code(err) != protocol.CodeAuditFailed {
+		t.Fatalf("list inside an open window after the sink failed: %v", err)
+	}
+	// A sink that recovers records again.
+	h.sink.SetFailure(nil)
+	if _, err := h.svc.ListSecrets(ctx, h.call()); err != nil {
+		t.Fatal(err)
+	}
+	wantTypes(t, h.sink.Events(), "secret.list:ok", "secret.list:ok")
+}
+
+// A realm can't tell an unexposed secret from one that doesn't exist by
+// whether asking for it writes an event: inside a window that an unknown
+// name opened, a probe for an unexposed one is only counted, and the other
+// way round.
+func TestUnknownAndUnexposedNamesShareOneWindow(t *testing.T) {
+	for _, order := range [][2]string{{"common:nope", "common:prod-db"}, {"common:prod-db", "common:nope"}} {
+		h := newHarness(t)
+		now := time.Unix(1000, 0)
+		h.svc.opts.Now = func() time.Time { return now }
+		ctx := context.Background()
+		h.svc.ReadSecrets(ctx, h.call(), []string{order[0]})
+		before := len(h.sink.Events())
+		now = now.Add(time.Second)
+		if _, err := h.svc.ReadSecrets(ctx, h.call(), []string{order[1]}); code(err) != protocol.CodeNotFound {
+			t.Fatalf("probe: %v", err)
+		}
+		if n := len(h.sink.Events()); n != before {
+			t.Fatalf("%s after %s wrote %d events", order[1], order[0], n-before)
+		}
+	}
+}
+
+// A request for which no prompt is ever shown, because none can be shown
+// here or because its client left while it waited, costs the realm nothing,
+// so its events are coalesced like rejections: one per window, not an
+// approval event and one per name each time.
+func TestRequestsThatNeverShowAPromptAreCoalesced(t *testing.T) {
+	// 25 requests in all: within the rate limit's burst.
+	h := newHarness(t)
+	now := time.Unix(1000, 0)
+	h.svc.opts.Now = func() time.Time { return now }
+	ctx := context.Background()
+	h.auth.SetUnavailable(true)
+	for i := 0; i < 12; i++ {
+		if _, err := h.svc.ReadSecrets(ctx, h.call(), []string{"common:github-pat", "common:npm-token"}); code(err) != protocol.CodeAuthUnavailable {
+			t.Fatalf("unavailable: %v", err)
+		}
+	}
+	h.auth.SetUnavailable(false)
+
+	// Cancelled while another request's prompt is open.
+	h.auth.Default = fake.Hang
+	h.auth.Started = make(chan plugin.ApprovalRequest, 1)
+	open, cancelOpen := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() { h.svc.ReadSecrets(open, h.call(), []string{"common:npm-token"}); close(done) }()
+	<-h.auth.Started
+	gone, cancel := context.WithCancel(ctx)
+	cancel()
+	for i := 0; i < 12; i++ {
+		if _, err := h.svc.ReadSecrets(gone, h.call(), []string{"common:github-pat"}); code(err) != protocol.CodeTimeout {
+			t.Fatalf("cancelled: %v", err)
+		}
+	}
+	cancelOpen()
+	<-done
+	h.svc.FlushRejections(ctx)
+
+	var got []string
+	for _, e := range h.sink.Events() {
+		if e.Type == audit.TypeRequestRejected {
+			got = append(got, fmt.Sprintf("%s/%d", e.Reason, folded(e)))
+		}
+	}
+	sort.Strings(got)
+	if want := "auth_unavailable/0 auth_unavailable/11 cancelled/0 cancelled/11"; strings.Join(got, " ") != want {
+		t.Fatalf("rejections %v, want %s", got, want)
+	}
+	// Only the prompt that was shown has approval events.
+	for _, e := range h.sink.Events() {
+		if strings.HasPrefix(e.Type, "approval.") && (len(e.Resources) != 1 || e.Resources[0].ID != "common:npm-token") {
+			t.Fatalf("approval event for a prompt never shown: %+v", e)
+		}
 	}
 }

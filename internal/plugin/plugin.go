@@ -159,8 +159,11 @@ type Result struct {
 type Provider interface {
 	Kind() string
 	List(ctx context.Context) ([]Resource, error)
-	// Resolve returns ErrNotFound (or ErrNotExposed) for unknown names.
-	Resolve(ctx context.Context, id string) (Resource, error)
+	// Resolve looks up every name of one request at once, in order, so the
+	// request costs one read of the store however many names it carries.
+	// errs[i] is ErrNotFound (or ErrNotExposed) for an unknown name; err is
+	// a failure of the lookup itself.
+	Resolve(ctx context.Context, ids []string) (rs []Resource, errs []error, err error)
 	Validate(ctx context.Context, r Resource, params map[string]string) (map[string]string, error)
 	// Serve is only ever called by the core after a successful approval.
 	Serve(ctx context.Context, r Resource, params map[string]string) (Result, error)
@@ -171,17 +174,56 @@ type Provider interface {
 type EventKind string
 
 const (
+	// Sleep, ScreenLock and SessionEnd wipe every grant.
 	EventSleep      EventKind = "sleep"
 	EventScreenLock EventKind = "screen-lock"
 	EventSessionEnd EventKind = "session-end"
+	// Ready means the source is subscribed and will report the events
+	// above. Until a source sends it, and again after Run returns, reuse
+	// is off (design D13).
+	EventReady EventKind = "ready"
 )
 
 type PlatformEvent struct {
 	Kind   EventKind
 	At     time.Time
 	Source string
+	// Done, if set, is closed by the core once it has handled the event:
+	// for a sleep, once grants are wiped and the lock is recorded. A source
+	// that can hold sleep back (logind's inhibitor, the helper's ack) lets
+	// the machine sleep only then, or after HandledWait.
+	Done chan struct{}
 }
 
+// HandledWait bounds how long a source holds sleep back for the core. It
+// stays under the 5 s that logind and macOS allow a delay anyway.
+const HandledWait = 4 * time.Second
+
+// Handled closes Done, if set. Only the core calls it, once per event.
+func (e PlatformEvent) Handled() {
+	if e.Done != nil {
+		close(e.Done)
+	}
+}
+
+// WaitHandled returns once the core has handled e, max has passed or ctx
+// has ended, whichever comes first.
+func (e PlatformEvent) WaitHandled(ctx context.Context, max time.Duration) {
+	if e.Done == nil {
+		return
+	}
+	t := time.NewTimer(max)
+	defer t.Stop()
+	select {
+	case <-e.Done:
+	case <-t.C:
+	case <-ctx.Done():
+	}
+}
+
+// PlatformEvents reports sleep, screen lock and session end, so the service
+// can wipe grants. Run blocks until ctx ends or the source fails; any return
+// while ctx is still live counts as a failure.
 type PlatformEvents interface {
 	Name() string
 	Run(ctx context.Context, out chan<- PlatformEvent) error

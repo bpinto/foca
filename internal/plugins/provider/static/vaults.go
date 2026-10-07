@@ -42,6 +42,23 @@ func qualify(r plugin.Resource, vault string) plugin.Resource {
 	return r
 }
 
+// label is how a prompt shows r, a resolved secret: no two secrets the
+// instance may read are shown alike, since the realm picks which one it asks
+// for. A display name another secret in the vault also shows gets the full
+// name, "GitHub PAT (common:github-pat)". With several vaults, every display
+// name gets its vault, "GitHub PAT (common)": the other vaults' names are
+// left unread, so each read unseals only the vaults it names.
+func (v *Vaults) label(r plugin.Resource, shown map[string]int) plugin.Resource {
+	switch {
+	case r.Ref.Display == r.Ref.ID: // its full name
+	case shown[r.Ref.Display] > 1:
+		r.Ref.Display += " (" + r.Ref.ID + ")"
+	case len(v.vaults) > 1:
+		r.Ref.Display += " (" + r.Ref.Vault + ")"
+	}
+	return r
+}
+
 // List lists every vault. A vault not created yet holds nothing; only when
 // none of them is created is the answer its not-initialized error, so the
 // caller can say which vault to create.
@@ -70,22 +87,43 @@ func (v *Vaults) List(ctx context.Context) ([]plugin.Resource, error) {
 	return out, nil
 }
 
-// Resolve looks name up in the vault it names. A vault the instance doesn't
-// read holds nothing it can see.
-func (v *Vaults) Resolve(ctx context.Context, name string) (plugin.Resource, error) {
-	vault, id, ok := secretname.Split(name)
-	if !ok {
-		return plugin.Resource{}, plugin.ErrNotFound
+// Resolve asks each vault once for all the names in it, so each data key is
+// unsealed once per request. A vault the instance doesn't read holds nothing
+// it can see.
+func (v *Vaults) Resolve(ctx context.Context, names []string) ([]plugin.Resource, []error, error) {
+	rs := make([]plugin.Resource, len(names))
+	errs := make([]error, len(names))
+	byVault := map[string][]int{}
+	for i, name := range names {
+		vault, _, ok := secretname.Split(name)
+		if !ok || v.find(vault) == nil {
+			errs[i] = plugin.ErrNotFound
+			continue
+		}
+		byVault[vault] = append(byVault[vault], i)
 	}
-	p := v.find(vault)
-	if p == nil {
-		return plugin.Resource{}, plugin.ErrNotFound
+	for _, p := range v.vaults {
+		idx := byVault[p.Vault()]
+		if len(idx) == 0 {
+			continue
+		}
+		ids := make([]string, len(idx))
+		for j, i := range idx {
+			_, ids[j], _ = secretname.Split(names[i])
+		}
+		prs, perrs, shown, err := p.resolve(ctx, ids)
+		if err != nil {
+			return nil, nil, err
+		}
+		for j, i := range idx {
+			if perrs[j] != nil {
+				errs[i] = perrs[j]
+				continue
+			}
+			rs[i] = v.label(qualify(prs[j], p.Vault()), shown)
+		}
 	}
-	r, err := p.Resolve(ctx, id)
-	if err != nil {
-		return plugin.Resource{}, err
-	}
-	return qualify(r, vault), nil
+	return rs, errs, nil
 }
 
 func (v *Vaults) Validate(_ context.Context, _ plugin.Resource, params map[string]string) (map[string]string, error) {

@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"time"
 	"unicode/utf8"
 
 	"github.com/bpinto/foca/internal/identity"
@@ -11,9 +12,11 @@ import (
 
 // Method names.
 const (
-	MethodHello      = "server.hello"
-	MethodSecretList = "secret.list"
-	MethodSecretRead = "secret.read"
+	MethodHello        = "server.hello"
+	MethodSecretList   = "secret.list"
+	MethodSecretRead   = "secret.read"
+	MethodGrantsStatus = "grants.status"
+	MethodGrantsDrop   = "grants.drop"
 )
 
 // Common fields every request may carry. Embedded in each params type so
@@ -163,4 +166,30 @@ func DecodeValue(value, encoding string) ([]byte, error) {
 	default:
 		return nil, fmt.Errorf("unknown encoding %q", encoding)
 	}
+}
+
+type GrantsStatusParams struct {
+	Common
+}
+
+// GrantInfo is one of the caller's live reuse grants.
+type GrantInfo struct {
+	Name       string    `json:"name"`
+	Scope      string    `json:"scope"`
+	ApprovalID string    `json:"approval_id"`
+	ExpiresAt  time.Time `json:"expires_at"`
+}
+
+type GrantsStatusResult struct {
+	Grants []GrantInfo `json:"grants"`
+}
+
+// GrantsDropParams drops the caller's grants for Names, or all of them.
+type GrantsDropParams struct {
+	Common
+	Names []string `json:"names,omitempty"`
+}
+
+type GrantsDropResult struct {
+	Dropped int `json:"dropped"`
 }

@@ -10,7 +10,7 @@
     in {
       devShells = forAll (pkgs: {
         default = pkgs.mkShell {
-          packages = [ pkgs.go pkgs.gopls pkgs.socat pkgs.gcc ];  # gcc: only for `go test -race`
+          packages = [ pkgs.go pkgs.gopls pkgs.socat pkgs.gcc pkgs.dbus ];  # gcc: only for `go test -race`; dbus: logind tests
           CGO_ENABLED = "0";
         };
       });

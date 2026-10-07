@@ -344,3 +344,63 @@ func TestVersion(t *testing.T) {
 		t.Fatalf("help: %d %q", code, out.String())
 	}
 }
+
+func TestPolicyExplain(t *testing.T) {
+	dir := t.TempDir()
+	cfg := filepath.Join(dir, "config.toml")
+	os.WriteFile(cfg, []byte(`version = 1
+[plugins]
+authenticator = "fake"
+platform_events = "none"
+[vaults.common]
+[vaults.common.policy]
+approval = "reuse"
+window = "2h"
+[instances.dev]
+realm = { kind = "vm" }
+expose = ["common:github-pat"]
+[instances.work]
+realm = { kind = "vm" }
+expose = ["common:*"]
+[instances.work.policy]
+approval = "reuse"
+window = "30m"
+scope = "connection"
+`), 0o600)
+	env, out, errb := testEnv(t, map[string]string{"FOCA_CONFIG": cfg, "FOCA_DATA_DIR": dir, "FOCA_RUNTIME_DIR": dir})
+	if code := Main([]string{"policy", "explain"}, env, "test"); code != 0 {
+		t.Fatalf("exit %d: %s", code, errb)
+	}
+	if !strings.Contains(out.String(), "Platform events: none. Grants can't be wiped") ||
+		strings.Contains(out.String(), "reuse for") {
+		t.Fatalf("without platform events, explain promised reuse:\n%s", out)
+	}
+
+	os.WriteFile(cfg, bytes.Replace(mustRead(t, cfg), []byte(`platform_events = "none"`), []byte(`platform_events = "logind"`), 1), 0o600)
+	env, out, _ = testEnv(t, map[string]string{"FOCA_CONFIG": cfg, "FOCA_DATA_DIR": dir, "FOCA_RUNTIME_DIR": dir})
+	if code := Main([]string{"policy", "explain", "common:github-pat", "common:npm-token"}, env, "test"); code != 0 {
+		t.Fatalf("exit %d", code)
+	}
+	want := `Platform events: logind. Reuse applies only while it reports sleep and screen lock; otherwise every access asks.
+
+Instance dev (VM dev), vault common
+  common:github-pat  one approval allows reuse for 2h by anything in VM dev
+  common:npm-token   not exposed to this instance
+
+Instance work (VM work), vault common
+  common:github-pat  one approval allows reuse for 30m on the same connection
+  common:npm-token   one approval allows reuse for 30m on the same connection
+`
+	if out.String() != want {
+		t.Fatalf("got:\n%s\nwant:\n%s", out, want)
+	}
+}
+
+func mustRead(t *testing.T, path string) []byte {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}

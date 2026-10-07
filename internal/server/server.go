@@ -12,7 +12,8 @@ import (
 	"log/slog"
 	"net"
 	"os"
-	"path/filepath"
+	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -37,7 +38,16 @@ type Options struct {
 	// sends no complete request for that long. Zero means the config default.
 	MaxConnections int
 	IdleTimeout    time.Duration
+	// WriteTimeout closes a connection whose client doesn't take a response
+	// for that long. Zero means DefaultWriteTimeout.
+	WriteTimeout time.Duration
+	// Events reports sleep and lock so grants can be wiped. nil means
+	// none, and reuse stays off.
+	Events plugin.PlatformEvents
 }
+
+// DefaultWriteTimeout bounds each response write (design §9.6.1).
+const DefaultWriteTimeout = 10 * time.Second
 
 type Server struct {
 	opts      Options
@@ -49,6 +59,7 @@ type Server struct {
 	conns     map[net.Conn]struct{}
 	stopOnce  sync.Once
 	done      chan struct{}
+	guardDone <-chan struct{}
 	uid       int
 }
 
@@ -61,6 +72,9 @@ func New(opts Options) *Server {
 	}
 	if opts.IdleTimeout == 0 {
 		opts.IdleTimeout = config.DefaultIdleTimeout
+	}
+	if opts.WriteTimeout == 0 {
+		opts.WriteTimeout = DefaultWriteTimeout
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Server{opts: opts, ctx: ctx, cancel: cancel, conns: map[net.Conn]struct{}{},
@@ -94,6 +108,7 @@ func (s *Server) Start() error {
 		s.closeListeners()
 		return fmt.Errorf("audit: %w", err)
 	}
+	s.guardDone = s.opts.Core.Guard(s.ctx, s.opts.Events, s.opts.Log)
 	return nil
 }
 
@@ -247,26 +262,26 @@ func (s *Server) reject(inst *core.Instance, reason string, peer *identity.Verif
 	s.opts.Log.Warn("connection refused", "instance", inst.Name, "reason", reason)
 }
 
-// isProxy reports whether the peer's exe, Nix wrapper unwrapped, is listed in
-// opaque_peers.
-func (s *Server) isProxy(p identity.VerifiedPeer) bool {
-	name := identity.DisplayName(p.Exe, 64)
-	for _, n := range s.opts.OpaquePeers {
-		if name != "" && name == n {
-			return true
-		}
-	}
-	return false
+// proxyName is how both proxy checks name a peer's exe: Nix wrapper
+// unwrapped, and without the " (deleted)" mark Linux adds once the file is
+// replaced, as a package upgrade does to a long-running ssh.
+func proxyName(exe string) string {
+	return identity.DisplayName(strings.TrimSuffix(exe, " (deleted)"), 64)
 }
 
+// isProxy reports whether the peer's exe is listed in opaque_peers.
+func (s *Server) isProxy(p identity.VerifiedPeer) bool {
+	return listed(s.opts.OpaquePeers, proxyName(p.Exe))
+}
+
+// isOpaquePeer reports whether the peer looks like a proxy by its exe or by
+// its comm. Either is enough to refuse it on a direct realm.
 func (s *Server) isOpaquePeer(p identity.VerifiedPeer) bool {
-	names := map[string]bool{filepath.Base(p.Exe): true, p.Name: true}
-	for _, n := range s.opts.OpaquePeers {
-		if names[n] {
-			return true
-		}
-	}
-	return false
+	return listed(s.opts.OpaquePeers, proxyName(p.Exe)) || listed(s.opts.OpaquePeers, identity.DisplayName(p.Name, 64))
+}
+
+func listed(names []string, name string) bool {
+	return name != "" && slices.Contains(names, name)
 }
 
 // Shutdown stops accepting, cancels in-flight work, closes connections and
@@ -281,6 +296,17 @@ func (s *Server) Shutdown(reason string) {
 		s.mu.Unlock()
 		s.closeListeners()
 		s.wg.Wait()
+		// Grants never outlive the service, and a reload starts with none.
+		if s.guardDone != nil {
+			<-s.guardDone
+		}
+		wipe := core.WipeShutdown
+		if reason == "reload" {
+			wipe = core.WipeReload
+		}
+		if err := s.opts.Core.Wipe(context.Background(), wipe, nil); err != nil {
+			s.opts.Log.Error("audit failed for lock", "err", err)
+		}
 		if err := s.opts.Core.FlushRejections(context.Background()); err != nil {
 			s.opts.Log.Error("audit failed for coalesced rejections", "err", err)
 		}

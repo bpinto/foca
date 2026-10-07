@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/bpinto/foca/internal/identity"
+	"github.com/bpinto/foca/internal/policy"
 )
 
 const minimal = `
@@ -183,6 +184,13 @@ func TestKeysDifferingOnlyInCaseAreRefused(t *testing.T) {
 		"capitalised table":      {strings.Replace(minimal, "[plugins]", "[Plugins]", 1), "Plugins"},
 		"capitalised plugin key": {strings.Replace(minimal, "authenticator =", "Authenticator =", 1), "plugins.Authenticator"},
 		"inline table key":       {strings.Replace(minimal, `{ kind = "vm" }`, `{ Kind = "vm" }`, 1), "instances.dev.realm.Kind"},
+		"policy repeated in another case": {minimal + `
+[instances.dev.policy]
+approval = "every-time"
+[instances.dev.Policy]
+Approval = "reuse"
+Window = "8h"
+`, "instances.dev.Policy"},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -274,5 +282,100 @@ func TestFileProtectorWhenOptedIn(t *testing.T) {
 	}
 	if c.Plugins.KeyProtector != "file" || !c.Plugins.InsecureFileProtector {
 		t.Fatalf("%+v", c.Plugins)
+	}
+}
+
+func TestPolicyRejections(t *testing.T) {
+	pol := func(table, body string) string { return minimal + "\n[" + table + "]\n" + body + "\n" }
+	cases := map[string]struct{ cfg, want string }{
+		"window over the 8h cap":    {pol("instances.dev.policy", "approval = \"reuse\"\nwindow = \"8h1s\""), "window 8h0m1s is outside 1s..8h0m0s"},
+		"window under 1s":           {pol("vaults.dev.policy", "approval = \"reuse\"\nwindow = \"500ms\""), "outside"},
+		"secret without its vault":  {pol("secrets.x.policy", "approval = \"every-time\""), `secrets: "x" is not a secret name`},
+		"secret in no vault":        {pol(`secrets."nope:x".policy`, "approval = \"every-time\""), `secrets.nope:x: vault "nope" is not in the config`},
+		"every-time with a window":  {pol(`secrets."dev:x".policy`, "approval = \"every-time\"\nwindow = \"1m\""), "takes no window"},
+		"every-time with a scope":   {pol(`secrets."dev:x".policy`, "approval = \"every-time\"\nscope = \"connection\""), "takes no window"},
+		"reuse without a window":    {pol("instances.dev.policy", "approval = \"reuse\""), "needs a window"},
+		"no approval key":           {pol("instances.dev.policy", "window = \"1m\""), "approval is required"},
+		"unknown approval":          {pol("instances.dev.policy", "approval = \"sometimes\""), "must be"},
+		"unknown scope":             {pol("instances.dev.policy", "approval = \"reuse\"\nwindow = \"1m\"\nscope = \"vm\""), "unknown scope"},
+		"unknown policy key":        {pol("instances.dev.policy", "approval = \"reuse\"\nwindow = \"1m\"\nwidth = 3"), "unknown keys"},
+		"unknown authenticator":     {pol("authenticators.faceid.policy", "approval = \"every-time\""), "unknown authenticator"},
+		"bad secret id":             {pol("secrets.\"common:a/b\".policy", "approval = \"every-time\""), "is not a secret name"},
+		"guest-session on instance": {pol("instances.dev.policy", "approval = \"reuse\"\nwindow = \"1m\"\nscope = \"guest-session\""), `instances.dev.policy: scope "guest-session" needs the guest relay`},
+		"guest-program on vault":    {pol("vaults.dev.policy", "approval = \"reuse\"\nwindow = \"1m\"\nscope = \"guest-program\""), `vaults.dev.policy: scope "guest-program" needs the guest relay (design §14), which dev doesn't have`},
+		"guest-session on secret":   {pol(`secrets."dev:x".policy`, "approval = \"reuse\"\nwindow = \"1m\"\nscope = \"guest-session\""), "secrets.dev:x.policy: scope"},
+		"guest-session on authn":    {pol("authenticators.fake.policy", "approval = \"reuse\"\nwindow = \"1m\"\nscope = \"guest-session\""), "authenticators.fake.policy: scope"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := Parse([]byte(tc.cfg))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("got %v, want error containing %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// The design's example config (§7.1) folds to the results it states.
+func TestPolicyFoldsLikeTheDesignExample(t *testing.T) {
+	cfg := `
+version = 1
+[plugins]
+authenticator = "touchid"
+[vaults.common]
+[vaults.common.policy]
+approval = "reuse"
+window   = "2h"
+[instances.dev]
+realm  = { kind = "vm" }
+expose = ["common:github-pat"]
+[instances.dev.policy]
+approval = "reuse"
+window   = "30m"
+scope    = "peer-session"
+[instances.work]
+realm  = { kind = "vm" }
+expose = ["common:*"]
+[authenticators.touchid.policy]
+approval = "reuse"
+window   = "1h"
+[authenticators.polkit.policy]
+approval = "reuse"
+window   = "8h"
+[secrets."common:prod-db-password".policy]
+approval = "every-time"
+`
+	c, err := Parse([]byte(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dev, _ := c.Instance("dev")
+	work, _ := c.Instance("work")
+	want := policy.Policy{Kind: policy.Reuse, Window: 30 * time.Minute, Scope: policy.ScopePeerSession}
+	if got := c.SecretPolicy(dev, "common:github-pat"); got != want {
+		t.Errorf("dev github-pat = %v, want %v", got, want)
+	}
+	if got := c.SecretPolicy(work, "common:prod-db-password"); got.Kind != policy.EveryTime {
+		t.Errorf("work prod-db-password = %v, want every-time", got)
+	}
+	// work has no instance policy: vault 2h and authenticator 1h fold to 1h,
+	// and the floor caps the scope. The unused polkit entry plays no part.
+	want = policy.Policy{Kind: policy.Reuse, Window: time.Hour, Scope: policy.ScopePeerSession}
+	if got := c.SecretPolicy(work, "common:github-pat"); got != want {
+		t.Errorf("work github-pat = %v, want %v", got, want)
+	}
+	if c.Plugins.PlatformEvents != "auto" {
+		t.Errorf("platform_events default %q", c.Plugins.PlatformEvents)
+	}
+}
+
+func TestNoPolicyMeansEveryTime(t *testing.T) {
+	c, err := Parse([]byte(minimal))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dev, _ := c.Instance("dev")
+	if got := c.SecretPolicy(dev, "common:anything"); got.Kind != policy.EveryTime {
+		t.Fatalf("got %v", got)
 	}
 }

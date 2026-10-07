@@ -1,6 +1,6 @@
 // Package cli is the foca command line: the service (serve), host
 // management (init, add, edit, remove, reload, stop) and the socket client
-// (list, get, run) that also runs inside realms.
+// (list, get, run, grants) that also runs inside realms.
 //
 // Interaction rules (design D21): prompts appear only when stdin and stderr
 // are terminals, and draw on stderr so stdout stays clean. Secret values are
@@ -77,7 +77,7 @@ func (e *Env) notify(ch chan<- os.Signal) (stop func()) {
 		e.Signals(ch)
 		return func() {}
 	}
-	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGUSR1)
 	return func() { signal.Stop(ch) }
 }
 
@@ -104,7 +104,10 @@ type CLI struct {
 	Get     GetCmd     `cmd:"" help:"Read secrets to a pipe or a file."`
 	Run     RunCmd     `cmd:"" help:"Run a command with secrets in its environment."`
 	Reload  ReloadCmd  `cmd:"" help:"Make the running service reload its config (host)."`
+	Lock    LockCmd    `cmd:"" help:"Drop every reuse grant now, so the next access asks again (host)."`
 	Stop    StopCmd    `cmd:"" help:"Stop the running service (host)."`
+	Policy  PolicyCmd  `cmd:"" help:"Explain the approval policy the config sets (host)."`
+	Grants  GrantsCmd  `cmd:"" help:"List or drop your reuse grants."`
 	Version VersionCmd `cmd:"" help:"Print the version."`
 }
 

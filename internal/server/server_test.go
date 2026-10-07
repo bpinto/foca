@@ -25,6 +25,7 @@ import (
 	"github.com/bpinto/foca/internal/plugins/peer"
 	"github.com/bpinto/foca/internal/plugins/provider/static"
 	"github.com/bpinto/foca/internal/plugins/store/memory"
+	"github.com/bpinto/foca/internal/policy"
 	"github.com/bpinto/foca/internal/protocol"
 	"github.com/bpinto/foca/internal/server/core"
 )
@@ -131,7 +132,7 @@ func TestRequestApprovalAuditOverRealSocket(t *testing.T) {
 	if err := c.Call(ctx(t), protocol.MethodHello, protocol.HelloParams{Protocol: 1}, &hello); err != nil {
 		t.Fatal(err)
 	}
-	if hello.Instance != "dev" || hello.Protocol != 1 || len(hello.Features) != 2 {
+	if hello.Instance != "dev" || hello.Protocol != 1 || len(hello.Features) != 4 {
 		t.Fatalf("hello %+v", hello)
 	}
 
@@ -260,7 +261,11 @@ func rejected(e *env, reason string) int {
 	n := 0
 	for _, ev := range e.sink.Events() {
 		if ev.Type == audit.TypeRequestRejected && ev.Reason == reason {
-			n += max(ev.Count, 1)
+			if ev.Coalesced != nil {
+				n += ev.Coalesced.Count
+			} else {
+				n++
+			}
 		}
 	}
 	return n
@@ -286,6 +291,23 @@ func TestProxyPeerRefusedOnDirectRealm(t *testing.T) {
 	e = start(t, vmRealm, &peer.Static{Peer: identity.VerifiedPeer{UID: os.Getuid(), PID: 1, Exe: "/usr/bin/ssh", Name: "ssh"}})
 	if err := dial(t, e.paths.ClientSocket("dev")).Call(ctx(t), protocol.MethodHello, nil, nil); err != nil {
 		t.Fatalf("vm realm refused ssh: %v", err)
+	}
+
+	// A Nix-wrapped proxy is still a proxy: comm is the wrapper's name,
+	// truncated, so only the unwrapped exe name gives it away.
+	e = start(t, hostRealm, &peer.Static{Peer: identity.VerifiedPeer{UID: os.Getuid(), PID: 1, Exe: "/nix/store/x-socat/bin/.socat-wrapped", Name: ".socat-wrappe"}})
+	if err := dial(t, e.paths.ClientSocket("dev")).Call(ctx(t), protocol.MethodHello, nil, nil); err == nil {
+		t.Fatal("wrapped socat accepted on a direct realm")
+	}
+	waitFor(t, func() bool { return hasReject(e.sink, "opaque_peer_on_direct_realm") })
+}
+
+// After a package upgrade replaces ssh, a running forward's exe reads
+// "/usr/bin/ssh (deleted)". It is still the VM's proxy.
+func TestUpgradedProxyAcceptedOnOpaqueRealm(t *testing.T) {
+	e := start(t, vmRealm, &peer.Static{Peer: identity.VerifiedPeer{UID: os.Getuid(), PID: 1, Exe: "/usr/bin/ssh (deleted)", Name: "ssh"}})
+	if err := dial(t, e.paths.ClientSocket("dev")).Call(ctx(t), protocol.MethodHello, nil, nil); err != nil {
+		t.Fatalf("upgraded ssh refused: %v", err)
 	}
 }
 
@@ -586,6 +608,90 @@ func TestHangUpCancelsPendingApproval(t *testing.T) {
 	t.Fatalf("hang-up didn't cancel the prompt; events %v", e.sink.Events())
 }
 
+// A client that sent more requests behind the one being handled, then hung
+// up, is still noticed at once: the reader never waits for the handler. The
+// requests it left behind aren't handled, but they are recorded.
+func TestPipelinedHangUpCancelsPendingApproval(t *testing.T) {
+	e := start(t, hostRealm, nil)
+	e.auth.Default = fake.Hang
+	e.auth.Started = make(chan plugin.ApprovalRequest, 1)
+	c := dial(t, e.paths.ClientSocket("dev"))
+	read := []byte(`{"jsonrpc":"2.0","id":1,"method":"secret.read","params":{"names":["dev:github-pat"]}}`)
+	c.WriteRaw(read)
+	<-e.auth.Started
+	c.WriteRaw(read)
+	c.WriteRaw(read)
+	start := time.Now()
+	c.Close()
+	waitFor(t, func() bool {
+		for _, ev := range e.sink.Events() {
+			if ev.Type == audit.TypeApprovalTimeout && ev.Reason == "cancelled" {
+				return true
+			}
+		}
+		return false
+	})
+	if time.Since(start) > time.Second {
+		t.Fatal("hang-up noticed only when the prompt timed out")
+	}
+	waitFor(t, func() bool { return hasReject(e.sink, "connection_closed") })
+	e.srv.Shutdown("test") // flushes the coalesced count
+	if n := rejected(e, "connection_closed"); n != 2 {
+		t.Fatalf("%d left-behind requests recorded, want 2", n)
+	}
+	if n := len(e.auth.Requests()); n != 1 {
+		t.Fatalf("%d prompts for a client that had gone", n)
+	}
+}
+
+// More than maxPipelined requests waiting behind the one being handled
+// close the connection, which also cancels that one.
+func TestTooManyPipelinedRequestsCloseTheConnection(t *testing.T) {
+	e := start(t, hostRealm, nil)
+	e.auth.Default = fake.Hang
+	e.auth.Started = make(chan plugin.ApprovalRequest, 1)
+	c := dial(t, e.paths.ClientSocket("dev"))
+	c.WriteRaw([]byte(`{"jsonrpc":"2.0","id":1,"method":"secret.read","params":{"names":["dev:github-pat"]}}`))
+	<-e.auth.Started
+	for i := 0; i <= maxPipelined; i++ {
+		c.WriteRaw([]byte(`{"jsonrpc":"2.0","id":2,"method":"server.hello"}`))
+	}
+	waitFor(t, func() bool { return hasReject(e.sink, "too_many_pipelined") })
+	for {
+		if _, err := c.ReadRaw(); err != nil {
+			break // closed; anything before is the cancelled read's answer
+		}
+	}
+	waitFor(t, func() bool {
+		for _, ev := range e.sink.Events() {
+			if ev.Type == audit.TypeApprovalTimeout && ev.Reason == "cancelled" {
+				return true
+			}
+		}
+		return false
+	})
+}
+
+// A client that doesn't take its answer is given up on after WriteTimeout.
+func TestWriteGivesUpOnAClientThatDoesntRead(t *testing.T) {
+	s := New(Options{WriteTimeout: 50 * time.Millisecond})
+	a, b := net.Pipe() // writes block until the other end reads
+	defer a.Close()
+	defer b.Close()
+	done := make(chan bool, 1)
+	go func() {
+		done <- s.write(a, protocol.Response{JSONRPC: "2.0", ID: json.RawMessage("1"), Result: json.RawMessage("{}")})
+	}()
+	select {
+	case ok := <-done:
+		if ok {
+			t.Fatal("write to a client that never reads succeeded")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("write blocked past its deadline")
+	}
+}
+
 // Every way of sending a request the socket refuses leaves an audit record,
 // so a realm probing the socket shows up in the log.
 func TestEveryRefusedRequestIsAudited(t *testing.T) {
@@ -595,7 +701,7 @@ func TestEveryRefusedRequestIsAudited(t *testing.T) {
 		{`not json`, "parse_error"},
 		{`{"jsonrpc":"1.0","id":1,"method":"x"}`, "invalid_request"},
 		{`{"jsonrpc":"2.0","id":1,"method":"vault.export\u001b[2J"}`, "method_not_found"},
-		{`{"jsonrpc":"2.0","id":1,"method":"secret.read","params":{"names":["a"],"extra":1}}`, "invalid_params"},
+		{`{"jsonrpc":"2.0","id":1,"method":"secret.read","params":{"names":["dev:a"],"extra":1}}`, "invalid_params"},
 		{`{"jsonrpc":"2.0","id":1,"method":"secret.read","params":{"names":[]}}`, "invalid_params"},
 		{`{"jsonrpc":"2.0","id":1,"method":"secret.list","params":{"min_protocol":99}}`, "protocol_unsupported"},
 	}
@@ -629,5 +735,96 @@ func TestEveryRefusedRequestIsAudited(t *testing.T) {
 		if m := ev.Params["method"]; strings.ContainsAny(m, "\x1b[") {
 			t.Errorf("unsanitised method stored: %q", m)
 		}
+	}
+}
+
+// readySource is a platform-events source that is healthy at once.
+type readySource struct{}
+
+func (readySource) Name() string { return "ready" }
+
+func (readySource) Run(ctx context.Context, out chan<- plugin.PlatformEvent) error {
+	out <- plugin.PlatformEvent{Kind: plugin.EventReady, Source: "ready"}
+	<-ctx.Done()
+	return nil
+}
+
+func withReuse(p policy.Policy) func(*Options) {
+	return func(o *Options) {
+		o.Events = readySource{}
+		ci, _ := o.Core.Instance("dev")
+		ci.Policy = func(string) policy.Policy { return p }
+	}
+}
+
+// Over a real socket and the kernel identifier: one approval covers reads
+// from other connections in the same session; grants.status shows it, and
+// grants.drop ends it.
+func TestGrantsOverTheSocket(t *testing.T) {
+	e := startWith(t, hostRealm, nil, withReuse(policy.Policy{Kind: policy.Reuse, Window: time.Hour, Scope: policy.ScopePeerSession}))
+	e.auth.Default = fake.Approve
+	for deadline := time.Now().Add(5 * time.Second); !e.srv.opts.Core.Healthy(); time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("events never ready")
+		}
+	}
+	read := func(c *client.Client) {
+		t.Helper()
+		var res protocol.SecretReadResult
+		if err := c.Call(ctx(t), protocol.MethodSecretRead, protocol.SecretReadParams{Names: []string{"dev:github-pat"}}, &res); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c1, c2 := dial(t, e.paths.ClientSocket("dev")), dial(t, e.paths.ClientSocket("dev"))
+	read(c1)
+	read(c2)
+	if n := len(e.auth.Requests()); n != 1 {
+		t.Fatalf("%d prompts, want 1", n)
+	}
+	if p := e.auth.Requests()[0].Prompt; !strings.HasSuffix(p, "Approving allows reuse for 1h by anything in the same session.") {
+		t.Fatalf("prompt %q", p)
+	}
+
+	var st protocol.GrantsStatusResult
+	if err := c2.Call(ctx(t), protocol.MethodGrantsStatus, protocol.GrantsStatusParams{}, &st); err != nil {
+		t.Fatal(err)
+	}
+	if len(st.Grants) != 1 || st.Grants[0].Name != "dev:github-pat" || st.Grants[0].Scope != "peer-session" {
+		t.Fatalf("status %+v", st)
+	}
+	var dr protocol.GrantsDropResult
+	if err := c2.Call(ctx(t), protocol.MethodGrantsDrop, protocol.GrantsDropParams{}, &dr); err != nil || dr.Dropped != 1 {
+		t.Fatalf("drop %+v %v", dr, err)
+	}
+	read(c1)
+	if n := len(e.auth.Requests()); n != 2 {
+		t.Fatalf("read after drop: %d prompts", n)
+	}
+	// A bad name is refused and audited like any invalid request.
+	err := c1.Call(ctx(t), protocol.MethodGrantsDrop, protocol.GrantsDropParams{Names: []string{"a b"}}, &dr)
+	if pe := callErr(err); pe == nil || pe.Code != protocol.CodeInvalidParams || pe.Data.EventSeq == 0 {
+		t.Fatalf("got %v", err)
+	}
+
+	// Shutdown wipes and says so.
+	e.srv.Shutdown("signal terminated")
+	var lock *audit.Event
+	for _, ev := range e.sink.Events() {
+		if ev.Type == audit.TypeLock {
+			ev := ev
+			lock = &ev
+		}
+	}
+	if lock == nil || lock.Reason != "shutdown" || lock.Count != 1 {
+		t.Fatalf("lock %+v", lock)
+	}
+}
+
+func TestReloadShutdownWipesAsReload(t *testing.T) {
+	e := start(t, hostRealm, nil)
+	e.srv.Shutdown("reload")
+	evs := e.sink.Events()
+	if lock := evs[len(evs)-2]; lock.Type != audit.TypeLock || lock.Reason != "reload" {
+		t.Fatalf("events end with %+v", evs[len(evs)-2:])
 	}
 }

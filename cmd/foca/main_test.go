@@ -213,3 +213,58 @@ func waitFor(t *testing.T, cond func() bool) {
 		}
 	}
 }
+
+// Reuse across separate client processes in one session, then `foca lock`
+// ends it; `foca policy explain` describes the same policy.
+func TestBinaryReuseLockAndExplain(t *testing.T) {
+	p := setup(t)
+	cfgPath := filepath.Join(p.base, "config.toml")
+	cfg := strings.Replace(config, "[plugins]\n", "[plugins]\nplatform_events = \"fake\"\n", 1) +
+		"[instances.dev.policy]\napproval = \"reuse\"\nwindow = \"15m\"\nscope = \"peer-session\"\n" +
+		"[secrets.\"dev:prod-db\".policy]\napproval = \"every-time\"\n"
+	os.WriteFile(cfgPath, []byte(cfg), 0o600)
+
+	out := p.ok("", "policy", "explain")
+	for _, want := range []string{
+		"Platform events: fake.",
+		"Instance dev (host dev), vault dev",
+		"any other secret in dev  one approval allows reuse for 15m by anything in the same session",
+		"dev:prod-db              asks every time",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("explain output lacks %q:\n%s", want, out)
+		}
+	}
+
+	p.ok("", "init")
+	p.ok("ghp_123\n", "add", "dev:github-pat")
+	srv := p.serve()
+	count := func(s string) int { return strings.Count(p.auditTypes(), s) }
+	// The fake source reports ready at once, but give the service a moment.
+	time.Sleep(100 * time.Millisecond)
+
+	base := count(`"type":"approval.granted"`) // init and add
+	p.ok("", "get", "dev:github-pat")
+	p.ok("", "get", "dev:github-pat")
+	if g, r := count(`"type":"approval.granted"`)-base, count(`"type":"approval.reused"`); g != 1 || r != 1 {
+		t.Fatalf("granted %d, reused %d", g, r)
+	}
+	if out := p.ok("", "grants"); !strings.Contains(out, "github-pat") || !strings.Contains(out, "peer-session") {
+		t.Fatalf("grants: %q", out)
+	}
+
+	if _, errs, err := p.run("", "lock"); err != nil || !strings.Contains(errs, "lock requested") {
+		t.Fatalf("lock: %v %s", err, errs)
+	}
+	waitFor(t, func() bool { return count(`"type":"lock","outcome":"ok","reason":"manual"`) == 1 })
+	p.ok("", "get", "dev:github-pat")
+	if g := count(`"type":"approval.granted"`) - base; g != 2 {
+		t.Fatalf("after lock: %d grants", g)
+	}
+
+	p.ok("", "stop")
+	srv.Wait()
+	if !strings.Contains(p.auditTypes(), `"type":"lock","outcome":"ok","reason":"shutdown","count":1`) {
+		t.Fatalf("no shutdown wipe in:\n%s", p.auditTypes())
+	}
+}

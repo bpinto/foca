@@ -10,6 +10,7 @@ import (
 	"os"
 	"regexp"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -18,6 +19,8 @@ import (
 
 	"github.com/bpinto/foca/internal/fsutil"
 	"github.com/bpinto/foca/internal/identity"
+	"github.com/bpinto/foca/internal/policy"
+	"github.com/bpinto/foca/internal/secretname"
 )
 
 // Config is the validated result of loading a config file.
@@ -29,6 +32,11 @@ type Config struct {
 	Limits      Limits
 	Vaults      []string
 	Instances   []Instance
+	// Policy levels other than the instance's own (design §9.2), by name.
+	// A missing entry is "no opinion".
+	VaultPolicies         map[string]policy.Policy
+	SecretPolicies        map[string]policy.Policy
+	AuthenticatorPolicies map[string]policy.Policy
 }
 
 type Plugins struct {
@@ -37,6 +45,8 @@ type Plugins struct {
 	KeyProtector   string
 	PeerIdentifier string
 	AuditSink      string
+	// PlatformEvents reports sleep and screen lock, so grants can be wiped.
+	PlatformEvents string
 	// InsecureFileProtector allows key_protector = "file", which keeps the
 	// key that unlocks the vault in a plain file next to it.
 	InsecureFileProtector bool
@@ -65,6 +75,8 @@ type Instance struct {
 	// Expose is what the instance may read, by vault (design §7.1). Its keys
 	// are exactly the vaults the instance reads.
 	Expose map[string]Expose
+	// Policy is the instance level ([instances.<name>.policy]).
+	Policy policy.Policy
 }
 
 // Expose is what an instance may read in one vault: all of it, or the
@@ -140,13 +152,15 @@ var defaultSkipAncestors = []string{
 // ---- raw file shape ----
 
 type rawFile struct {
-	Version     int                    `toml:"version"`
-	OpaquePeers []string               `toml:"opaque_peers"`
-	Plugins     rawPlugins             `toml:"plugins"`
-	Approval    rawApproval            `toml:"approval"`
-	Limits      rawLimits              `toml:"limits"`
-	Vaults      map[string]rawVault    `toml:"vaults"`
-	Instances   map[string]rawInstance `toml:"instances"`
+	Version        int                       `toml:"version"`
+	OpaquePeers    []string                  `toml:"opaque_peers"`
+	Plugins        rawPlugins                `toml:"plugins"`
+	Approval       rawApproval               `toml:"approval"`
+	Limits         rawLimits                 `toml:"limits"`
+	Vaults         map[string]rawVault       `toml:"vaults"`
+	Instances      map[string]rawInstance    `toml:"instances"`
+	Secrets        map[string]rawPolicyTable `toml:"secrets"`
+	Authenticators map[string]rawPolicyTable `toml:"authenticators"`
 }
 
 type rawPlugins struct {
@@ -155,6 +169,7 @@ type rawPlugins struct {
 	KeyProtector          string `toml:"key_protector"`
 	PeerIdentifier        string `toml:"peer_identifier"`
 	AuditSink             string `toml:"audit_sink"`
+	PlatformEvents        string `toml:"platform_events"`
 	InsecureFileProtector bool   `toml:"insecure_file_protector"`
 }
 
@@ -170,11 +185,26 @@ type rawLimits struct {
 	IdleTimeout    *duration `toml:"idle_timeout"`
 }
 
-type rawVault struct{}
+type rawVault struct {
+	Policy *rawPolicy `toml:"policy"`
+}
+
+// rawPolicyTable is a [secrets.<id>] or [authenticators.<name>] table. Only
+// policy lives there; secret values and metadata stay in the vault.
+type rawPolicyTable struct {
+	Policy *rawPolicy `toml:"policy"`
+}
+
+type rawPolicy struct {
+	Approval string    `toml:"approval"`
+	Window   *duration `toml:"window"`
+	Scope    string    `toml:"scope"`
+}
 
 type rawInstance struct {
 	Realm  *rawRealm  `toml:"realm"`
 	Expose *rawExpose `toml:"expose"`
+	Policy *rawPolicy `toml:"policy"`
 }
 
 type rawRealm struct {
@@ -295,6 +325,7 @@ func validate(raw *rawFile) (*Config, error) {
 		SecretStore:    orDefault(raw.Plugins.SecretStore, "memory"),
 		PeerIdentifier: orDefault(raw.Plugins.PeerIdentifier, "auto"),
 		AuditSink:      orDefault(raw.Plugins.AuditSink, "jsonl"),
+		PlatformEvents: orDefault(raw.Plugins.PlatformEvents, "auto"),
 		KeyProtector:   raw.Plugins.KeyProtector,
 
 		InsecureFileProtector: raw.Plugins.InsecureFileProtector,
@@ -417,6 +448,9 @@ func validate(raw *rawFile) (*Config, error) {
 			}
 			users[v] = append(users[v], name)
 		}
+		if inst.Policy, err = parsePolicy(ri.Policy); err != nil {
+			fail("instances.%s.policy: %v", name, err)
+		}
 		c.Instances = append(c.Instances, inst)
 	}
 
@@ -430,6 +464,41 @@ func validate(raw *rawFile) (*Config, error) {
 		}
 	}
 
+	// policy levels (design §9.2)
+	c.VaultPolicies = map[string]policy.Policy{}
+	for name, rv := range raw.Vaults {
+		p, err := parsePolicy(rv.Policy)
+		if err != nil {
+			fail("vaults.%s.policy: %v", name, err)
+		}
+		c.VaultPolicies[name] = p
+	}
+	c.SecretPolicies = map[string]policy.Policy{}
+	for id, rs := range raw.Secrets {
+		if _, _, ok := secretname.Split(id); !ok {
+			fail("secrets: %q is not a secret name, <vault>:<secret>", id)
+			continue
+		}
+		p, err := parsePolicy(rs.Policy)
+		if err != nil {
+			fail("secrets.%s.policy: %v", id, err)
+		}
+		c.SecretPolicies[id] = p
+	}
+	c.AuthenticatorPolicies = map[string]policy.Policy{}
+	for name, ra := range raw.Authenticators {
+		if !knownAuthenticators[name] {
+			fail("authenticators.%s: unknown authenticator (%s)", name, strings.Join(sortedKeys(knownAuthenticators), " | "))
+			continue
+		}
+		p, err := parsePolicy(ra.Policy)
+		if err != nil {
+			fail("authenticators.%s.policy: %v", name, err)
+		}
+		c.AuthenticatorPolicies[name] = p
+	}
+	errs = append(errs, c.checkGuestScopes()...)
+
 	vaultSet := map[string]bool{}
 	for v := range declared {
 		vaultSet[v] = true
@@ -441,6 +510,11 @@ func validate(raw *rawFile) (*Config, error) {
 		c.Vaults = append(c.Vaults, v)
 	}
 	sort.Strings(c.Vaults)
+	for id := range c.SecretPolicies {
+		if vault, _, _ := secretname.Split(id); !slices.Contains(c.Vaults, vault) {
+			fail("secrets.%s: vault %q is not in the config", id, vault)
+		}
+	}
 
 	if len(errs) > 0 {
 		return nil, errors.Join(errs...)

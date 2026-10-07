@@ -18,9 +18,11 @@ import (
 // clientMethods is everything a socket offers. None of it changes state on
 // the host.
 var clientMethods = map[string]bool{
-	protocol.MethodHello:      true,
-	protocol.MethodSecretList: true,
-	protocol.MethodSecretRead: true,
+	protocol.MethodHello:        true,
+	protocol.MethodSecretList:   true,
+	protocol.MethodSecretRead:   true,
+	protocol.MethodGrantsStatus: true,
+	protocol.MethodGrantsDrop:   true,
 }
 
 // managementMethods are host CLI operations. They exist on no socket; a realm
@@ -33,23 +35,30 @@ var managementMethods = map[string]bool{
 }
 
 type connState struct {
+	id     string // for connection-scoped grants
 	inst   *core.Instance
 	peer   identity.VerifiedPeer
 	client *identity.ClientInfo // from server.hello; per-request client overrides it
 }
 
-// message is one framed request, or the error that ended reading.
-type message struct {
-	line []byte
-	err  error
-}
+// maxPipelined is how many requests a connection may send ahead of the one
+// being handled. One more closes the connection.
+const maxPipelined = 4
+
+// Reasons a connection's reader stops other than the client hanging up.
+const (
+	endTooLarge  = "message_too_large"
+	endPipelined = "too_many_pipelined"
+)
 
 // serveConn handles requests one at a time, in order. A separate reader
-// keeps reading while a request is handled, so a client that hangs up is
-// noticed at once: its pending prompt is cancelled instead of holding a
-// queue slot until prompt_timeout. A connection that sends no complete
-// request within IdleTimeout is closed; the deadline is lifted while a
-// request is being handled, so a slow approval never trips it.
+// keeps reading while a request is handled, and never waits for the handler,
+// so a client that hangs up is noticed at once even if it sent more
+// requests: its pending prompt is cancelled instead of holding a queue slot
+// until prompt_timeout, and requests it left queued aren't handled. A
+// connection that sends no complete request within IdleTimeout is closed;
+// the deadline is lifted while a request is being handled, so a slow
+// approval never trips it.
 func (s *Server) serveConn(conn *net.UnixConn, inst *core.Instance) {
 	peer, ok := s.admit(conn, inst)
 	if !ok {
@@ -57,47 +66,73 @@ func (s *Server) serveConn(conn *net.UnixConn, inst *core.Instance) {
 	}
 	ctx, cancel := context.WithCancel(s.ctx)
 	defer cancel()
-	st := &connState{inst: inst, peer: peer}
-	msgs := make(chan message)
-	go s.readLoop(conn, cancel, msgs)
+	st := &connState{id: ids.New(), inst: inst, peer: peer}
+	msgs := make(chan []byte, maxPipelined)
+	ended := make(chan string, 1)
+	go s.readLoop(conn, cancel, msgs, ended)
 	conn.SetReadDeadline(time.Now().Add(s.opts.IdleTimeout))
-	for m := range msgs {
-		if m.err != nil {
-			call := core.Call{RequestID: ids.New(), Origin: audit.OriginClientSocket, Instance: inst, Peer: peer, Reported: st.client}
-			s.write(conn, *s.refuseAs(ctx, call, nil, "", "message_too_large",
-				protocol.NewError(protocol.CodeParseError, "message too large (max %d bytes)", protocol.MaxMessage)))
-			return
+	for line := range msgs {
+		if ctx.Err() != nil {
+			// Nobody is left to answer. The request is recorded, not handled.
+			s.reject(inst, "connection_closed", &peer)
+			continue
 		}
 		conn.SetReadDeadline(time.Time{})
-		if resp := s.handle(ctx, st, m.line); resp != nil {
-			s.write(conn, *resp)
+		if resp := s.handle(ctx, st, line); resp != nil && !s.write(conn, *resp) {
+			// The client isn't taking answers. Closing ends the reader, and
+			// what it left queued is recorded below.
+			cancel()
+			conn.Close()
+			continue
 		}
 		conn.SetReadDeadline(time.Now().Add(s.opts.IdleTimeout))
+	}
+	switch <-ended {
+	case endTooLarge:
+		call := core.Call{RequestID: ids.New(), Origin: audit.OriginClientSocket, Conn: st.id, Instance: inst, Peer: peer, Reported: st.client}
+		s.write(conn, *s.refuseAs(ctx, call, nil, "", endTooLarge,
+			protocol.NewError(protocol.CodeParseError, "message too large (max %d bytes)", protocol.MaxMessage)))
+	case endPipelined:
+		s.reject(inst, endPipelined, &peer)
 	}
 }
 
 // readLoop frames messages until the connection fails, then cancels the
-// connection's in-flight work. EOF counts as hanging up, so clients must not
-// half-close while they wait for an answer.
-func (s *Server) readLoop(conn *net.UnixConn, cancel context.CancelFunc, msgs chan<- message) {
-	defer close(msgs)
-	defer cancel()
+// connection's in-flight work and reports why it stopped ("" for a hang-up
+// or a read error). It never blocks on the handler: a request beyond
+// maxPipelined waiting ones closes the connection. EOF counts as hanging up,
+// so clients must not half-close while they wait for an answer.
+func (s *Server) readLoop(conn *net.UnixConn, cancel context.CancelFunc, msgs chan<- []byte, ended chan<- string) {
+	reason := ""
+	defer func() {
+		cancel()
+		ended <- reason
+		close(msgs)
+	}()
 	r := bufio.NewReaderSize(conn, 64*1024)
 	for {
 		line, err := protocol.ReadMessage(r)
 		if errors.Is(err, protocol.ErrTooLarge) {
-			msgs <- message{err: err}
+			reason = endTooLarge
 			return
 		}
 		if err != nil {
 			return
 		}
-		msgs <- message{line: line}
+		select {
+		case msgs <- line:
+		default:
+			// The handler may be stuck writing to a client that doesn't
+			// read; closing the connection unblocks it.
+			reason = endPipelined
+			conn.Close()
+			return
+		}
 	}
 }
 
 func (s *Server) handle(ctx context.Context, st *connState, line []byte) *protocol.Response {
-	call := core.Call{RequestID: ids.New(), Origin: audit.OriginClientSocket, Instance: st.inst, Peer: st.peer, Reported: st.client}
+	call := core.Call{RequestID: ids.New(), Origin: audit.OriginClientSocket, Conn: st.id, Instance: st.inst, Peer: st.peer, Reported: st.client}
 	if !json.Valid(line) {
 		return s.refuse(ctx, call, nil, "", protocol.NewError(protocol.CodeParseError, "invalid JSON"))
 	}
@@ -212,7 +247,7 @@ func (s *Server) dispatch(ctx context.Context, st *connState, call core.Call, re
 		}
 		return protocol.HelloResult{
 			Protocol: protocol.Version, Instance: st.inst.Name, Realm: st.inst.Realm,
-			ServerVersion: s.opts.Version, Features: []string{protocol.MethodSecretList, protocol.MethodSecretRead},
+			ServerVersion: s.opts.Version, Features: []string{protocol.MethodSecretList, protocol.MethodSecretRead, protocol.MethodGrantsStatus, protocol.MethodGrantsDrop},
 		}, nil
 
 	case protocol.MethodSecretList:
@@ -250,6 +285,28 @@ func (s *Server) dispatch(ctx context.Context, st *connState, call core.Call, re
 			out.Secrets = append(out.Secrets, protocol.SecretOut{Name: sec.Name, Value: v, Encoding: enc})
 		}
 		return out, nil
+
+	case protocol.MethodGrantsStatus:
+		var p protocol.GrantsStatusParams
+		if e := s.decode(&call, req.Params, &p); e != nil {
+			return nil, e
+		}
+		out := protocol.GrantsStatusResult{Grants: []protocol.GrantInfo{}}
+		for _, g := range s.opts.Core.Grants(call) {
+			out.Grants = append(out.Grants, protocol.GrantInfo{Name: g.Resource.ID, Scope: g.Scope, ApprovalID: g.ApprovalID, ExpiresAt: g.ExpiresAt})
+		}
+		return out, nil
+
+	case protocol.MethodGrantsDrop:
+		var p protocol.GrantsDropParams
+		if e := s.decode(&call, req.Params, &p); e != nil {
+			return nil, e
+		}
+		n, err := s.opts.Core.DropGrants(ctx, call, p.Names)
+		if err != nil {
+			return nil, asProtocol(err)
+		}
+		return protocol.GrantsDropResult{Dropped: n}, nil
 	}
 	return nil, protocol.NewError(protocol.CodeMethodNotFound, "unknown method %q", req.Method)
 }
@@ -270,16 +327,31 @@ func errResp(id json.RawMessage, e *protocol.Error) *protocol.Response {
 }
 
 // write sends one response and zeroes the encoded bytes afterwards, since
-// they may contain secret values.
-func (s *Server) write(conn net.Conn, resp protocol.Response) {
-	b, err := json.Marshal(resp)
+// they may contain secret values. A client that doesn't read its answer
+// within WriteTimeout is given up on: false means the connection must close.
+// The core refuses values that wouldn't fit before it records them served;
+// any other answer too large to read is replaced by an error, so the client
+// isn't left with a connection that fails mid-message.
+func (s *Server) write(conn net.Conn, resp protocol.Response) bool {
+	b, err := protocol.Marshal(resp)
 	if err != nil {
-		return
+		return false
+	}
+	if len(b) > protocol.MaxMessage {
+		zero(b)
+		zero(resp.Result)
+		s.opts.Log.Warn("answer too large for one message; sent an error instead", "bytes", len(b))
+		b, err = protocol.Marshal(errResp(resp.ID, protocol.NewError(protocol.CodeInternal, "the answer is larger than one message (%d bytes)", protocol.MaxMessage)))
+		if err != nil {
+			return false
+		}
 	}
 	b = append(b, '\n')
-	conn.Write(b)
+	conn.SetWriteDeadline(time.Now().Add(s.opts.WriteTimeout))
+	_, err = conn.Write(b)
 	zero(b)
 	zero(resp.Result)
+	return err == nil
 }
 
 func zero(b []byte) {

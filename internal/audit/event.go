@@ -30,6 +30,7 @@ const (
 	TypeConfigReload    = "config.reload"
 	TypeLock            = "lock"
 	TypeRequestRejected = "request.rejected"
+	TypeGrantsDrop      = "grants.drop"
 )
 
 // Outcomes.
@@ -75,7 +76,22 @@ type Event struct {
 	Peer      *Peer             `json:"peer,omitempty"`
 	Client    *Client           `json:"client,omitempty"`
 	Error     *ErrorInfo        `json:"error,omitempty"`
-	Count     int               `json:"count,omitempty"`
+	// Count is what the event itself counts: the grants a lock or
+	// grants.drop removed, the secrets a secret.list returned.
+	Count int `json:"count,omitempty"`
+	// Coalesced is set only on an event that stands for a burst of others
+	// like it (design §9.6).
+	Coalesced *Coalesced `json:"coalesced,omitempty"`
+}
+
+// Coalesced says how many events were folded into one, and which event,
+// written in full, they followed.
+type Coalesced struct {
+	Count    int    `json:"count"`
+	AfterSeq uint64 `json:"after_seq"`
+	// Reasons counts the folded events by their own reason, when reasons
+	// that a realm must not tell apart share one window (design §9.6).
+	Reasons map[string]int `json:"reasons,omitempty"`
 }
 
 type Resource struct {
@@ -89,6 +105,7 @@ type Approval struct {
 	Authenticator string     `json:"authenticator,omitempty"`
 	Method        string     `json:"method,omitempty"`
 	Scope         string     `json:"scope,omitempty"`
+	ScopeKey      *ScopeKey  `json:"scope_key,omitempty"`
 	GrantedAt     *time.Time `json:"granted_at,omitempty"`
 	ExpiresAt     *time.Time `json:"expires_at,omitempty"`
 	PromptText    string     `json:"prompt_text,omitempty"`
@@ -109,4 +126,17 @@ type Client struct {
 type ErrorInfo struct {
 	Code    string `json:"code"`
 	Message string `json:"message,omitempty"`
+}
+
+// ScopeKey is the exact key a grant was made for. Each component records who
+// vouched for it, so a UI can show what a reuse was matched on.
+type ScopeKey struct {
+	Instance    string   `json:"instance"`
+	Connection  *KeyPart `json:"connection,omitempty"`
+	PeerSession *KeyPart `json:"peer_session,omitempty"`
+}
+
+type KeyPart struct {
+	Value string `json:"value"`
+	By    string `json:"by"` // "host": the host kernel
 }

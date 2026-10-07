@@ -56,9 +56,38 @@ func (g *Globals) openHost(e *Env, vaultFlag string) (*hostOp, error) {
 		call: core.HostCall(ids.New(), vault, selfPeer())}, nil
 }
 
+// close waits out the pause after a prompt that timed out or was cancelled
+// before anything else: the process holds the prompt lock through it, and
+// the lock drops when the process exits (design §9.6).
 func (o *hostOp) close() {
+	o.host.Core.Settle()
 	o.unlock()
 	o.host.Audit.Close()
+}
+
+// opContext is the context for a host operation's approval and change. A
+// signal that would end the process (Ctrl-C) cancels it instead, so a prompt
+// on screen is cancelled and recorded, and close keeps the prompt lock
+// through the pause before the process exits. The first signal also restores
+// the default, so a second one ends the process at once.
+func opContext(e *Env) (ctx context.Context, done func()) {
+	ctx, cancel := context.WithCancel(background())
+	sigs := make(chan os.Signal, 1)
+	stop := e.notify(sigs)
+	finished := make(chan struct{})
+	go func() {
+		select {
+		case <-sigs:
+			stop()
+			cancel()
+		case <-finished:
+		}
+	}()
+	return ctx, func() {
+		close(finished)
+		stop()
+		cancel()
+	}
 }
 
 // pickVault: --vault, else the vault of --instance / FOCA_INSTANCE if it reads
@@ -132,7 +161,9 @@ func (c *InitCmd) Run(g *Globals, e *Env) error {
 		defer zero(pass)
 	}
 	prot := op.host.Protector
-	err = op.host.Core.InitVault(background(), op.call, op.vault, func(ctx context.Context) (string, func(context.Context) error, error) {
+	ctx, done := opContext(e)
+	defer done()
+	err = op.host.Core.InitVault(ctx, op.call, op.vault, func(ctx context.Context) (string, func(context.Context) error, error) {
 		h, err := op.store.Create(ctx, prot, vaultfile.CreateOptions{Recovery: pass})
 		if err != nil {
 			return "", nil, err
@@ -192,7 +223,9 @@ func (c *AddCmd) Run(g *Globals, e *Env) error {
 		return err
 	}
 	defer op.close()
-	ch, err := op.host.Core.AddSecret(background(), op.call, core.NewSecret{
+	ctx, done := opContext(e)
+	defer done()
+	ch, err := op.host.Core.AddSecret(ctx, op.call, core.NewSecret{
 		Vault: op.vault, ID: id, DisplayName: c.DisplayName, Description: c.Description, Value: value,
 	})
 	if err != nil {
@@ -239,7 +272,9 @@ func (c *EditCmd) Run(g *Globals, e *Env) error {
 		}
 		defer zero(ed.Value)
 	}
-	ch, err := op.host.Core.EditSecret(background(), op.call, ed)
+	ctx, done := opContext(e)
+	defer done()
+	ch, err := op.host.Core.EditSecret(ctx, op.call, ed)
 	if err != nil {
 		return err
 	}
@@ -300,7 +335,9 @@ func (c *RemoveCmd) Run(g *Globals, e *Env) error {
 		return err
 	}
 	defer op.close()
-	ch, err := op.host.Core.RemoveSecret(background(), op.call, op.vault, id)
+	ctx, done := opContext(e)
+	defer done()
+	ch, err := op.host.Core.RemoveSecret(ctx, op.call, op.vault, id)
 	if err != nil {
 		return err
 	}

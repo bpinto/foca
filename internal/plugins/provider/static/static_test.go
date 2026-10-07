@@ -27,26 +27,44 @@ func TestExposureFiltersListResolveAndServe(t *testing.T) {
 	if err != nil || len(list) != 2 {
 		t.Fatalf("list = %+v, %v", list, err)
 	}
-	r, err := p.Resolve(ctx, "github-pat")
-	if err != nil || r.Ref.Display != "GitHub PAT" {
-		t.Fatalf("resolve = %+v, %v", r, err)
+	rs, errs, err := p.Resolve(ctx, []string{"github-pat", "prod-db", "missing"})
+	if err != nil || len(rs) != 3 || len(errs) != 3 {
+		t.Fatalf("resolve = %+v %v, %v", rs, errs, err)
 	}
-	res, err := p.Serve(ctx, r, nil)
+	if r := rs[0]; errs[0] != nil || r.Ref.Display != "GitHub PAT" {
+		t.Fatalf("resolve = %+v, %v", r, errs[0])
+	}
+	res, err := p.Serve(ctx, rs[0], nil)
 	if err != nil || string(res.Value) != "ghp_x" {
 		t.Fatalf("serve = %q, %v", res.Value, err)
 	}
 
-	_, err = p.Resolve(ctx, "prod-db")
-	if !errors.Is(err, plugin.ErrNotFound) || !errors.Is(err, plugin.ErrNotExposed) {
+	if err := errs[1]; !errors.Is(err, plugin.ErrNotFound) || !errors.Is(err, plugin.ErrNotExposed) {
 		t.Fatalf("unexposed secret: %v", err)
 	}
-	_, err = p.Resolve(ctx, "missing")
-	if !errors.Is(err, plugin.ErrNotFound) || errors.Is(err, plugin.ErrNotExposed) {
+	if err := errs[2]; !errors.Is(err, plugin.ErrNotFound) || errors.Is(err, plugin.ErrNotExposed) {
 		t.Fatalf("missing secret: %v", err)
 	}
 	// Serving an unexposed resource directly is still refused.
 	if _, err := p.Serve(ctx, plugin.Resource{Ref: plugin.ResourceRef{ID: "prod-db"}}, nil); !errors.Is(err, plugin.ErrNotExposed) {
 		t.Fatalf("serve of unexposed: %v", err)
+	}
+}
+
+// A request unseals the data key once, however many names it carries.
+func TestResolveUnsealsOncePerRequest(t *testing.T) {
+	unseals := 0
+	dek := func(context.Context) ([]byte, func(), error) {
+		unseals++
+		return nil, func() {}, nil
+	}
+	p := New("v", seeded(t), Exposure{All: true}, dek)
+	names := []string{"github-pat", "npm-token", "prod-db", "a", "b", "c"}
+	if _, _, err := p.Resolve(context.Background(), names); err != nil {
+		t.Fatal(err)
+	}
+	if unseals != 1 {
+		t.Fatalf("%d unseals for one request of %d names", unseals, len(names))
 	}
 }
 

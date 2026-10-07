@@ -14,6 +14,7 @@ import (
 	"github.com/bpinto/foca/internal/plugins/provider/static"
 	"github.com/bpinto/foca/internal/plugins/store/memory"
 	"github.com/bpinto/foca/internal/plugins/store/vaultfile"
+	"github.com/bpinto/foca/internal/policy"
 	"github.com/bpinto/foca/internal/server"
 	"github.com/bpinto/foca/internal/server/core"
 )
@@ -108,7 +109,7 @@ func openAudit(cfg *config.Config, paths config.Paths) (plugin.AuditSink, error)
 	}
 }
 
-func newCore(cfg *config.Config, auth plugin.Authenticator, sink plugin.AuditSink, v *vaults) *core.Service {
+func newCore(cfg *config.Config, paths config.Paths, auth plugin.Authenticator, sink plugin.AuditSink, v *vaults) *core.Service {
 	var instances []*core.Instance
 	for _, ic := range cfg.Instances {
 		var vaults []*static.Provider
@@ -120,12 +121,16 @@ func newCore(cfg *config.Config, auth plugin.Authenticator, sink plugin.AuditSin
 			Name: ic.Name, Realm: ic.Realm, Vaults: ic.Vaults(),
 			Secrets: static.NewVaults(vaults...),
 			Exposes: ic.Exposes,
+			Policy:  func(name string) policy.Policy { return cfg.SecretPolicy(ic, name) },
 		})
 	}
 	return core.New(core.Options{
 		Authenticator: auth, Audit: sink, Keys: v.keys,
 		PromptTimeout: cfg.Approval.PromptTimeout, MaxQueue: cfg.Approval.MaxQueue,
 		ShowClient: cfg.Approval.PromptShowClient, SkipAncestors: cfg.Approval.SkipAncestors,
+		// The service and the host CLI share it, so foca shows one prompt
+		// at a time across processes. The CLI may create the directory.
+		PromptLock: fsutil.PrivateLock(paths.RuntimeDir, "prompt.lock"),
 	}, instances, v.stores)
 }
 
@@ -154,14 +159,22 @@ func Build(cfg *config.Config, paths config.Paths, version string, log *slog.Log
 	if err != nil {
 		return nil, err
 	}
+	events, err := platformEvents(cfg)
+	if err != nil {
+		return nil, err
+	}
+	if events == nil {
+		log.Warn("platform_events is none: grants can't be wiped on sleep or lock, so every access asks")
+	}
 	sink, err := openAudit(cfg, paths)
 	if err != nil {
 		return nil, err
 	}
-	svc := newCore(cfg, auth, sink, v)
+	svc := newCore(cfg, paths, auth, sink, v)
 	srv := server.New(server.Options{
 		Paths: paths, Instances: cfg.Instances, OpaquePeers: cfg.OpaquePeers,
 		Core: svc, Peers: peers, Version: version, Log: log,
+		Events:         events,
 		MaxConnections: cfg.Limits.MaxConnections, IdleTimeout: cfg.Limits.IdleTimeout,
 	})
 	return &Built{Server: srv, Core: svc, Audit: sink, Stores: v.stores}, nil
@@ -196,5 +209,5 @@ func BuildHost(cfg *config.Config, paths config.Paths, log *slog.Logger) (*Host,
 	if err != nil {
 		return nil, err
 	}
-	return &Host{Core: newCore(cfg, auth, sink, v), Audit: sink, Vaults: v.files, Protector: v.protector}, nil
+	return &Host{Core: newCore(cfg, paths, auth, sink, v), Audit: sink, Vaults: v.files, Protector: v.protector}, nil
 }

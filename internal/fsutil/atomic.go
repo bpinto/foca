@@ -1,11 +1,13 @@
 package fsutil
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -107,4 +109,48 @@ func Lock(path string) (unlock func() error, err error) {
 		unix.Flock(int(f.Fd()), unix.LOCK_UN)
 		return f.Close()
 	}, nil
+}
+
+// PrivateLock returns a function that takes the lock file name in dir,
+// creating dir as a private directory first, and waits for it until ctx
+// ends.
+func PrivateLock(dir, name string) func(context.Context) (release func(), err error) {
+	return func(ctx context.Context) (func(), error) {
+		if err := EnsurePrivateDir(dir); err != nil {
+			return nil, err
+		}
+		unlock, err := LockContext(ctx, filepath.Join(dir, name), 50*time.Millisecond)
+		if err != nil {
+			return nil, err
+		}
+		return func() { unlock() }, nil
+	}
+}
+
+// LockContext is Lock that gives up when ctx ends. It tries every poll
+// rather than blocking in flock, which can't be interrupted.
+func LockContext(ctx context.Context, path string, poll time.Duration) (unlock func() error, err error) {
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	for {
+		err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB)
+		if err == nil {
+			return func() error {
+				unix.Flock(int(f.Fd()), unix.LOCK_UN)
+				return f.Close()
+			}, nil
+		}
+		if !errors.Is(err, unix.EWOULDBLOCK) {
+			f.Close()
+			return nil, fmt.Errorf("lock %s: %w", path, err)
+		}
+		select {
+		case <-ctx.Done():
+			f.Close()
+			return nil, ctx.Err()
+		case <-time.After(poll):
+		}
+	}
 }

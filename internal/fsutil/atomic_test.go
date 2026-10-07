@@ -1,6 +1,7 @@
 package fsutil
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -95,5 +96,37 @@ func TestLockIsExclusive(t *testing.T) {
 	case <-got:
 	case <-time.After(2 * time.Second):
 		t.Fatal("second lock never acquired")
+	}
+}
+
+// LockContext waits for a held lock, and gives up when its context ends.
+func TestLockContextWaitsAndGivesUp(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "prompt.lock")
+	unlock, err := LockContext(context.Background(), path, 10*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := LockContext(ctx, path, 10*time.Millisecond); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("lock taken while held: %v", err)
+	}
+	got := make(chan error, 1)
+	go func() {
+		u, err := LockContext(context.Background(), path, 10*time.Millisecond)
+		if err == nil {
+			u()
+		}
+		got <- err
+	}()
+	time.Sleep(30 * time.Millisecond)
+	unlock()
+	select {
+	case err := <-got:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("lock never taken after release")
 	}
 }

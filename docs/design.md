@@ -386,13 +386,30 @@ type PlatformEvents interface {
     Run(ctx, out chan<- PlatformEvent) error   // blocks; returns on ctx cancel or failure
 }
 type PlatformEvent struct{ Kind EventKind; At time.Time; Source string }
-// EventKind: Sleep, ScreenLock, SessionEnd, (ScreenUnlock and Wake for audit only)
+// EventKind: Sleep, ScreenLock, SessionEnd (each wipes),
+//            Ready (the source is subscribed; reuse may apply from now on)
 ```
 
-- `logind` (Linux; D-Bus `PrepareForSleep`, session `Lock` / `LockedHint`), `darwin` (helper
-  streaming JSON lines), `none`, and `fake`.
-- If the source fails or stops, the core **wipes and disables reuse** until it is healthy again
-  (D13).
+- `logind` (Linux; D-Bus `PrepareForSleep`, session `Lock` / `LockedHint`, and
+  `SessionRemoved` for the service user's own sessions), `darwin` (helper streaming JSON lines), `none`, and `fake` (test builds only). `auto` is `logind` on Linux and `none`
+  elsewhere until the darwin source exists.
+- `logind` matches only signals sent by `org.freedesktop.login1`, so another process on the bus
+  can't fake an event. It reads the name's unique owner once, after subscribing to
+  `NameOwnerChanged` for it, and any change of owner (logind restarting or going away) ends
+  the source with an error: the core wipes, and the source starts again with the new owner.
+  It dials the system bus at `/run/dbus/system_bus_socket` only, never at
+  `DBUS_SYSTEM_BUS_ADDRESS`, and refuses it unless `SO_PEERCRED` says root opened it: the
+  name's owner is only as trustworthy as the bus daemon.
+  `logind` takes a `delay` sleep inhibitor and releases it only once the core
+  has wiped the grants and recorded the lock, or after 4 s, so suspend waits for the wipe; if
+  polkit refuses one, the sleep signal still arrives and the watchdog (§9.5) is the backstop.
+  It holds at most one: a wake takes a new one and closes any still held.
+- Waking and unlocking are not reported: they clear nothing and restore nothing, and the next
+  access after a lock always asks. A source only uses wake internally, e.g. logind takes its
+  delay inhibitor again for the next suspend.
+- Reuse starts only after the source sends `Ready`. If the source fails or stops, the core
+  **wipes and disables reuse** until it is ready again (D13), and restarts it with backoff
+  (1 s doubling to 30 s).
 
 ### 4.6 Peer identifier: "who connected"
 
@@ -584,8 +601,8 @@ it (for example, `run` reporting the target command).
 | `secret.read` `{names:[…]}` | **yes** | batch: one prompt lists every name (D15) |
 | `action.list` | no | names, descriptions, parameter schemas |
 | `action.run` `{name, params}` | **yes** | runs one host-declared action (§11) |
-| `grants.status` | no | caller's live reuse grants (none by default) |
-| `grants.drop` | no | drop caller's grants; tightening is always allowed |
+| `grants.status` | no | caller's live reuse grants (none by default): the ones a request from this caller would reuse; not audited, since it changes nothing and returns no secret material; `foca grants` |
+| `grants.drop` `{names?}` | no | drop caller's grants, all or by name; tightening is always allowed; audited as `grants.drop`; `foca grants --drop` |
 
 Nothing on the socket changes state on the host. Management method names sent to it, such
 as `secret.add`, `vault.init` or `server.shutdown`, return `-32010 forbidden_on_socket` and
@@ -939,13 +956,17 @@ continues.
 `approval.denied` · `approval.reused` · `approval.timeout` · `secret.list` · `secret.read` ·
 `action.list` · `action.run` · `secret.add` · `secret.update` · `secret.remove` · `vault.init`
 · `vault.reset` (reserved for `reset`, not built) · `grants.drop` · `lock` (with `reason`: `sleep`, `screen-lock`,
-`session-end`, `shutdown`, `manual`, `expired`, `events-unhealthy`) · `request.rejected`.
+`session-end`, `shutdown`, `reload`, `manual`, `expired`, `events-unhealthy`, and `count`, the
+grants dropped) · `request.rejected`.
 
 `request.rejected` covers every request the socket refuses before it reaches the pipeline,
 with `reason` set to `forbidden_on_socket`, `parse_error`, `invalid_request` (including
 notifications), `method_not_found`, `invalid_params`, `protocol_unsupported`,
-`message_too_large`, `busy`, `prompt_too_long`, or a connection-level reason. The method name a
-client sent is kept to method-name characters, at most 64 bytes. Bursts are coalesced (§9.6).
+`message_too_large`, `busy`, `rate_limited`, `prompt_too_long`, `denial_backoff`,
+`prompt_cooldown`, or a connection-level reason (`too_many_connections`,
+`too_many_pipelined`, `connection_closed` for requests a client left queued when it hung up,
+and the identification refusals of §2.1). The method name a client sent is kept to
+method-name characters, at most 64 bytes. Bursts are coalesced (§9.6).
 
 `outcome` is `ok`, `denied`, `error`, `not_found` or `rejected`.
 
@@ -1063,6 +1084,11 @@ meet(Reuse a, Reuse b)         = Reuse{min(a.window,b.window), narrower(a.scope,
 effective = meet(level1, level2, level3) ; if Unset → EveryTime ; then meet(…, code floor)
 ```
 
+A `Reuse` level may leave out `scope`: it then has no opinion on scope, folds like the widest
+one, and the floor caps it at `peer-session`. `window` is required with `reuse`. After the
+floor, a window under the minimum or a `request` scope (a grant nothing could reuse) becomes
+`EveryTime`; the evaluator only ever narrows.
+
 `meet` is commutative, associative and idempotent, and `meet(x, y) ⊑ x` holds for every `y`.
 So **adding a level, or any setting at any level, can never loosen the result**. A
 `secrets.X.policy = every-time` can't be undone by an instance-wide 30-minute window, because
@@ -1081,24 +1107,41 @@ What follows:
 
 - `MaxReuseWindow = 8h`, `MinReuseWindow = 1s`. Config values outside this range are
   **rejected** at load time. The evaluator clamps as well, as defence in depth.
-- `approval = "every-time"` with a `window` set is a config error.
+- `approval = "every-time"` with a `window` or `scope` set is a config error, and so is
+  `approval = "reuse"` without a `window`.
+- `[authenticators.<name>.policy]` names a known authenticator. Only the configured one
+  applies; the others are allowed so a config can switch authenticators and keep them.
 
 ### 9.5 Grants and wipe rules
 
 - A successful fresh approval under a `Reuse` policy creates a grant:
   `{approval_id, resource, scope_key, expires_at = now + window}`. Grants are per resource, so
-  approving `github-pat` doesn't cover `npm-token`.
+  approving `github-pat` doesn't cover `npm-token`. Host CLI operations never create or reuse
+  grants.
+- **Scope keys.** `connection` is keyed on the connection, `peer-session` on the peer's durable
+  session (§4.6), and both on the instance. If the caller lacks a component, for example a peer
+  whose pid isn't pinned or has no session, that read is `EveryTime`: no grant is made or
+  reused, and the prompt promises no reuse.
+- **A batch is one approval**, so its uncovered names share one policy: the meet of theirs. The
+  `{reach}` sentence is then true for every name on the prompt.
 - **Expiry uses wall-clock time, not Go's monotonic clock (D11).** The monotonic clock stops
   during system sleep on both macOS and Linux, so a window measured on it would stretch across
-  sleep. A watchdog also compares wall and monotonic elapsed time every few seconds. A jump
-  larger than 30 s is treated as a `sleep` event, as a backstop for missed notifications.
+  sleep. A watchdog also compares wall and monotonic elapsed time every 5 s. A jump
+  larger than 30 s, either way, is treated as a `sleep` event, as a backstop for missed
+  notifications. The same tick drops expired grants and audits `lock` with `reason: expired`.
+  A request that could reuse a grant, and `grants.status`, run the same check first, so a
+  grant is never reused in the seconds between a missed sleep and the next tick.
 - **Unconditional wipe**, whatever the config, on `Sleep`, `ScreenLock`, `SessionEnd`, service
   shutdown, `foca lock` (`SIGUSR1`), the platform-events source becoming unhealthy, or a
   config reload.
-  A wipe drops all grants, zeroes the cached DEK and any plaintext, and audits `lock` with its
-  reason.
-- **DEK lifetime.** The DEK is held in memory only while a request is in flight or at least one
-  grant is live. Otherwise it is zeroed and unsealed again on demand. With the Keychain
+  A wipe drops all grants, denial backoff and strikes (§9.6), and audits `lock` with its reason
+  and the number of grants dropped. An approval whose prompt was open during a wipe serves its
+  request but creates no grant. A wipe that comes while an approval is being recorded waits
+  for its grant, then drops and counts it, so `approval.granted` never claims a grant that
+  didn't exist.
+- **DEK lifetime.** The DEK is unsealed for each request and zeroed when the request ends; it
+  is never cached between requests, so a wipe has no key to zero. (Caching it while a grant
+  is live would be allowed; it would only save a protector call.) With the Keychain
   protector, unsealing needs no prompt. The user's approval is the Touch ID step itself.
 - **If platform events are unavailable** (`none`, or the source is unhealthy), reuse is
   disabled: the effective policy becomes `EveryTime`. Reuse is only safe if we can wipe on
@@ -1119,17 +1162,44 @@ misbehaving VM from flooding the screen with prompts.
   coalesced `request.rejected` with `reason: cancelled`. Nothing is decrypted for a client that has gone, even if approval
   arrived. Clients must not half-close a connection while they wait for an answer.
 
-**Denials are never cached as "no".** Instead, repeated denials for the same
-`(scope key, resource)` back off: about 2 s, then 8 s, then 30 s before the next prompt. The
-prompt then shows "(denied N times)". A wipe resets the backoff.
+**Denials are never cached as "no".** Instead, repeated denials of the same resource for the
+same caller (its pinned peer session, else its connection) back off: 2 s, then 8 s, then 30 s
+before the next prompt. A request inside that time is refused with `denied` and audited as a
+coalesced `request.rejected` (`reason: denial_backoff`); it doesn't wait. The next prompt
+shows "(denied once)" or "(denied N times)". An approval resets the count, a denial is
+forgotten after 10 minutes, and a wipe resets everything. The prompt slot is held until a
+decision is recorded, so a request queued behind a denial meets the backoff, and one queued
+behind an approval finds the new grant.
 
-**Rejected requests are coalesced in the audit log.** Bursts of `request.rejected` events
-(`busy`, `forbidden_on_socket`, refused connections and so on) are folded per **instance and
-reason**, not per peer, because a caller can fork new processes but can't change its realm.
-The first rejection in a 10 s window is written at once. Later ones are counted, and the count
-is written as one event (`count`, plus `params.coalesced_after_seq`) when the next window
-starts or the service stops. A flood therefore can't bury real events or fill the disk.
-Access and approval events are **never** coalesced.
+**Unapproved prompts cool the instance down.** Denial backoff is per resource, so a realm
+could still keep prompts coming by asking for each of its secrets in turn, and a prompt left to
+time out would cost it nothing. So every prompt an instance opens that isn't approved (denied,
+timed out, or cancelled by its client while on screen) is a strike against the instance as a
+whole, which a realm can't change by forking or reconnecting. After three strikes, the
+instance opens no prompt until 30 s after the last one; a fourth makes that 2 min, and every
+later one 5 min. A request in that time is refused with `denied` and audited as a coalesced
+`request.rejected` (`reason: prompt_cooldown`); it doesn't wait. The next prompt shows
+"(N unanswered)" for the timeouts and cancels among the strikes. An approval or a wipe clears
+them, and a strike is forgotten after 10 minutes.
+
+**Nothing takes a closing prompt's place.** After a prompt times out or is cancelled, its slot
+stays held for 1.5 s before the next queued prompt may open. A realm can't cancel one prompt
+just as the user reaches for the sensor and have another appear under their finger. The
+service and the host CLI also share a lock, `prompt.lock` in the runtime directory, held while
+a prompt is on screen and through that pause. foca never shows two prompts at once, so a
+realm's prompt can't open alongside one the user expects from `foca add`. The lock drops when
+a process exits, so a host command whose prompt timed out keeps it through the pause before
+exiting. Ctrl-C on such a prompt cancels it the same way, then the command waits out the pause;
+a second Ctrl-C ends it at once.
+
+**Unapproved events are coalesced in the audit log.** These are the events a realm can cause
+without any approval: `request.rejected` (`busy`, `forbidden_on_socket`, refused connections
+and so on), `secret.read` with outcome `not_found`, and `secret.list`. Bursts are folded per
+**instance, type and reason**, not per peer, because a caller can fork new processes but can't
+change its realm. The first event in a 10 s window is written at once and in full, with the
+name it asked for. Later ones are counted, and the count is written as one event of the same
+type, with `coalesced` set (§8.1), when the next window starts or the service stops. A flood therefore can't bury real events or fill the disk. Events that involve an
+approval are **never** coalesced.
 
 - **Reasons a realm must not tell apart share a window.** An unknown name and an unexposed
   one (`unknown`, `not_exposed`) share one, `not_found`, as do an action's unknown and
@@ -1333,8 +1403,10 @@ Secret values; the DEK; the ability to run host actions; config integrity; audit
   history.
 - **Unattended machine.** Sleep, screen lock and session end wipe grants and the DEK. A
   wall-clock watchdog backs this up.
-- **Prompt floods and confusing prompts.** One prompt at a time, a bounded queue, trusted
-  fields first, and unverified fields labelled and sanitised.
+- **Prompt floods and confusing prompts.** One prompt at a time, across the service and the
+  host CLI, a bounded queue, a cooldown for a realm whose prompts go unapproved, a pause
+  before a prompt can take a closing one's place, trusted fields first, and unverified fields
+  labelled and sanitised.
 - **Other local users.** Socket directory 0700, socket 0600, and a uid check on every
   connection. Private directories (runtime, data) must sit below directories no other user
   can write, unless sticky like `/tmp`, so they can't be swapped for an older copy.
@@ -1537,11 +1609,13 @@ internal/protocol/        wire contract shared by both sides: JSON-RPC framing, 
 internal/client/          protocol client (CLI, tests, later the relay); must not import service-side code
 internal/cli/             CLI commands
 internal/server/          listeners, per-connection identification, method dispatch
-internal/server/core/     request → approval → audit pipeline, prompt text, prompt queue
+internal/server/core/     request → approval → audit pipeline, prompt text, prompt queue,
+                          grants, denial backoff, wipe controller and watchdog
 internal/server/wiring/   config → plugins; test-only plugins gated by the foca_testing tag
 internal/plugin/          plugin interfaces
+internal/policy/          approval-policy lattice: meet, effective policy, the code floor, reach wording
 internal/plugins/…        authn/fake, store/memory, store/vaultfile, keyprot/file, provider/static,
-                          peer (linux); later darwin, keyprot/*, provider/command, events/*
+                          peer (linux), events/logind; later darwin, keyprot/*, provider/command
 internal/audit/           event types (v1) + sinks: memory, jsonl
 internal/config/          TOML load and validation, paths
 internal/identity/        host-verified, guest-verified and reported identity, one distinct type each
@@ -1550,7 +1624,7 @@ internal/svcctl/          serve.pid and verified signalling for reload / stop
 internal/ids/             sortable ids
 internal/format/          output formatters: raw, json, env
 helpers/darwin/           Swift package: foca-darwin
-flake.nix                 dev shell (go, gopls, socat; gcc only for `go test -race`)
+flake.nix                 dev shell (go, gopls, socat, dbus for the logind tests; gcc only for `go test -race`)
 ```
 
 A test, `internal/client/boundary_test.go`, fails if client-side code ever imports
@@ -1591,8 +1665,8 @@ noted; packages are named as in `go test` output (`main` is `cmd/foca`, whose te
 | uid mismatch, wrong kind of peer, and every other refusal audited | `server.TestUIDMismatchIsRefusedAndAudited`, `server.TestNonProxyPeerRefusedOnOpaqueRealm`, `server.TestProxyPeerRefusedOnDirectRealm`, `server.TestEveryRefusedRequestIsAudited` |
 | verified, guest-verified and reported identity kept apart | `audit.TestVerifiedAndReportedStaySeparateOnTheWire`, `core.TestIdentityLevelsHaveDistinctTypes` |
 | prompts: claims never stated as fact, unsealed names marked, no name elided | `core.TestPromptWording`, `core.TestPromptNeverElidesCredentials`, `core.TestOversizedBatchRefusedBeforePrompting`, `peer.TestMountsCantLendASealedName`, `peer.TestLoadedCodeMustBeSealedToo` |
-| a realm can't exhaust the service or flood the log | `server.TestConnectionCapPerInstance` |
-| config rejections and file trust | `config.TestRejections`, `config.TestLoadChecksFileTrust` |
+| a realm can't exhaust the service or flood the log | `server.TestConnectionCapPerInstance`, `core.TestReadsAndListsAreRateLimited`, `core.TestUnapprovedEventsAreCoalesced` |
+| config rejections and file trust | `config.TestRejections`, `config.TestPolicyRejections`, `config.TestLoadChecksFileTrust` |
 | test-only plugins unreachable in a production build | `wiring.TestFakeAuthenticatorRefusedInProductionBuild`, `cli.TestServiceDoesNotImportCLIUI` |
 | **Vaults, exposure and the host CLI** | |
 | a vault shared without explicit `expose` is a config error | `config.TestImplicitPrivateVaultCollisionCountsAsSharing` |
@@ -1606,12 +1680,12 @@ noted; packages are named as in `go test` output (`main` is `cmd/foca`, whose te
 | key holders hide their memory | `main.TestBinaryKeyHoldersHideTheirMemory` |
 | `--only` never splits a vault; one process per instance | — |
 | **Policy, grants and wipes** | |
-| lattice laws; no setting loosens; the 8 h cap | — |
-| a grant key that differs in any component never reuses | — |
-| sleep-jump watchdog; a missed sleep caught before reuse | — |
-| wipe on every event kind; a wipe during a prompt makes no grant | — |
-| unhealthy or no events → every-time; only logind's signals count | — |
-| cooldown, the pause after a closing prompt, one prompt across processes | — |
+| lattice laws; no setting loosens; the 8 h cap | `policy.TestLatticeLaws`, `policy.TestEffectiveNeverLoosens`, `policy.TestLooseningAttempts`, `core.TestEightHourCap` |
+| a grant key that differs in any component never reuses | `core.TestGrantKeyMismatchNeverReuses` |
+| sleep-jump watchdog; a missed sleep caught before reuse | `core.TestSleepJumpWatchdog` |
+| wipe on every event kind; a wipe during a prompt makes no grant | `core.TestWipeOnEveryEventKind`, `logind.TestLogindReportsEveryEventKind`, `core.TestWipeDuringPromptCreatesNoGrant` |
+| unhealthy or no events → every-time; only logind's signals count | `core.TestUnhealthyEventsMeanEveryTime`, `core.TestNoEventsSourceMeansEveryTime`, `logind.TestLogindIgnoresSignalsFromOthers`, `sysbus.TestSystemBusMustBeServedByRoot` |
+| cooldown, the pause after a closing prompt, one prompt across processes | `core.TestCooldownAfterThreeUnapprovedPrompts`, `core.TestPromptPauseHoldsTheSlot`, `core.TestPromptLockIsSharedAcrossServices` |
 | **Actions** | |
 | injection attempts and unknown params refused before any prompt | — |
 | timeout, cancel and hang-up kill the group | — |
@@ -1644,8 +1718,6 @@ noted; packages are named as in `go test` output (`main` is `cmd/foca`, whose te
 
 **Not built**
 
-- Reuse: policy levels, grants, denial backoff and wipes, the logind events source, `lock`
-  and `policy explain`. Every access asks.
 - The `foca-darwin` helper (Touch ID, the Keychain protector, sleep and lock events) and
   the macOS peer identifier: on macOS, `serve` has no authenticator and identifies no peer.
 - Actions: the command provider, `action.list` and `action.run`, `foca exec` and
@@ -1658,7 +1730,7 @@ noted; packages are named as in `go test` output (`main` is `cmd/foca`, whose te
   error until then.
 - A command that opens a vault with its recovery passphrase: `init --recovery` writes the
   slot, but nothing reads it yet.
-- On macOS, `reload` and `stop` match the service by its command name only, without
+- On macOS, `reload`, `lock` and `stop` match the service by its command name only, without
   pinning its pid.
 - `foca reset` and its `vault.reset` event; `[approval] list_requires_approval` (D16); a
   custom `--format`; the `secure-enclave`, `libsecret` and `keyring` key protectors.

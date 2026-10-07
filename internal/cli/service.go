@@ -10,6 +10,7 @@ import (
 
 	"github.com/bpinto/foca/internal/audit"
 	"github.com/bpinto/foca/internal/config"
+	"github.com/bpinto/foca/internal/server/core"
 	"github.com/bpinto/foca/internal/server/wiring"
 	"github.com/bpinto/foca/internal/svcctl"
 )
@@ -18,7 +19,8 @@ import (
 
 type ServeCmd struct{}
 
-// Run serves until SIGINT or SIGTERM. SIGHUP reloads the config: a config
+// Run serves until SIGINT or SIGTERM. SIGUSR1 (foca lock) drops every grant.
+// SIGHUP reloads the config: a config
 // that fails to load or wire keeps the old one running. A good one replaces
 // the running service, which closes open connections and cancels pending
 // approvals; clients reconnect.
@@ -52,6 +54,13 @@ func (ServeCmd) Run(g *Globals, e *Env) error {
 	for {
 		select {
 		case s := <-sig:
+			if s == syscall.SIGUSR1 {
+				// foca lock: wipe now. Tightening, so no approval.
+				if err := b.Core.Wipe(background(), core.WipeManual, nil); err != nil {
+					log.Error("audit failed for lock", "err", err)
+				}
+				continue
+			}
 			if s != syscall.SIGHUP {
 				b.Server.Shutdown("signal " + s.String())
 				b.Audit.Close()
