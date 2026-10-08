@@ -97,8 +97,22 @@ func (p Paths) VaultFile(vault string) string {
 // KeysDir holds the file key protector's keys (test builds only).
 func (p Paths) KeysDir() string { return filepath.Join(p.DataDir, "keys") }
 
-// PIDFile is where serve records its pid so the host CLI can signal it.
-func (p Paths) PIDFile() string { return filepath.Join(p.RuntimeDir, "serve.pid") }
+// PIDFile is where the service serving instance records its pid, so the host
+// CLI can signal it. One process may serve several instances; each has one.
+func (p Paths) PIDFile(instance string) string {
+	return filepath.Join(p.InstanceDir(instance), "serve.pid")
+}
+
+// LockFile is the lock a service holds for every instance it serves, so no
+// other process can serve it at the same time.
+func (p Paths) LockFile(instance string) string {
+	return filepath.Join(p.InstanceDir(instance), "serve.lock")
+}
+
+// PIDFiles finds the pid files of every instance in the runtime directory.
+func (p Paths) PIDFiles() ([]string, error) {
+	return filepath.Glob(filepath.Join(p.RuntimeDir, "*", "serve.pid"))
+}
 
 // MaxSocketPath is the longest usable Unix socket path on this OS (sun_path
 // minus the terminating NUL).

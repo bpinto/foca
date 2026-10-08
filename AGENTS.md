@@ -187,6 +187,8 @@ internal/identity/        verified, guest and reported identity types
 internal/fsutil/          trusted-file checks, private dirs, atomic writes, locks
 internal/svcctl/          serve.pid, the instance lock, and verified signalling (reload, lock, stop)
 helpers/darwin/           foca-darwin (Swift): Touch ID, Keychain, sleep and lock events
+nix/                      packages (Linux from source, macOS the release archive), NixOS modules (host,
+                          guest), home-manager module (systemd or launchd), flake checks
 ```
 
 ## Build and test
@@ -200,13 +202,16 @@ go test -tags foca_testing ./...                        # + CLI end-to-end and b
 CGO_ENABLED=1 go test -race ./...                       # race detector (gcc from the shell)
 GOOS=darwin GOARCH=arm64 go vet ./...                   # darwin code compiles and vets
 gofmt -l internal cmd                                   # must print nothing
+nix flake check                                         # the package and the Nix modules (nix/)
 ```
 
 On a Mac: `scripts/build-darwin.sh`, then `FOCA_HELPER=$PWD/bin/foca-darwin go test
 ./internal/plugin/helper/...` runs the helper conformance suite; add
 `FOCA_HELPER_INTERACTIVE=1` and `-run Interactive` for the Touch ID and screen-lock tests,
 which need a person at the Mac. CI runs the Linux
-matrix and the macOS suite on every push (`.github/workflows/test.yml`).
+matrix, `nix flake check` and the macOS suite on every push (`.github/workflows/test.yml`).
+After changing `go.mod`, update `vendorHash` in `nix/package.nix`: set it to `lib.fakeHash`,
+run `nix build`, and copy the hash it prints.
 
 ## Releases
 
@@ -224,6 +229,12 @@ Assets: `foca-darwin-arm64.tar.gz` (`foca` and `foca-darwin`), `foca-linux-amd64
 macOS: without the build script it has no helper pin and runs no helper. The
 `MACOS_CERT_P12`, `MACOS_CERT_PASSWORD` and `MACOS_SIGN_IDENTITY` secrets sign the helper
 with a Developer ID; without them it is signed ad hoc.
+
+The Nix package for macOS installs a published release archive, pinned in
+`nix/darwin-release.nix`. After publishing a `vX.Y.Z` release, the workflow pins it there with
+a commit on `main` (through the contents API; nothing from the repository runs with write
+access). That commit starts no runs of its own, so `tip` follows the newest `main` commit that
+had one. Pre-releases and `tip` are never pinned.
 
 ## Conventions
 

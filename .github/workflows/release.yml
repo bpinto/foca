@@ -4,7 +4,9 @@ name: release
 #
 # - main: the rolling "tip" pre-release, rebuilt for every commit and
 #   versioned <next patch>-tip.<commit date, UTC, YYYYMMDD>+<sha>;
-# - a v* tag: a stable release of that version.
+# - a v* tag: a stable release of that version. For vX.Y.Z (not a
+#   pre-release), its macOS archive is then pinned in nix/darwin-release.nix
+#   on main by a commit of this workflow's.
 #
 # Pull requests never publish anything.
 #
@@ -171,11 +173,19 @@ jobs:
         run: |
           set -eu
           # Test runs can finish out of order; never move tip back to an
-          # older commit.
-          head=$(gh api "repos/$GH_REPO/commits/main" --jq .sha)
-          if [ "$head" != "$SHA" ]; then
-            echo "main is now at $head; leaving tip to that commit's run"
+          # older commit. The commit needn't be main's head: commits this
+          # workflow pushes (the Nix pin below) start no runs of their own.
+          on_main=$(gh api "repos/$GH_REPO/compare/$SHA...main" --jq .status)
+          if [ "$on_main" != ahead ] && [ "$on_main" != identical ]; then
+            echo "$SHA is no longer on main; not publishing it"
             exit 0
+          fi
+          if cur=$(gh api "repos/$GH_REPO/git/ref/tags/tip" --jq .object.sha 2> /dev/null); then
+            newer=$(gh api "repos/$GH_REPO/compare/$cur...$SHA" --jq .status)
+            if [ "$newer" != ahead ] && [ "$newer" != identical ]; then
+              echo "tip is at $cur, newer than $SHA; leaving it there"
+              exit 0
+            fi
           fi
           if gh api "repos/$GH_REPO/git/refs/tags/tip" > /dev/null 2>&1; then
             gh api -X PATCH "repos/$GH_REPO/git/refs/tags/tip" -f sha="$SHA" -F force=true > /dev/null
@@ -194,3 +204,64 @@ jobs:
       - name: release
         if: env.KIND == 'release'
         run: gh release create "$TAG" dist/* --verify-tag --title "$TAG" --generate-notes
+
+  # After a stable release, pins its macOS archive in nix/darwin-release.nix
+  # on main, so the flake's macOS package installs it. tip is never pinned:
+  # its assets change with every commit. Nothing from the repository runs
+  # here; the commit is made through the contents API.
+  pin-nix:
+    needs: [plan, publish]
+    if: needs.plan.outputs.kind == 'release'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ needs.plan.outputs.tag }}
+      VERSION: ${{ needs.plan.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: foca-darwin-arm64
+          path: dist
+      - name: pin
+        run: |
+          set -euo pipefail
+          if ! echo "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "$TAG is a pre-release; not pinned"
+            exit 0
+          fi
+          # The hash of what users download: the published asset must be the
+          # archive this run built.
+          gh release download "$TAG" --pattern foca-darwin-arm64.tar.gz --dir "$RUNNER_TEMP/published"
+          cmp dist/foca-darwin-arm64.tar.gz "$RUNNER_TEMP/published/foca-darwin-arm64.tar.gz"
+          hash="sha256-$(openssl dgst -sha256 -binary dist/foca-darwin-arm64.tar.gz | base64 -w0)"
+
+          path=nix/darwin-release.nix
+          gh api "repos/$GH_REPO/contents/$path?ref=main" > "$RUNNER_TEMP/file.json"
+          blob=$(jq -r .sha "$RUNNER_TEMP/file.json")
+          jq -r .content "$RUNNER_TEMP/file.json" | base64 -d > "$RUNNER_TEMP/old.nix"
+          pinned=$(sed -nE 's/^  version = "([0-9.]+)";$/\1/p' "$RUNNER_TEMP/old.nix")
+          # Releases can finish out of order (a fix to an older line); never
+          # replace a newer pin with an older one.
+          if [ -n "$pinned" ] && [ "$(printf '%s\n%s\n' "$pinned" "$VERSION" | sort -V | tail -n 1)" != "$VERSION" ]; then
+            echo "main pins $pinned, newer than $VERSION; leaving it"
+            exit 0
+          fi
+          sed -E -e "s|^  version = .*;$|  version = \"$VERSION\";|" \
+                 -e "s|^  hash = .*;$|  hash = \"$hash\";|" "$RUNNER_TEMP/old.nix" > "$RUNNER_TEMP/new.nix"
+          # The file must still have the shape this expects.
+          grep -qx "  version = \"$VERSION\";" "$RUNNER_TEMP/new.nix"
+          grep -qx "  hash = \"$hash\";" "$RUNNER_TEMP/new.nix"
+          if cmp -s "$RUNNER_TEMP/old.nix" "$RUNNER_TEMP/new.nix"; then
+            echo "already pinned to $VERSION"
+            exit 0
+          fi
+          # sha makes GitHub refuse the update if the file changed since it
+          # was read, rather than overwrite that change.
+          gh api -X PUT "repos/$GH_REPO/contents/$path" \
+            -f branch=main -f sha="$blob" \
+            -f message="chore: pin the macOS Nix package to $TAG" \
+            -f content="$(base64 -w0 "$RUNNER_TEMP/new.nix")" > /dev/null
+          echo "pinned $path to $VERSION ($hash)"

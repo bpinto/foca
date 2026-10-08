@@ -81,6 +81,9 @@ func TestSignalReachesVerifiedService(t *testing.T) {
 	if fi.Mode().Perm() != 0o600 {
 		t.Fatalf("pid file mode %o", fi.Mode().Perm())
 	}
+	if pid, err := PID(pidfile); err != nil || pid != cmd.Process.Pid {
+		t.Fatalf("pid: %d %v", pid, err)
+	}
 	// A second service can't take over the file while the first is alive.
 	if _, err := WritePIDFile(pidfile); err == nil || !strings.Contains(err.Error(), "already running") {
 		t.Fatalf("second service: %v", err)
@@ -97,6 +100,9 @@ func TestSignalReachesVerifiedService(t *testing.T) {
 	}
 	if _, err := Signal(pidfile, syscall.SIGHUP); !errors.Is(err, ErrNotRunning) {
 		t.Fatalf("after exit: %v", err)
+	}
+	if _, err := PID(pidfile); !errors.Is(err, ErrNotRunning) {
+		t.Fatalf("pid after exit: %v", err)
 	}
 }
 

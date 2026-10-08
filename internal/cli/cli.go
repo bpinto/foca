@@ -111,6 +111,7 @@ type CLI struct {
 	Lock         LockCmd         `cmd:"" help:"Drop every reuse grant now, so the next access asks again (host)."`
 	Stop         StopCmd         `cmd:"" help:"Stop the running service (host)."`
 	Policy       PolicyCmd       `cmd:"" help:"Explain the approval policy the config sets (host)."`
+	Config       ConfigCmd       `cmd:"" help:"Check a config file (host)."`
 	Events       EventsCmd       `cmd:"" help:"Query or follow the audit log (host)."`
 	Grants       GrantsCmd       `cmd:"" help:"List or drop your reuse grants."`
 	PolkitPolicy PolkitPolicyCmd `cmd:"" name:"polkit-policy" help:"Print the polkit action the polkit authenticator needs (host, Linux)."`

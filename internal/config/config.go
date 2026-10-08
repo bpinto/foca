@@ -844,3 +844,36 @@ func (c *Config) Instance(name string) (Instance, bool) {
 	}
 	return Instance{}, false
 }
+
+// Only narrows the config to the named instances, for one process of several
+// (design §7.1, D3). Every instance reading a vault one of them reads must
+// be among them: a vault is never split across processes.
+func (c *Config) Only(names []string) (*Config, error) {
+	if len(names) == 0 {
+		return c, nil
+	}
+	keep := map[string]bool{}
+	for _, n := range names {
+		if _, ok := c.Instance(n); !ok {
+			return nil, fmt.Errorf("--only %s: no such instance in %s", n, c.Path)
+		}
+		keep[n] = true
+	}
+	out := *c
+	out.Instances = nil
+	for _, inst := range c.Instances {
+		if !keep[inst.Name] {
+			continue
+		}
+		for _, v := range inst.Vaults() {
+			for _, other := range c.Instances {
+				if _, reads := other.Expose[v]; reads && !keep[other.Name] {
+					return nil, fmt.Errorf("vault %s is read by %s and %s, so they must be served by one process: add --only %s",
+						v, inst.Name, other.Name, other.Name)
+				}
+			}
+		}
+		out.Instances = append(out.Instances, inst)
+	}
+	return &out, nil
+}

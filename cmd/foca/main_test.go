@@ -91,7 +91,7 @@ func (p *proc) serve() *exec.Cmd {
 		p.t.Fatal(err)
 	}
 	p.t.Cleanup(func() { c.Process.Kill(); c.Wait() })
-	pidfile := filepath.Join(p.base, "r", "serve.pid")
+	pidfile := filepath.Join(p.base, "r", "dev", "serve.pid")
 	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(20 * time.Millisecond) {
 		if b, err := os.ReadFile(pidfile); err == nil && strings.HasPrefix(string(b), fmt.Sprint(c.Process.Pid)+" ") {
 			return c
@@ -201,8 +201,57 @@ func TestBinarySecondServeRefused(t *testing.T) {
 	p := setup(t)
 	p.serve()
 	_, errs, err := p.run("", "serve")
-	if err == nil || !strings.Contains(errs, "in use by another running service") {
+	if err == nil || !strings.Contains(errs, "already serving this instance") {
 		t.Fatalf("second serve: %v %s", err, errs)
+	}
+}
+
+// Services started at the same moment can't both serve an instance: each
+// takes the instance's lock before touching its socket or pid file, so all
+// but one refuse, and none ends up listening on a socket another unlinked.
+func TestBinaryServesStartedTogetherRefuseAllButOne(t *testing.T) {
+	p := setup(t)
+	type result struct {
+		cmd  *exec.Cmd
+		errs *bytes.Buffer
+		done chan error
+	}
+	var rs []result
+	for i := 0; i < 4; i++ {
+		c := p.cmd("", "serve")
+		var errb bytes.Buffer
+		c.Stderr = &errb
+		if err := c.Start(); err != nil {
+			t.Fatal(err)
+		}
+		r := result{c, &errb, make(chan error, 1)}
+		go func() { r.done <- c.Wait() }()
+		t.Cleanup(func() { c.Process.Kill(); <-r.done })
+		rs = append(rs, r)
+	}
+	refused := 0
+	var running *exec.Cmd
+	for _, r := range rs {
+		select {
+		case err := <-r.done:
+			r.done <- err
+			if err == nil || !strings.Contains(r.errs.String(), "already serving this instance") {
+				t.Fatalf("a serve exited with %v: %s", err, r.errs)
+			}
+			refused++
+		case <-time.After(3 * time.Second):
+			running = r.cmd
+		}
+	}
+	if refused != 3 || running == nil {
+		t.Fatalf("%d refused", refused)
+	}
+	b, _ := os.ReadFile(filepath.Join(p.base, "r", "dev", "serve.pid"))
+	if !strings.HasPrefix(string(b), fmt.Sprint(running.Process.Pid)+" ") {
+		t.Fatalf("pid file %q, running pid %d", b, running.Process.Pid)
+	}
+	if _, errs, err := p.run("", "lock"); err != nil {
+		t.Fatalf("lock: %v %s", err, errs)
 	}
 }
 

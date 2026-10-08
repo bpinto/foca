@@ -459,3 +459,20 @@ func TestProductionBuildLinksNoTestCode(t *testing.T) {
 		}
 	}
 }
+
+// config check validates a file as serve would, and names what is wrong.
+func TestConfigCheck(t *testing.T) {
+	dir := t.TempDir()
+	good := filepath.Join(dir, "good.toml")
+	os.WriteFile(good, []byte("version = 1\n[plugins]\nauthenticator = \"fake\"\nsecret_store = \"memory\"\n[instances.dev]\n"), 0o644)
+	env, _, errb := testEnv(t, nil)
+	if code := Main([]string{"config", "check", good}, env, "test"); code != 0 || !strings.Contains(errb.String(), "is valid") {
+		t.Fatalf("good config: %d %s", code, errb)
+	}
+	bad := filepath.Join(dir, "bad.toml")
+	os.WriteFile(bad, []byte("version = 1\n[plugins]\nauthenticator = \"fake\"\n[instances.dev]\nexpose = [\"github-pat\"]\n"), 0o600)
+	env, _, errb = testEnv(t, nil)
+	if code := Main([]string{"config", "check", bad}, env, "test"); code != 1 || !strings.Contains(errb.String(), `"github-pat" must be "<vault>:*" or "<vault>:<secret>"`) {
+		t.Fatalf("bad config: %d %s", code, errb)
+	}
+}

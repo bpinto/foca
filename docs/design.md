@@ -42,7 +42,7 @@ Non-goals for now: the UI itself, syncing between machines, sharing between user
  Mac (host)                                              microVM "dev"
  ┌──────────────────────────────────────────┐            ┌──────────────────────────────┐
  │ launchd agent: foca serve                │            │                              │
- │   --instance dev                         │   SSH      │  ~/.foca.sock  ◄── CLI       │
+ │   --only dev                             │   SSH      │  ~/.foca.sock  ◄── CLI       │
  │   ├─ client.sock  (0600, dir 0700) ◄─────┼─RemoteFwd──┤  (forwarded by ssh)          │
  │   ├─ serve.pid    (host CLI signals it)  │            │  foca get / run / exec       │
  │   ├─ vault.fcv    (encrypted)            │            └──────────────────────────────┘
@@ -840,16 +840,19 @@ the host, working directly on host files:
 | `lock` (wipe now) | sends `SIGUSR1` to the service | no (tightening) |
 | `reload` (config) | checks the config, then sends `SIGHUP`; a config that fails validation keeps the old one. A good one replaces the running service: open connections close and pending approvals are cancelled | no |
 | `stop` | sends `SIGTERM`, or uses launchctl / systemctl | no |
+| `config check` | parses a config file as `serve` would, without trusting or using it (Nix checks generated configs with it) | no |
 | `events` | reads the audit log (§8.5) | no |
 
 - **The service is read-only on vaults.** It re-reads a vault when the file's identity, size
   or mtime changes, so the CLI's edits apply to the next request. A bug in the service can't
   corrupt or plant secrets.
-- **Signals go only to a verified service.** The CLI finds the service through
-  `$RUNTIME/foca/serve.pid` (0600, inside the 0700 runtime dir). Before signalling, it
-  pins the process (a pidfd on Linux, its pid version on macOS, checked again just before
-  `kill`), matches its start time, and checks that its executable is foca and that it runs
-  as the same uid.
+- **Signals go only to a verified service.** A service records its pid in
+  `<runtime>/<instance>/serve.pid` (0600, inside the 0700 instance dir) for each instance it
+  serves. `reload`, `lock` and `stop` signal every running service once, or with `-i` the one
+  serving that instance. Before signalling, the CLI pins the process (a pidfd on Linux, its
+  pid version on macOS, checked again just before `kill`), matches its start time, and
+  checks that its executable is foca (its name, on Linux, since a service hides its
+  executable) and that it runs as the same uid.
 - **Concurrent writers.** The CLI and the service both append to the audit log. Each append
   takes an exclusive `flock` on `audit.lock` and reads the last `seq` under the lock, so
   sequence numbers stay unique across processes, also across rotations (D10).
@@ -993,9 +996,14 @@ setups:
 
 - **One process for all instances.** This is the default. One prompt queue serialises
   prompts across all realms, events and wipes happen once, and there is one launchd agent.
-- **One process per instance.** Run `serve --only <instance>`, or give each process its own
-  config. This keeps memory separation between realms as defence in depth. A vault used by
-  instances in different processes is refused (each vault has exactly one writer).
+- **One process per instance, or per group.** Run `serve --only <instance>` (repeatable) for
+  each process, or give each its own config. This keeps memory separation between realms as
+  defence in depth. Instances that read a vault in common must be served by one process:
+  `--only` refuses a set that splits a vault's readers. A service holds an exclusive `flock`
+  on `<runtime>/<instance>/serve.lock` for each instance it serves, from before it touches
+  the instance's socket or pid file until it exits, so two processes can never serve one
+  instance, even when started at the same moment: the second refuses to start. The prompt
+  lock is shared, so even separate processes show one prompt at a time.
 
 **Paths.** Every path can be overridden with an env var or flag.
 
@@ -2018,10 +2026,16 @@ internal/ids/             sortable ids
 internal/format/          output formatters: raw, json, env
 helpers/darwin/           Swift package: foca-darwin
 scripts/                  build-darwin.sh (signed helper, pinned into foca), build-linux.sh
-.github/workflows/        test (every push and pull request), release (tip from main, v* tags)
+.github/workflows/        test (every push and pull request), release (tip from main, v* tags, then the
+                          macOS Nix pin on main)
+nix/                      the Linux package, the macOS package (the release archive, installed unchanged),
+                          NixOS modules (host: polkit action and TPM access; guest: ptrace hardening),
+                          the home-manager module (config, and systemd user units on Linux or launchd
+                          agents on macOS), and the flake checks that evaluate them
 flake.nix                 dev shell (go, gopls, socat; dbus for the logind and polkit tests; bubblewrap and
                           FOCA_POLKITD to run the real polkitd in tests; swtpm and FOCA_SWTPM for the
-                          TPM tests; gcc only for `go test -race`)
+                          TPM tests; gcc only for `go test -race`); the package, the modules and
+                          `nix flake check`
 ```
 
 A test, `internal/client/boundary_test.go`, fails if client-side code ever imports
@@ -2067,7 +2081,7 @@ noted; packages are named as in `go test` output (`main` is `cmd/foca`, whose te
 | test-only plugins unreachable in a production build | `wiring.TestFakeAuthenticatorRefusedInProductionBuild`, `wiring.TestFileProtectorRefusedInProductionBuild`, `cli.TestProductionBuildLinksNoTestCode`, `cli.TestServiceDoesNotImportCLIUI` |
 | **Vaults, exposure and the host CLI** | |
 | a vault shared without explicit `expose` is a config error | `config.TestImplicitPrivateVaultCollisionCountsAsSharing` |
-| an unexposed secret looks like `not_found` and is audited; private vaults can't see each other | `core.TestUnexposedLooksLikeMissingButIsAuditedWithReason`, `cli.TestHostCLIAndClientEndToEnd` |
+| an unexposed secret looks like `not_found` and is audited; private vaults can't see each other | `core.TestUnexposedLooksLikeMissingButIsAuditedWithReason`, `cli.TestPrivateVaultsCantSeeEachOther`, `cli.TestHostCLIAndClientEndToEnd` |
 | crypto round trip; AAD swaps and ambiguous files refused | `vaultfile.TestCryptoRoundTrip`, `vaultfile.TestAADSwapRejected`, `vaultfile.TestAmbiguousVaultFilesAreRefused` |
 | atomic writes | `fsutil.TestWriteFileAtomicNeverLeavesAPartialFile` |
 | no secret in argv; no value written to a terminal | `cli.TestNoSecretInArgv`, `cli.TestGetRefusesTerminalBeforeAsking`, `main.TestBinaryServeGetReloadStop` |
@@ -2075,7 +2089,7 @@ noted; packages are named as in `go test` output (`main` is `cmd/foca`, whose te
 | add, edit and remove name every realm affected | `core.TestAddNamesEveryRealmThatWillSeeTheSecret`, `core.TestEditNamesEveryRealmThatReadsIt`, `core.TestRemoveNamesRealmsThatLoseIt` |
 | signals only reach a verified service | `svcctl.TestSignalRefusesUnverifiedProcesses`, `svcctl.TestSignalRefusesOtherUID`, `svcctl.TestPinRefusesAChangedProcess` (macOS) |
 | key holders hide their memory | `main.TestBinaryKeyHoldersHideTheirMemory`, `cli.TestKeyHoldingCommandsArePrivate` |
-| `--only` never splits a vault; one process per instance | — |
+| `--only` never splits a vault; one process per instance | `config.TestOnlyNeverSplitsAVault`, `main.TestBinaryOneProcessPerInstanceGroup`, `main.TestBinaryServesStartedTogetherRefuseAllButOne` |
 | **Policy, grants and wipes** | |
 | lattice laws; no setting loosens; the 8 h cap | `policy.TestLatticeLaws`, `policy.TestEffectiveNeverLoosens`, `policy.TestLooseningAttempts`, `core.TestEightHourCap` |
 | a grant key that differs in any component never reuses | `core.TestGrantKeyMismatchNeverReuses` |
@@ -2110,7 +2124,8 @@ noted; packages are named as in `go test` output (`main` is `cmd/foca`, whose te
 | reported fields can't overwrite guest-verified ones | — |
 
 The real-polkitd tests need `FOCA_POLKITD` and bubblewrap, and the TPM tests `FOCA_SWTPM`;
-without them they skip (the dev shell and CI set both).
+without them they skip (the dev shell and CI set both). The Nix modules are checked by
+`nix flake check` (`nix/checks.nix`).
 
 ---
 
@@ -2118,7 +2133,6 @@ without them they skip (the dev shell and CI set both).
 
 **Not built**
 
-- Nix packaging, and `serve --only` for one process per instance or group.
 - The guest relay, guest-verified identity and the `guest-*` scopes, which are a config
   error until then.
 - `foca reset` and its `vault.reset` event; `[approval] list_requires_approval` (D16); a
@@ -2145,6 +2159,10 @@ without them they skip (the dev shell and CI set both).
   the action file). Over ssh the host CLI has no agent and gets `auth_unavailable`, unless
   the user runs `pkttyagent`.
 - A hardware TPM, and PCR 7 across a real firmware update; the tests use swtpm.
+- The NixOS modules in a booted VM (`pkgs.testers.runNixOSTest` needs KVM).
+- The macOS package and the home-manager launchd agents on a Mac: the flake checks evaluate the
+  agents on Linux, but neither has run on a Mac. The package also needs a published release
+  pinned in `nix/darwin-release.nix`.
 - `darwinproc` reaches `getsockopt` and `proc_info` through `unix.Syscall6`, which goes
   through libc's deprecated `syscall()`. It works on current macOS; if Apple removes it,
   those two calls need another route.

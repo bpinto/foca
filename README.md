@@ -84,9 +84,32 @@ Every release includes `SHA256SUMS` for checking the archives.
 <details>
 <summary><b>Nix</b></summary>
 
-```sh
-nix profile install github:bpinto/foca
+`nix profile install github:bpinto/foca`, or use the modules. On a NixOS host the module
+installs foca's polkit action, gives its users the TPM and restricts ptrace; the home-manager
+module writes the config from Nix, checks it with foca at build time, and runs the service, as
+systemd user units on Linux and launchd agents on macOS:
+
+```nix
+# flake inputs: foca.url = "github:bpinto/foca";
+# NixOS
+imports = [ foca.nixosModules.default ];
+services.foca = { enable = true; users = [ "alice" ]; };
+
+# home-manager
+imports = [ foca.homeManagerModules.default ];
+services.foca = {
+  enable = true;
+  settings = {
+    plugins = { authenticator = "polkit"; key_protector = "tpm"; };
+    instances.dev.realm.kind = "vm";
+  };
+};
 ```
+
+In a VM, `foca.nixosModules.guest` installs the client and sets `kernel.yama.ptrace_scope`.
+On macOS (Apple silicon) the package is the release archive, installed as it is: its helper
+is signed and pinned into `foca`, so Nix must not strip or sign it again. Use `touchid` and
+`keychain` there.
 
 </details>
 
@@ -150,13 +173,14 @@ foca run -e GH_TOKEN=dev:github-pat -- gh pr list
 
 | Command | Runs on | What it does |
 |---|---|---|
-| `foca serve` | host | Run the service for every instance in the config |
+| `foca serve [--only <instance>…]` | host | Run the service for every instance in the config, or some of them |
 | `foca init` · `add` · `edit` · `remove` | host | Manage vaults and secrets, each approved |
 | `foca recover` | host | Seal a vault's key again with its recovery key, after a firmware or Secure Boot change |
 | `foca rekey` | host | Encrypt a vault again under a new key and recovery key, so the old recovery key and copies of the old file open nothing in it from then on (a copy still holds the secrets as they were) |
 | `foca reload` · `stop` | host | Reload the config, or stop the service |
 | `foca lock` | host | Drop every reuse grant now |
 | `foca policy explain [names…]` | host | What the config allows, in the prompt's own words |
+| `foca config check [file]` | host | Check a config file as `serve` would |
 | `foca events query` · `follow` | host | Search the audit log, or follow it live |
 | `foca list` | anywhere | Names and descriptions you can read, never values |
 | `foca get <names…>` | anywhere | Values to a pipe or file: `-f raw\|json\|env`, `-o FILE` |
@@ -301,6 +325,7 @@ approving blindly, or malware running as your user on the host. Full threat mode
 nix develop                       # Go, gopls, socat, dbus, polkit, bubblewrap, swtpm
 go test ./...                     # everything that runs on Linux
 go test -tags foca_testing ./...  # + end-to-end tests with a fake authenticator
+nix flake check                   # the Nix package and modules
 scripts/build-darwin.sh           # macOS build with the signed, pinned helper
 ```
 

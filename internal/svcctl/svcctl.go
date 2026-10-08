@@ -65,6 +65,24 @@ func WritePIDFile(path string) (remove func(), err error) {
 	}, nil
 }
 
+// PID returns the pid of the verified service behind path, without
+// signalling it.
+func PID(path string) (int, error) {
+	r, err := read(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, fmt.Errorf("%w (no %s)", ErrNotRunning, path)
+	}
+	if err != nil {
+		return 0, err
+	}
+	h, err := verify(r)
+	if err != nil {
+		return r.pid, err
+	}
+	h.close()
+	return r.pid, nil
+}
+
 // Signal sends sig to the verified service and returns its pid.
 func Signal(path string, sig syscall.Signal) (int, error) {
 	r, err := read(path)

@@ -16,7 +16,6 @@ import (
 	"github.com/bpinto/foca/internal/policy"
 	"github.com/bpinto/foca/internal/protocol"
 	"github.com/bpinto/foca/internal/secretname"
-	"github.com/bpinto/foca/internal/svcctl"
 )
 
 // ---- lock ----
@@ -30,11 +29,11 @@ func (LockCmd) Run(g *Globals, e *Env) error {
 	if err != nil {
 		return err
 	}
-	pid, err := svcctl.Signal(paths.PIDFile(), syscall.SIGUSR1)
+	pids, _, err := g.signalServices(e, paths, syscall.SIGUSR1)
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(e.Stderr, "lock requested (pid %d): every reuse grant is dropped\n", pid)
+	fmt.Fprintf(e.Stderr, "lock requested (pid %s): every reuse grant is dropped\n", pidList(pids))
 	return nil
 }
 

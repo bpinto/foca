@@ -522,3 +522,38 @@ func TestAuditRotationSettings(t *testing.T) {
 		t.Fatalf("audit %+v", c.Audit)
 	}
 }
+
+// One process may serve some instances, but never part of a vault's readers.
+func TestOnlyNeverSplitsAVault(t *testing.T) {
+	c, err := Parse([]byte(`
+version = 1
+[plugins]
+authenticator = "fake"
+secret_store = "memory"
+[vaults.common]
+[instances.dev]
+realm = { kind = "vm" }
+expose = ["dev:*", "common:github-pat"]
+[instances.work]
+realm = { kind = "vm" }
+expose = ["common:*"]
+[instances.web]
+realm = { kind = "container", peers = "opaque" }
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Only([]string{"dev"}); err == nil || !strings.Contains(err.Error(), "vault common is read by dev and work, so they must be served by one process: add --only work") {
+		t.Fatalf("split vault: %v", err)
+	}
+	both, err := c.Only([]string{"work", "dev"})
+	if err != nil || len(both.Instances) != 2 || len(c.Instances) != 3 {
+		t.Fatalf("dev and work: %v %+v", err, both)
+	}
+	if web, err := c.Only([]string{"web"}); err != nil || len(web.Instances) != 1 || web.Instances[0].Name != "web" {
+		t.Fatalf("web: %v", err)
+	}
+	if _, err := c.Only([]string{"nope"}); err == nil || !strings.Contains(err.Error(), "no such instance") {
+		t.Fatalf("unknown: %v", err)
+	}
+}
