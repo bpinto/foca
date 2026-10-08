@@ -140,3 +140,23 @@ func TestWalkFollowsSymlinksAndStopsLoops(t *testing.T) {
 		t.Fatal("a path through a file accepted")
 	}
 }
+
+func TestCheckTrustedDirWalksSymlinks(t *testing.T) {
+	base := t.TempDir()
+	good := filepath.Join(base, "good")
+	os.Mkdir(good, 0o700)
+	open := filepath.Join(base, "open")
+	os.Mkdir(open, 0o700)
+	os.Chmod(open, 0o777)
+	os.Symlink(good, filepath.Join(open, "via"))
+	if err := CheckTrustedDir(good); err != nil {
+		t.Fatalf("private dir refused: %v", err)
+	}
+	if err := CheckTrustedDir(filepath.Join(open, "via")); err == nil {
+		t.Fatal("dir reached through a symlink in a world-writable directory accepted")
+	}
+	os.WriteFile(filepath.Join(good, "f"), nil, 0o600)
+	if err := CheckTrustedDir(filepath.Join(good, "f")); err == nil {
+		t.Fatal("a file accepted as a directory")
+	}
+}

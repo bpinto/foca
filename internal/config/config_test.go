@@ -352,7 +352,7 @@ func TestPolicyRejections(t *testing.T) {
 		"unknown authenticator":     {pol("authenticators.faceid.policy", "approval = \"every-time\""), "unknown authenticator"},
 		"bad secret id":             {pol("secrets.\"common:a/b\".policy", "approval = \"every-time\""), "is not a secret name"},
 		"guest-session on instance": {pol("instances.dev.policy", "approval = \"reuse\"\nwindow = \"1m\"\nscope = \"guest-session\""), `instances.dev.policy: scope "guest-session" needs the guest relay`},
-		"guest-program on vault":    {pol("vaults.dev.policy", "approval = \"reuse\"\nwindow = \"1m\"\nscope = \"guest-program\""), `vaults.dev.policy: scope "guest-program" needs the guest relay (design §14), which dev doesn't have`},
+		"guest-session on vault":    {pol("vaults.dev.policy", "approval = \"reuse\"\nwindow = \"1m\"\nscope = \"guest-session\""), `vaults.dev.policy: scope "guest-session" needs the guest relay (design §14), which dev doesn't have`},
 		"guest-session on secret":   {pol(`secrets."dev:x".policy`, "approval = \"reuse\"\nwindow = \"1m\"\nscope = \"guest-session\""), "secrets.dev:x.policy: scope"},
 		"guest-session on authn":    {pol("authenticators.fake.policy", "approval = \"reuse\"\nwindow = \"1m\"\nscope = \"guest-session\""), "authenticators.fake.policy: scope"},
 	}
@@ -555,5 +555,49 @@ realm = { kind = "container", peers = "opaque" }
 	}
 	if _, err := c.Only([]string{"nope"}); err == nil || !strings.Contains(err.Error(), "no such instance") {
 		t.Fatalf("unknown: %v", err)
+	}
+}
+
+const relayKey = "ed25519:11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo="
+
+func TestGuestRelay(t *testing.T) {
+	cfg := minimal + "guest_relay = { public_key = \"" + relayKey + "\" }\n"
+	c, err := Parse([]byte(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.Instances[0].GuestRelay) != 32 {
+		t.Fatalf("key %v", c.Instances[0].GuestRelay)
+	}
+	bad := map[string]string{
+		"no prefix":     strings.Replace(cfg, "ed25519:", "", 1),
+		"short key":     strings.Replace(cfg, relayKey, "ed25519:AAAA", 1),
+		"not base64":    strings.Replace(cfg, relayKey, "ed25519:!!!", 1),
+		"unknown key":   strings.Replace(cfg, "public_key", "pubkey", 1),
+		"direct realm":  strings.Replace(cfg, `{ kind = "vm" }`, `{ kind = "host" }`, 1),
+		"missing value": minimal + "guest_relay = {}\n",
+	}
+	for name, cfg := range bad {
+		if _, err := Parse([]byte(cfg)); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}
+
+// With the relay, guest-* scopes are allowed; a level that also applies to
+// an instance without one is still refused, naming only that instance.
+func TestGuestScopesNeedTheRelayOnEveryInstanceTheyApplyTo(t *testing.T) {
+	cfg := minimal + "guest_relay = { public_key = \"" + relayKey + "\" }\n" +
+		"[instances.dev.policy]\napproval = \"reuse\"\nwindow = \"15m\"\nscope = \"guest-session\"\n"
+	c, err := Parse([]byte(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p := c.SecretPolicy(c.Instances[0], "dev:x"); p.Scope.String() != "guest-session" {
+		t.Fatalf("policy %v", p)
+	}
+	mixed := cfg + "[instances.work]\nrealm = { kind = \"vm\" }\n[authenticators.fake.policy]\napproval = \"reuse\"\nwindow = \"1m\"\nscope = \"guest-session\"\n"
+	if _, err := Parse([]byte(mixed)); err == nil || !strings.Contains(err.Error(), "which work doesn't have") {
+		t.Fatalf("mixed: %v", err)
 	}
 }

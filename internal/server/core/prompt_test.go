@@ -25,7 +25,7 @@ func TestPromptWording(t *testing.T) {
 	vm := identity.Realm{Kind: "vm", Name: "dev", Peers: "opaque"}
 	host := identity.Realm{Kind: "host", Name: "host", Peers: "direct"}
 	claimed := &identity.ClientInfo{Exe: "/bin/gh", Parents: []identity.Proc{{Name: "bash"}, {Name: "claude"}}}
-	guest := &identity.GuestInfo{Exe: "/bin/gh", ExeSealed: true, Parents: []identity.Proc{{Exe: "/bin/bash", Sealed: true}, {Exe: "/opt/claude", Sealed: true}}}
+	guest := &identity.GuestInfo{Name: "gh", PIDStable: true, Parents: []identity.Proc{{Name: "bash"}, {Name: "claude"}}}
 	ssh := identity.VerifiedPeer{Exe: "/usr/bin/ssh", Name: "ssh", Opaque: true}
 	local := identity.VerifiedPeer{Exe: "/run/bin/foca", Name: "foca", ExeSealed: true, PIDStable: true,
 		Parents: []identity.Proc{{Exe: "/bin/gh", Name: "gh", Sealed: true}, {Exe: "/bin/zsh", Name: "zsh", Sealed: true}, {Exe: "/opt/claude", Name: "claude", Sealed: true}}}
@@ -41,7 +41,7 @@ func TestPromptWording(t *testing.T) {
 		{"claimed in VM", PromptInput{Realm: vm, Resources: refs("GitHub PAT"), Requester: plugin.Requester{Peer: ssh, Reported: claimed}, ShowClient: true},
 			"let a program use GitHub PAT in VM dev. VM claims: gh via claude."},
 		{"guest-verified in VM", PromptInput{Realm: vm, Resources: refs("GitHub PAT"), Requester: plugin.Requester{Peer: ssh, GuestVerified: guest, Reported: claimed}, ShowClient: true},
-			"let gh use GitHub PAT in VM dev, via claude."},
+			"let gh ⚠ use GitHub PAT in VM dev, via claude ⚠."},
 		{"host-verified local", PromptInput{Realm: host, Resources: refs("GitHub PAT"), Requester: plugin.Requester{Peer: local}, ShowClient: true},
 			"let gh use GitHub PAT, via claude."},
 		{"no identity", PromptInput{Realm: vm, Resources: refs("GitHub PAT"), Requester: plugin.Requester{Peer: ssh}, ShowClient: true},
@@ -92,6 +92,22 @@ func TestPromptWording(t *testing.T) {
 			Reported: &identity.ClientInfo{Exe: "/usr/bin/foca", Target: &identity.Target{Exe: "/usr/bin/npm", Argv0: "npm"},
 				Parents: []identity.Proc{{Name: "bash"}, {Name: "claude"}}}}, ShowClient: true},
 			"let a program use x in VM dev. VM claims: npm via claude."},
+		// A program that runs itself again shows once, and the agent
+		// behind it takes the via slot.
+		{"claimed repeated name", PromptInput{Realm: vm, Resources: refs("x"), Requester: plugin.Requester{Peer: ssh,
+			Reported: &identity.ClientInfo{Exe: "/usr/bin/foca", Parents: []identity.Proc{{Name: "zsh"}, {Name: "herdr"}, {Name: "herdr"}, {Name: "claude"}}}}, ShowClient: true},
+			"let a program use x in VM dev. VM claims: herdr via claude."},
+		{"claimed only repeated name", PromptInput{Realm: vm, Resources: refs("x"), Requester: plugin.Requester{Peer: ssh,
+			Reported: &identity.ClientInfo{Exe: "/usr/bin/foca", Parents: []identity.Proc{{Name: "herdr"}, {Name: "herdr"}}}}, ShowClient: true},
+			"let a program use x in VM dev. VM claims: herdr."},
+		{"guest repeated name", PromptInput{Realm: vm, Resources: refs("x"), Requester: plugin.Requester{Peer: ssh,
+			GuestVerified: &identity.GuestInfo{Name: "gh", PIDStable: true, Parents: []identity.Proc{{Name: "gh"}, {Name: "claude"}}}}, ShowClient: true},
+			"let gh ⚠ use x in VM dev, via claude ⚠."},
+		// An unsealed parent can't hide behind its sealed child's name.
+		{"repeated name, seal differs", PromptInput{Realm: host, Resources: refs("GitHub PAT"), Requester: plugin.Requester{
+			Peer: identity.VerifiedPeer{Exe: "/usr/bin/gh", ExeSealed: true, PIDStable: true,
+				Parents: []identity.Proc{{Exe: "/tmp/gh"}, {Exe: "/opt/claude", Sealed: true}}}}, ShowClient: true},
+			"let gh use GitHub PAT, via gh ⚠."},
 		// Verified identity keeps its verified names; a target can't take
 		// the sentence position.
 		{"verified with run target", PromptInput{Realm: host, Resources: refs("GitHub PAT"), Requester: plugin.Requester{Peer: local,
@@ -220,5 +236,40 @@ func TestPromptNeverElidesCredentials(t *testing.T) {
 	}
 	if strings.Contains(got, "more") {
 		t.Fatalf("names elided: %q", got)
+	}
+}
+
+// A process whose name cleans to nothing is named as unnamed, never skipped:
+// skipping it would put its parent in its place, with no mark for its own
+// unsealed file.
+func TestUnnamedProcessNeverHidesBehindItsParent(t *testing.T) {
+	host := identity.Realm{Kind: "host", Name: "host", Peers: "direct"}
+	vm := identity.Realm{Kind: "vm", Name: "dev", Peers: "opaque"}
+	claude := identity.Proc{Exe: "/usr/bin/claude", Name: "claude", Sealed: true}
+	for _, tc := range []struct {
+		name string
+		r    identity.Realm
+		req  plugin.Requester
+		want string
+	}{
+		{"host-verified", host, plugin.Requester{Peer: identity.VerifiedPeer{Exe: "/tmp/@", Name: "@", PIDStable: true,
+			Parents: []identity.Proc{claude}}},
+			"let an unnamed program ⚠ use GitHub PAT, via claude."},
+		{"host-verified parent", host, plugin.Requester{Peer: identity.VerifiedPeer{Exe: "/usr/bin/gh", Name: "gh", ExeSealed: true, PIDStable: true,
+			Parents: []identity.Proc{{Exe: "/tmp/@", Name: "@"}, claude}}},
+			"let gh use GitHub PAT, via an unnamed program ⚠."},
+		{"guest-verified", vm, plugin.Requester{Peer: identity.VerifiedPeer{Opaque: true},
+			GuestVerified: &identity.GuestInfo{Name: "@", PIDStable: true, Parents: []identity.Proc{{Name: "claude"}}}},
+			"let an unnamed program ⚠ use GitHub PAT in VM dev, via claude ⚠."},
+		{"claimed", vm, plugin.Requester{Peer: identity.VerifiedPeer{Opaque: true},
+			Reported: &identity.ClientInfo{Exe: "/tmp/@", Parents: []identity.Proc{{Name: "claude"}}}},
+			"let a program use GitHub PAT in VM dev. VM claims: an unnamed program via claude."},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := build(t, PromptInput{Realm: tc.r, Resources: refs("GitHub PAT"), Requester: tc.req, ShowClient: true, Skip: skip})
+			if got != tc.want {
+				t.Fatalf("\n got: %q\nwant: %q", got, tc.want)
+			}
+		})
 	}
 }

@@ -52,9 +52,19 @@ func (l *Linux) pidfd(fd int) (int, error) {
 }
 
 func (l *Linux) Identify(conn *net.UnixConn) (identity.VerifiedPeer, error) {
+	p, pidfd, err := l.identify(conn)
+	if pidfd >= 0 {
+		unix.Close(pidfd)
+	}
+	return p, err
+}
+
+// identify reads the peer and returns its pidfd, or -1 without one. The
+// caller closes the pidfd, also on error.
+func (l *Linux) identify(conn *net.UnixConn) (identity.VerifiedPeer, int, error) {
 	raw, err := conn.SyscallConn()
 	if err != nil {
-		return identity.VerifiedPeer{}, err
+		return identity.VerifiedPeer{}, -1, err
 	}
 	var cred *unix.Ucred
 	var credErr, pidfdErr error
@@ -63,31 +73,28 @@ func (l *Linux) Identify(conn *net.UnixConn) (identity.VerifiedPeer, error) {
 		cred, credErr = unix.GetsockoptUcred(int(fd), unix.SOL_SOCKET, unix.SO_PEERCRED)
 		pidfd, pidfdErr = l.pidfd(int(fd))
 	}); err != nil {
-		return identity.VerifiedPeer{}, err
+		return identity.VerifiedPeer{}, pidfd, err
 	}
 	if credErr != nil {
-		return identity.VerifiedPeer{}, fmt.Errorf("SO_PEERCRED: %w", credErr)
-	}
-	if pidfd >= 0 {
-		defer unix.Close(pidfd)
+		return identity.VerifiedPeer{}, pidfd, fmt.Errorf("SO_PEERCRED: %w", credErr)
 	}
 	if pidfdErr != nil {
-		return identity.VerifiedPeer{}, fmt.Errorf("SO_PEERPIDFD: %w", pidfdErr)
+		return identity.VerifiedPeer{}, pidfd, fmt.Errorf("SO_PEERPIDFD: %w", pidfdErr)
 	}
 	pid := int(cred.Pid)
 	if pid <= 0 {
-		return identity.VerifiedPeer{}, errors.New("peer has no pid in this namespace")
+		return identity.VerifiedPeer{}, pidfd, errors.New("peer has no pid in this namespace")
 	}
 
 	t := procfsTable{root: l.procfs, seals: map[string]bool{}}
 	st, err := t.stat(pid)
 	if err != nil {
-		return identity.VerifiedPeer{}, fmt.Errorf("peer %d: %w", pid, err)
+		return identity.VerifiedPeer{}, pidfd, fmt.Errorf("peer %d: %w", pid, err)
 	}
 	exe, _ := t.exe(pid)
 	session, err := durableSession(t, pid)
 	if err != nil {
-		return identity.VerifiedPeer{}, fmt.Errorf("peer %d session: %w", pid, err)
+		return identity.VerifiedPeer{}, pidfd, fmt.Errorf("peer %d session: %w", pid, err)
 	}
 	p := identity.VerifiedPeer{
 		Source:    "SO_PEERCRED",
@@ -108,18 +115,30 @@ func (l *Linux) Identify(conn *net.UnixConn) (identity.VerifiedPeer, error) {
 
 	// Make sure everything we read belongs to the process that connected.
 	if pidfd >= 0 {
-		if err := unix.PidfdSendSignal(pidfd, 0, nil, 0); err != nil {
-			return identity.VerifiedPeer{}, fmt.Errorf("peer %d exited during identification", pid)
+		if exited(pidfd) {
+			return identity.VerifiedPeer{}, pidfd, fmt.Errorf("peer %d exited during identification", pid)
 		}
 		p.Source = "SO_PEERCRED+SO_PEERPIDFD"
 		p.PIDStable = true
 	} else if again, err := t.stat(pid); err != nil || again.StartTime != st.StartTime {
-		return identity.VerifiedPeer{}, fmt.Errorf("peer %d changed during identification", pid)
+		return identity.VerifiedPeer{}, pidfd, fmt.Errorf("peer %d changed during identification", pid)
 	}
 	// Without a pidfd, the pid could have been reused before the first
 	// read, and both reads would agree on the wrong process. PIDStable
 	// stays false, so nothing downstream states these names as fact.
-	return p, nil
+	return p, pidfd, nil
+}
+
+// exited reports whether the process behind pidfd has exited: a pidfd
+// polls readable once it has. Unlike a signal, this needs no permission over
+// the process, so the guest relay can watch other users' callers.
+func exited(pidfd int) bool {
+	fds := []unix.PollFd{{Fd: int32(pidfd), Events: unix.POLLIN}}
+	n, err := unix.Poll(fds, 0)
+	for err == unix.EINTR {
+		n, err = unix.Poll(fds, 0)
+	}
+	return err != nil || n > 0
 }
 
 // procfsTable reads /proc. seals, if set, remembers file and directory checks

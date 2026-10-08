@@ -3,6 +3,9 @@ package server
 import (
 	"bufio"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"net"
@@ -41,6 +44,16 @@ type connState struct {
 	inst   *core.Instance
 	peer   identity.VerifiedPeer
 	client *identity.ClientInfo // from server.hello; per-request client overrides it
+
+	// The guest relay's handshake (design §14): the nonce relay.challenge
+	// sent, until relay.hello uses it up, and whether the relay proved
+	// itself. guest is the first caller it named; a relay serves one caller
+	// per connection, so every later request must name the same process.
+	nonce   []byte
+	relayed bool
+	guest   *identity.GuestInfo
+	// closing makes the connection close once the response is written.
+	closing bool
 }
 
 // maxPipelined is how many requests a connection may send ahead of the one
@@ -80,9 +93,10 @@ func (s *Server) serveConn(conn *net.UnixConn, inst *core.Instance) {
 			continue
 		}
 		conn.SetReadDeadline(time.Time{})
-		if resp := s.handle(ctx, st, line); resp != nil && !s.write(conn, *resp) {
-			// The client isn't taking answers. Closing ends the reader, and
-			// what it left queued is recorded below.
+		if resp := s.handle(ctx, st, line); resp != nil && !s.write(conn, *resp) || st.closing {
+			// The client isn't taking answers, or isn't the relay this
+			// instance answers. Closing ends the reader, and what it left
+			// queued is recorded below.
 			cancel()
 			conn.Close()
 			continue
@@ -135,21 +149,40 @@ func (s *Server) readLoop(conn *net.UnixConn, cancel context.CancelFunc, msgs ch
 
 func (s *Server) handle(ctx context.Context, st *connState, line []byte) *protocol.Response {
 	call := core.Call{RequestID: ids.New(), Origin: audit.OriginClientSocket, Conn: st.id, Instance: st.inst, Peer: st.peer, Reported: st.client}
+	// On an instance that answers only its relay, any refusal before
+	// relay.hello also closes the connection (design §14, safeguard 2).
+	malformed := func(resp *protocol.Response) *protocol.Response {
+		if st.inst.GuestRelay != nil && !st.relayed {
+			st.closing = true
+		}
+		return resp
+	}
 	if !json.Valid(line) {
-		return s.refuse(ctx, call, nil, "", protocol.NewError(protocol.CodeParseError, "invalid JSON"))
+		return malformed(s.refuse(ctx, call, nil, "", protocol.NewError(protocol.CodeParseError, "invalid JSON")))
 	}
 	req, err := protocol.DecodeRequest(line)
 	if err != nil {
-		return s.refuse(ctx, call, nil, "", protocol.NewError(protocol.CodeInvalidRequest, "%v", err))
+		return malformed(s.refuse(ctx, call, nil, "", protocol.NewError(protocol.CodeInvalidRequest, "%v", err)))
 	}
 	if req.JSONRPC != "2.0" || req.Method == "" {
-		return s.refuse(ctx, call, req.ID, req.Method, protocol.NewError(protocol.CodeInvalidRequest, "not a JSON-RPC 2.0 request"))
+		return malformed(s.refuse(ctx, call, req.ID, req.Method, protocol.NewError(protocol.CodeInvalidRequest, "not a JSON-RPC 2.0 request")))
 	}
 	if len(req.ID) == 0 {
 		// Notifications aren't part of this protocol; there is nothing to
 		// answer them with, but the attempt is still recorded.
 		s.refuse(ctx, call, nil, req.Method, protocol.NewError(protocol.CodeInvalidRequest, "notifications are not supported"))
-		return nil
+		return malformed(nil)
+	}
+	if req.Method == protocol.MethodRelayChallenge || req.Method == protocol.MethodRelayHello {
+		return s.relayHandshake(ctx, st, call, req)
+	}
+	if st.inst.GuestRelay != nil && !st.relayed {
+		// Relay required means relay only: whatever reaches this socket
+		// without proving itself is refused outright, never downgraded to
+		// client-reported identity (design §14, safeguard 2).
+		st.closing = true
+		return s.refuseAs(ctx, call, req.ID, req.Method, "relay_required",
+			protocol.NewError(protocol.CodeRelayRequired, "instance %s answers only its guest relay; use the relay's socket in the realm", st.inst.Name))
 	}
 	if managementMethods[req.Method] {
 		return s.refuseAs(ctx, call, req.ID, req.Method, "forbidden_on_socket",
@@ -182,13 +215,18 @@ var rejectionCodes = map[int]bool{
 	protocol.CodeMethodNotFound:      true,
 	protocol.CodeInvalidParams:       true,
 	protocol.CodeProtocolUnsupported: true,
+	protocol.CodeRelayRequired:       true,
 }
 
-// refuse records a rejected request, reason named after the error code, and
-// returns the error response. If it can't be recorded, the answer becomes
-// audit_failed, as for every other unrecorded request.
+// refuse records a rejected request and returns the error response. The
+// reason is the error's own, else its code's name. If it can't be recorded,
+// the answer becomes audit_failed, as for every other unrecorded request.
 func (s *Server) refuse(ctx context.Context, call core.Call, id json.RawMessage, method string, pe *protocol.Error) *protocol.Response {
-	return s.refuseAs(ctx, call, id, method, protocol.CodeName(pe.Code), pe)
+	reason := pe.Data.Reason
+	if reason == "" {
+		reason = protocol.CodeName(pe.Code)
+	}
+	return s.refuseAs(ctx, call, id, method, reason, pe)
 }
 
 func (s *Server) refuseAs(ctx context.Context, call core.Call, id json.RawMessage, method, reason string, pe *protocol.Error) *protocol.Response {
@@ -221,14 +259,23 @@ func safeMethod(m string) string {
 }
 
 // decode applies strict decoding and the per-request common fields.
-func (s *Server) decode(call *core.Call, raw json.RawMessage, v protocol.Params) *protocol.Error {
+func (s *Server) decode(st *connState, call *core.Call, raw json.RawMessage, v protocol.Params) *protocol.Error {
 	if err := protocol.DecodeParams(raw, v); err != nil {
-		return protocol.NewError(protocol.CodeInvalidParams, "%v", err)
+		e := protocol.NewError(protocol.CodeInvalidParams, "%v", err)
+		if _, variant := protocol.GuestKey(raw); variant {
+			// Another spelling of guest_verified is refused as an unknown
+			// key; it is recorded as the forgery it is.
+			e.Data.Reason = "forged_guest_verified"
+		}
+		return e
 	}
 	base := v.Base()
 	if base.MinProtocol > protocol.Version {
 		return protocol.NewError(protocol.CodeProtocolUnsupported,
 			"client needs protocol %d; this server speaks %d", base.MinProtocol, protocol.Version)
+	}
+	if e := s.guest(st, call, base.GuestVerified); e != nil {
+		return e
 	}
 	if base.Client != nil {
 		c := base.Client.Clean()
@@ -237,11 +284,98 @@ func (s *Server) decode(call *core.Call, raw json.RawMessage, v protocol.Params)
 	return nil
 }
 
+// guest checks the guest-verified identity a request carries, and puts it
+// on the call. Only a connection whose relay passed relay.hello may carry
+// one, and on such a connection every request must (design §14). Forged or
+// missing, the request is refused, never handled with weaker identity.
+func (s *Server) guest(st *connState, call *core.Call, g *identity.GuestInfo) *protocol.Error {
+	refuse := func(code int, reason, format string, a ...any) *protocol.Error {
+		e := protocol.NewError(code, format, a...)
+		e.Data.Reason = reason
+		return e
+	}
+	switch {
+	case !st.relayed && g != nil:
+		return refuse(protocol.CodeInvalidParams, "forged_guest_verified", "guest_verified is set only by a verified guest relay")
+	case !st.relayed:
+		return nil
+	case g == nil:
+		return refuse(protocol.CodeRelayRequired, "guest_verified_missing", "the guest relay sent no guest_verified identity")
+	}
+	clean, err := g.Clean()
+	if err != nil {
+		return refuse(protocol.CodeInvalidParams, "invalid_guest_verified", "%v", err)
+	}
+	if st.guest == nil {
+		st.guest = &clean
+	} else if st.guest.PID != clean.PID || st.guest.StartTime != clean.StartTime {
+		// A relay opens one upstream connection per caller, so a second
+		// process on this connection means connections are multiplexed,
+		// which would blur connection scope (design §9.1, safeguard 4).
+		st.closing = true
+		return refuse(protocol.CodeRelayRequired, "relay_multiplexed", "the guest relay named another caller on this connection")
+	}
+	call.Guest = &clean
+	return nil
+}
+
+// relayHandshake answers relay.challenge and relay.hello. The relay signs the
+// nonce with the instance and connection the host named; a bad or replayed
+// signature, or any misstep, closes the connection, so a process that
+// reaches the forwarded socket can't pass itself off as the relay.
+func (s *Server) relayHandshake(ctx context.Context, st *connState, call core.Call, req protocol.Request) *protocol.Response {
+	if st.inst.GuestRelay == nil {
+		return s.refuse(ctx, call, req.ID, req.Method, protocol.NewError(protocol.CodeMethodNotFound, "instance %s has no guest relay", st.inst.Name))
+	}
+	fail := func(reason, format string, a ...any) *protocol.Response {
+		st.closing = true
+		return s.refuseAs(ctx, call, req.ID, req.Method, reason, protocol.NewError(protocol.CodeRelayRequired, format, a...))
+	}
+	if req.Method == protocol.MethodRelayChallenge {
+		var p protocol.RelayChallengeParams
+		if e := s.decode(st, &call, req.Params, &p); e != nil {
+			return fail(orReason(e, "relay_hello_invalid"), "%s", e.Message)
+		}
+		if st.relayed || st.nonce != nil {
+			return fail("relay_hello_invalid", "a connection gets one relay.challenge")
+		}
+		st.nonce = make([]byte, protocol.NonceSize)
+		if _, err := rand.Read(st.nonce); err != nil {
+			return errResp(req.ID, protocol.NewError(protocol.CodeInternal, "internal error"))
+		}
+		return result(req.ID, protocol.RelayChallengeResult{Instance: st.inst.Name, Connection: st.id,
+			Nonce: base64.StdEncoding.EncodeToString(st.nonce)})
+	}
+	var p protocol.RelayHelloParams
+	if e := s.decode(st, &call, req.Params, &p); e != nil {
+		return fail(orReason(e, "relay_hello_invalid"), "%s", e.Message)
+	}
+	nonce := st.nonce
+	st.nonce = nil // used once, pass or fail
+	if st.relayed || nonce == nil {
+		return fail("relay_required", "relay.hello needs a relay.challenge first, once per connection")
+	}
+	sig, err := base64.StdEncoding.Strict().DecodeString(p.Signature)
+	if err != nil || !ed25519.Verify(st.inst.GuestRelay, protocol.RelayMessage(st.inst.Name, st.id, nonce), sig) {
+		return fail("relay_hello_invalid", "relay.hello: the signature doesn't verify with instance %s's guest_relay key", st.inst.Name)
+	}
+	st.relayed = true
+	return result(req.ID, protocol.RelayHelloResult{Instance: st.inst.Name})
+}
+
+func result(id json.RawMessage, v any) *protocol.Response {
+	b, err := protocol.Marshal(v)
+	if err != nil {
+		return errResp(id, protocol.NewError(protocol.CodeInternal, "encoding failed"))
+	}
+	return &protocol.Response{JSONRPC: "2.0", ID: id, Result: b}
+}
+
 func (s *Server) dispatch(ctx context.Context, st *connState, call core.Call, req protocol.Request) (any, *protocol.Error) {
 	switch req.Method {
 	case protocol.MethodHello:
 		var p protocol.HelloParams
-		if e := s.decode(&call, req.Params, &p); e != nil {
+		if e := s.decode(st, &call, req.Params, &p); e != nil {
 			return nil, e
 		}
 		if call.Reported != nil {
@@ -254,7 +388,7 @@ func (s *Server) dispatch(ctx context.Context, st *connState, call core.Call, re
 
 	case protocol.MethodSecretList:
 		var p protocol.SecretListParams
-		if e := s.decode(&call, req.Params, &p); e != nil {
+		if e := s.decode(st, &call, req.Params, &p); e != nil {
 			return nil, e
 		}
 		rs, err := s.opts.Core.ListSecrets(ctx, call)
@@ -273,7 +407,7 @@ func (s *Server) dispatch(ctx context.Context, st *connState, call core.Call, re
 
 	case protocol.MethodSecretRead:
 		var p protocol.SecretReadParams
-		if e := s.decode(&call, req.Params, &p); e != nil {
+		if e := s.decode(st, &call, req.Params, &p); e != nil {
 			return nil, e
 		}
 		secrets, err := s.opts.Core.ReadSecrets(ctx, call, p.Names)
@@ -290,7 +424,7 @@ func (s *Server) dispatch(ctx context.Context, st *connState, call core.Call, re
 
 	case protocol.MethodGrantsStatus:
 		var p protocol.GrantsStatusParams
-		if e := s.decode(&call, req.Params, &p); e != nil {
+		if e := s.decode(st, &call, req.Params, &p); e != nil {
 			return nil, e
 		}
 		gs, err := s.opts.Core.Grants(ctx, call)
@@ -305,7 +439,7 @@ func (s *Server) dispatch(ctx context.Context, st *connState, call core.Call, re
 
 	case protocol.MethodGrantsDrop:
 		var p protocol.GrantsDropParams
-		if e := s.decode(&call, req.Params, &p); e != nil {
+		if e := s.decode(st, &call, req.Params, &p); e != nil {
 			return nil, e
 		}
 		n, err := s.opts.Core.DropGrants(ctx, call, p.Names)
@@ -316,7 +450,7 @@ func (s *Server) dispatch(ctx context.Context, st *connState, call core.Call, re
 
 	case protocol.MethodActionList:
 		var p protocol.ActionListParams
-		if e := s.decode(&call, req.Params, &p); e != nil {
+		if e := s.decode(st, &call, req.Params, &p); e != nil {
 			return nil, e
 		}
 		rs, err := s.opts.Core.ListActions(ctx, call)
@@ -336,7 +470,7 @@ func (s *Server) dispatch(ctx context.Context, st *connState, call core.Call, re
 
 	case protocol.MethodActionRun:
 		var p protocol.ActionRunParams
-		if e := s.decode(&call, req.Params, &p); e != nil {
+		if e := s.decode(st, &call, req.Params, &p); e != nil {
 			return nil, e
 		}
 		o, err := s.opts.Core.RunAction(ctx, call, p.Name, p.Params)
@@ -408,3 +542,11 @@ func zero(b []byte) {
 // features are the methods server.hello advertises.
 var features = []string{protocol.MethodSecretList, protocol.MethodSecretRead, protocol.MethodGrantsStatus,
 	protocol.MethodGrantsDrop, protocol.MethodActionList, protocol.MethodActionRun}
+
+// orReason is e's own audit reason, else def.
+func orReason(e *protocol.Error, def string) string {
+	if e.Data.Reason != "" {
+		return e.Data.Reason
+	}
+	return def
+}

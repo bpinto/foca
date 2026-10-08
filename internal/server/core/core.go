@@ -5,6 +5,7 @@ package core
 
 import (
 	"context"
+	"crypto/ed25519"
 	"errors"
 	"fmt"
 	"sort"
@@ -69,6 +70,10 @@ type Instance struct {
 	// secrets it uses included; nil means every-time.
 	Actions      plugin.Provider
 	ActionPolicy func(actionID string) policy.Policy
+	// GuestRelay is the public key of the realm's guest relay (design §14),
+	// or nil. With one, the socket answers only that relay, every request
+	// carries the caller as the relay read it, and guest-* scopes apply.
+	GuestRelay ed25519.PublicKey
 }
 
 // visibleTo lists the realms of every instance that may read secret id in
@@ -166,11 +171,14 @@ type Call struct {
 	Conn     string
 	Instance *Instance
 	Peer     identity.VerifiedPeer
+	// Guest is the caller as the instance's guest relay read it. The server
+	// sets it only on a connection that passed relay.hello.
+	Guest    *identity.GuestInfo
 	Reported *identity.ClientInfo
 }
 
 func (c Call) requester() plugin.Requester {
-	return plugin.Requester{Peer: c.Peer, Reported: c.Reported}
+	return plugin.Requester{Peer: c.Peer, GuestVerified: c.Guest, Reported: c.Reported}
 }
 
 // Event returns an audit event pre-filled with the call's context. Verified
@@ -185,9 +193,16 @@ func (s *Service) Event(c Call, typ, outcome string) *audit.Event {
 		e.Instance = c.Instance.Name
 		e.Vault = c.Instance.Vault
 	}
+	if c.Guest != nil || c.Reported != nil {
+		e.Client = &audit.Client{}
+	}
+	if c.Guest != nil {
+		g := *c.Guest
+		e.Client.GuestVerified = &g
+	}
 	if c.Reported != nil {
 		r := *c.Reported
-		e.Client = &audit.Client{Reported: &r}
+		e.Client.Reported = &r
 	}
 	return e
 }

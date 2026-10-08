@@ -157,17 +157,42 @@ func resolveActor(in PromptInput) actor {
 				chain[i].Sealed = false
 			}
 		}
-		return pick(chain, skip, trustVerified)
+		return pick(chain, skip, trustVerified, how{})
 	case r.GuestVerified != nil:
-		return pick(guestChain(*r.GuestVerified), skip, trustVerified)
+		// The realm's kernel vouches for each process, but every name is
+		// one the process gave itself (comm), so none is sealed and each
+		// carries the mark. The skip list applies by name: a process that
+		// calls itself bash to hide could as well call itself gh.
+		chain, leader := guestChain(*r.GuestVerified)
+		return pick(chain, skip, trustVerified, how{byName: true, comm: true, leader: leader})
 	case r.Reported != nil:
-		return pick(clientChain(*r.Reported), skip, trustClaimed)
+		return pick(clientChain(*r.Reported), skip, trustClaimed, how{byName: true})
 	}
 	return actor{}
 }
 
-func guestChain(g identity.GuestInfo) []identity.Proc {
-	return append([]identity.Proc{{Exe: g.Exe, Name: g.Name, Sealed: g.ExeSealed}}, g.Parents...)
+// guestChain is the caller and its parents as the relay read them: names
+// only, never sealed. It ends at the leader of the caller's terminal
+// session, the shell that owns the terminal: what is above it (a tmux
+// server, sshd, systemd) runs the terminal, not the request. leader says
+// whether the leader is in the chain; if not, the whole chain is kept.
+func guestChain(g identity.GuestInfo) (chain []identity.Proc, leader bool) {
+	chain = append([]identity.Proc{{PID: g.PID, StartTime: g.StartTime, Name: g.Name}}, g.Parents...)
+	for i := range chain {
+		chain[i].Exe, chain[i].Sealed = "", false
+	}
+	var sid int
+	var start uint64
+	if _, err := fmt.Sscanf(g.Session, "sid:%d:%d", &sid, &start); err != nil {
+		return chain, false
+	}
+	for i, p := range chain {
+		// The start time too: a pid alone could be a later process.
+		if p.PID == sid && p.StartTime == start {
+			return chain[:i+1], true
+		}
+	}
+	return chain, false
 }
 
 // clientChain is the claimed caller and its parents, after the command it
@@ -185,34 +210,66 @@ func clientChain(c identity.ClientInfo) []identity.Proc {
 	return chain
 }
 
+// how says how pick reads a chain.
+type how struct {
+	// byName applies the skip list to names whatever the seal, for chains
+	// where every name was chosen by the process itself.
+	byName bool
+	// comm: names are comm, which the kernel cuts to 15 bytes (commName).
+	comm bool
+	// leader: the chain ends at its terminal's session leader, which is
+	// named if every process in it is skipped. "zsh" then says the request
+	// was typed in a shell, not made through a program.
+	leader bool
+}
+
 // pick returns the first two processes in the chain that aren't shells,
 // multiplexers or foca itself: the program and the agent behind it.
 //
-// Only sealed entries are skipped. An unsealed file's name was chosen by
-// whoever wrote it, so a program named "env" or "foca" in the caller's
-// own directory can't hide itself and put its parent in the prompt instead.
-// For claimed chains nothing is sealed, so the skip list applies to names.
-func pick(chain []identity.Proc, skip map[string]bool, t trust) actor {
+// For host-verified chains only sealed entries are skipped. An unsealed
+// file's name was chosen by whoever wrote it, so a program named "env" or
+// "foca" in the caller's own directory can't hide itself and put its parent
+// in the prompt instead.
+func pick(chain []identity.Proc, skip map[string]bool, t trust, h how) actor {
 	type entry struct {
 		name   string
 		sealed bool
 	}
 	var got []entry
+	last := entry{}
 	for _, p := range chain {
-		n := identity.DisplayName(p.Name, maxNameLen)
+		n, bare := identity.DisplayName(p.Name, maxNameLen), ""
 		if e := identity.DisplayName(p.Exe, maxNameLen); e != "" {
 			n = e
 		}
-		if n == "" {
+		bare = n
+		if h.comm {
+			n, bare = commName(p.Name)
+		}
+		if bare == "" {
+			// A name that cleans to nothing is never skipped: it is on no
+			// skip list, and skipping it would put the next process in its
+			// place (an unsealed "/tmp/@" would show as its sealed parent).
+			n = unnamed
+		}
+		e := entry{n, p.Sealed && p.Exe != ""}
+		last = e
+		if skip[bare] && (p.Sealed || h.byName) {
 			continue
 		}
-		if skip[n] && (p.Sealed || t != trustVerified) {
+		// "herdr via herdr" says nothing the first name doesn't: a program
+		// that runs itself again shows once. Only an exact match, seal
+		// included, so an unsealed parent can't hide behind its sealed child.
+		if len(got) == 1 && e == got[0] {
 			continue
 		}
-		got = append(got, entry{n, p.Sealed && p.Exe != ""})
+		got = append(got, e)
 		if len(got) == 2 {
 			break
 		}
+	}
+	if len(got) == 0 && h.leader && last.name != "" {
+		got = append(got, last)
 	}
 	switch len(got) {
 	case 0:
@@ -222,6 +279,44 @@ func pick(chain []identity.Proc, skip map[string]bool, t trust) actor {
 	default:
 		return actor{program: got[0].name, programSealed: got[0].sealed, via: got[1].name, viaSealed: got[1].sealed, trust: t}
 	}
+}
+
+// unnamed stands for a process whose name cleans to nothing. It has spaces,
+// which no sanitised name has, so no process can pass for it.
+const unnamed = "an unnamed program"
+
+// commLen is how much of a name the kernel keeps in comm.
+const commLen = 15
+
+// CutMark follows a name the kernel may have cut short. Like UnsealedMark it
+// is added after sanitising, so no process can put it in its own name.
+const CutMark = "…"
+
+// commName is the label for a name read from comm, and the bare name the
+// skip list is matched on. A name of the full 15 bytes may have been cut, so
+// its label gets CutMark (a name exactly that long gets it too). A Nix
+// wrapper whose "-wrapped" suffix was cut is still unwrapped: the cut fell
+// in the suffix, so the name before it is whole.
+func commName(comm string) (label, bare string) {
+	s, cut := comm, len(comm) >= commLen
+	if cut && strings.HasPrefix(s, ".") {
+		const suffix = "-wrapped"
+		if strings.HasSuffix(s, suffix) {
+			cut = false // whole; DisplayName unwraps it
+		} else {
+			for k := len(suffix) - 1; k >= 2; k-- {
+				if strings.HasSuffix(s, suffix[:k]) {
+					s, cut = s[1:len(s)-k], false
+					break
+				}
+			}
+		}
+	}
+	bare = identity.DisplayName(s, maxNameLen)
+	if cut && bare != "" {
+		return bare + CutMark, bare
+	}
+	return bare, bare
 }
 
 // UnsealedMark follows a verified name whose file isn't sealed: the

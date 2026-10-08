@@ -11,13 +11,17 @@ import (
 )
 
 // ScopeKey is what a grant is matched on. Every component comes from the
-// host kernel or the service itself, never from the client (design §9.1).
-// A key is only built when every component its scope needs is present, so
-// a missing component can never match another missing one.
+// host kernel, the guest relay's reading of the realm's kernel, or the
+// service itself, never from the client (design §9.1). A key is only built
+// when every component its scope needs is present, so a missing component
+// can never match another missing one.
 type ScopeKey struct {
 	Instance    string
 	Connection  string // one socket connection
 	PeerSession string // durable session of a pinned peer
+	// GuestSession is the caller's durable session inside the realm, as the
+	// guest relay read it.
+	GuestSession string
 }
 
 // keyFor builds the caller's key for scope. ok=false means no grant can be
@@ -28,6 +32,9 @@ func keyFor(scope policy.Scope, c Call) (ScopeKey, bool) {
 		return ScopeKey{}, false
 	}
 	k := ScopeKey{Instance: c.Instance.Name}
+	// Without a pinned pid, the session may belong to a process that
+	// reused the pid (design §4.6).
+	peerSession := c.Peer.PIDStable && c.Peer.Session != ""
 	switch scope {
 	case policy.ScopeConnection:
 		if c.Conn == "" {
@@ -35,15 +42,23 @@ func keyFor(scope policy.Scope, c Call) (ScopeKey, bool) {
 		}
 		k.Connection = c.Conn
 	case policy.ScopePeerSession:
-		// Without a pinned pid, the session may belong to a process that
-		// reused the pid (design §4.6).
-		if !c.Peer.PIDStable || c.Peer.Session == "" {
+		if !peerSession {
 			return ScopeKey{}, false
 		}
 		k.PeerSession = c.Peer.Session
+	case policy.ScopeGuestSession:
+		// Only a relay the instance names can vouch for the guest side,
+		// and only for a process the realm's kernel pinned. The host side
+		// stays in the key: a guest session never outlives the forwarded
+		// connection it was seen on.
+		g := c.Guest
+		if c.Instance.GuestRelay == nil || g == nil || !g.PIDStable || g.Session == "" || !peerSession {
+			return ScopeKey{}, false
+		}
+		k.PeerSession, k.GuestSession = c.Peer.Session, g.Session
 	default:
-		// request never reuses; guest-* scopes need the relay;
-		// instance is capped at peer-session by the floor.
+		// request never reuses; instance is capped at peer-session by the
+		// floor.
 		return ScopeKey{}, false
 	}
 	return k, true
@@ -51,12 +66,15 @@ func keyFor(scope policy.Scope, c Call) (ScopeKey, bool) {
 
 func (k ScopeKey) audit() *audit.ScopeKey {
 	out := &audit.ScopeKey{Instance: k.Instance}
-	if k.Connection != "" {
-		out.Connection = &audit.KeyPart{Value: k.Connection, By: "host"}
+	part := func(v, by string) *audit.KeyPart {
+		if v == "" {
+			return nil
+		}
+		return &audit.KeyPart{Value: v, By: by}
 	}
-	if k.PeerSession != "" {
-		out.PeerSession = &audit.KeyPart{Value: k.PeerSession, By: "host"}
-	}
+	out.Connection = part(k.Connection, "host")
+	out.PeerSession = part(k.PeerSession, "host")
+	out.GuestSession = part(k.GuestSession, "guest")
 	return out
 }
 

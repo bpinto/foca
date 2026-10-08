@@ -20,6 +20,7 @@ const (
 	CodeParamRejected       = -32008
 	CodeForbiddenOnSocket   = -32010
 	CodeProtocolUnsupported = -32011
+	CodeRelayRequired       = -32012
 )
 
 var codeNames = map[int]string{
@@ -38,6 +39,7 @@ var codeNames = map[int]string{
 	CodeParamRejected:       "param_rejected",
 	CodeForbiddenOnSocket:   "forbidden_on_socket",
 	CodeProtocolUnsupported: "protocol_unsupported",
+	CodeRelayRequired:       "relay_required",
 }
 
 // CodeName returns the stable snake_case name for a code.
@@ -57,7 +59,14 @@ type Error struct {
 type ErrorData struct {
 	Name      string `json:"name"`
 	RequestID string `json:"request_id,omitempty"`
-	EventSeq  uint64 `json:"event_seq,omitempty"`
+	// EventSeq is the seq of the event that recorded the error. It never
+	// goes on the wire: seqs are shared by every instance, so a realm that
+	// saw them could follow other realms' activity. request_id finds the
+	// event instead.
+	EventSeq uint64 `json:"-"`
+	// Reason, if set, is the audit reason a refusal is recorded with in
+	// place of the code's name. It never goes on the wire.
+	Reason string `json:"-"`
 }
 
 func (e *Error) Error() string {

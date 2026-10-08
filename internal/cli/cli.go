@@ -115,6 +115,7 @@ type CLI struct {
 	Events       EventsCmd       `cmd:"" help:"Query or follow the audit log (host)."`
 	Grants       GrantsCmd       `cmd:"" help:"List or drop your reuse grants."`
 	PolkitPolicy PolkitPolicyCmd `cmd:"" name:"polkit-policy" help:"Print the polkit action the polkit authenticator needs (host, Linux)."`
+	Relay        RelayCmd        `cmd:"" help:"The guest relay, run inside a realm: verified identity for its callers."`
 	Version      VersionCmd      `cmd:"" help:"Print the version."`
 }
 

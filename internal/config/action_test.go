@@ -102,7 +102,7 @@ command = "/bin/true"
 		"undeclared action":     {strings.Replace(minimal, `realm = { kind = "vm" }`, `realm = { kind = "vm" }`+"\nactions = [\"nope\"]", 1), `action "nope" is not declared`},
 		"star in list":          {strings.Replace(base, `realm = { kind = "vm" }`, `realm = { kind = "vm" }`+"\nactions = [\"*\", \"a\"]", 1), `use actions = "*"`},
 		"bad actions value":     {strings.Replace(base, `realm = { kind = "vm" }`, `realm = { kind = "vm" }`+"\nactions = \"all\"", 1), `actions must be "*" or a list`},
-		"action policy guest":   {strings.Replace(base, `realm = { kind = "vm" }`, `realm = { kind = "vm" }`+"\nactions = [\"a\"]", 1) + "[actions.a.policy]\napproval = \"reuse\"\nwindow = \"1m\"\nscope = \"guest-program\"\n", `actions.a.policy: scope "guest-program" needs the guest relay (design §14), which dev doesn't have`},
+		"action policy guest":   {strings.Replace(base, `realm = { kind = "vm" }`, `realm = { kind = "vm" }`+"\nactions = [\"a\"]", 1) + "[actions.a.policy]\napproval = \"reuse\"\nwindow = \"1m\"\nscope = \"guest-session\"\n", `actions.a.policy: scope "guest-session" needs the guest relay (design §14), which dev doesn't have`},
 		"action policy invalid": {base + "[actions.a.policy]\napproval = \"reuse\"\n", "actions.a.policy: approval = \"reuse\" needs a window"},
 	}
 	for name, tc := range cases {

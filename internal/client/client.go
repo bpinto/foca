@@ -17,10 +17,12 @@ import (
 )
 
 type Client struct {
-	mu   sync.Mutex
-	conn net.Conn
-	r    *bufio.Reader
-	next int
+	// wmu orders writes and rmu reads, so one goroutine may wait for
+	// answers while another sends (the guest relay). Call takes both.
+	wmu, rmu sync.Mutex
+	conn     net.Conn
+	r        *bufio.Reader
+	next     int
 }
 
 func Dial(ctx context.Context, path string) (*Client, error) {
@@ -58,8 +60,10 @@ func (c *Client) Close() error { return c.conn.Close() }
 // Call sends one request and waits for its response. A JSON-RPC error is
 // returned as *protocol.Error.
 func (c *Client) Call(ctx context.Context, method string, params, result any) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
+	c.rmu.Lock()
+	defer c.rmu.Unlock()
 	c.next++
 	id := json.RawMessage(strconv.Itoa(c.next))
 	var raw json.RawMessage
@@ -107,15 +111,21 @@ func (c *Client) Call(ctx context.Context, method string, params, result any) er
 // WriteRaw sends raw bytes followed by a newline. Tests use it to send
 // malformed input.
 func (c *Client) WriteRaw(b []byte) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
 	_, err := c.conn.Write(append(append([]byte(nil), b...), '\n'))
 	return err
 }
 
 // ReadRaw reads one raw response line.
 func (c *Client) ReadRaw() ([]byte, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.rmu.Lock()
+	defer c.rmu.Unlock()
 	return protocol.ReadMessage(c.r)
+}
+
+// SetDeadline sets the connection's deadline for WriteRaw and ReadRaw. Call
+// sets its own. A net.Conn takes deadlines from any goroutine.
+func (c *Client) SetDeadline(t time.Time) error {
+	return c.conn.SetDeadline(t)
 }

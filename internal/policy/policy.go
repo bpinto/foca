@@ -30,7 +30,6 @@ const (
 	ScopeUnset Scope = iota
 	ScopeRequest
 	ScopeConnection
-	ScopeGuestProgram
 	ScopeGuestSession
 	ScopePeerSession
 	ScopeInstance
@@ -39,14 +38,13 @@ const (
 var scopeNames = map[Scope]string{
 	ScopeRequest:      "request",
 	ScopeConnection:   "connection",
-	ScopeGuestProgram: "guest-program",
 	ScopeGuestSession: "guest-session",
 	ScopePeerSession:  "peer-session",
 	ScopeInstance:     "instance",
 }
 
 // Scopes lists every named scope, narrowest first.
-var Scopes = []Scope{ScopeRequest, ScopeConnection, ScopeGuestProgram, ScopeGuestSession, ScopePeerSession, ScopeInstance}
+var Scopes = []Scope{ScopeRequest, ScopeConnection, ScopeGuestSession, ScopePeerSession, ScopeInstance}
 
 func (s Scope) String() string {
 	if n, ok := scopeNames[s]; ok {
@@ -74,7 +72,7 @@ func scopeList() []string {
 }
 
 // NeedsRelay reports whether the scope's key comes from the guest relay.
-func (s Scope) NeedsRelay() bool { return s == ScopeGuestProgram || s == ScopeGuestSession }
+func (s Scope) NeedsRelay() bool { return s == ScopeGuestSession }
 
 // width orders scopes for folding: unset counts as the widest.
 func (s Scope) width() Scope {
@@ -215,8 +213,6 @@ func who(s Scope, realm identity.Realm) string {
 	switch s {
 	case ScopeConnection:
 		return "on the same connection"
-	case ScopeGuestProgram:
-		return "by the same program in the same session" + in
 	case ScopeGuestSession:
 		return "by anything in the same session" + in
 	case ScopePeerSession:

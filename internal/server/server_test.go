@@ -221,7 +221,7 @@ func TestDeniedReadReturnsDenied(t *testing.T) {
 	c := dial(t, e.paths.ClientSocket("dev"))
 	err := c.Call(ctx(t), protocol.MethodSecretRead, protocol.SecretReadParams{Names: []string{"dev:github-pat"}}, nil)
 	pe := callErr(err)
-	if pe == nil || pe.Code != protocol.CodeDenied || pe.Data.RequestID == "" || pe.Data.EventSeq == 0 {
+	if pe == nil || pe.Code != protocol.CodeDenied || pe.Data.RequestID == "" {
 		t.Fatalf("got %v", err)
 	}
 }
@@ -713,8 +713,10 @@ func TestEveryRefusedRequestIsAudited(t *testing.T) {
 		}
 		var resp protocol.Response
 		json.Unmarshal(line, &resp)
-		if resp.Error == nil || resp.Error.Data == nil || resp.Error.Data.EventSeq == 0 {
-			t.Fatalf("%s: response has no audit seq: %s", tc.raw, line)
+		// The request id finds the audit record. The seq never goes out:
+		// every instance shares it.
+		if resp.Error == nil || resp.Error.Data == nil || resp.Error.Data.RequestID == "" || strings.Contains(string(line), "event_seq") {
+			t.Fatalf("%s: response has no request id, or carries the seq: %s", tc.raw, line)
 		}
 	}
 	// A notification gets no answer, but it is still recorded.
@@ -802,7 +804,7 @@ func TestGrantsOverTheSocket(t *testing.T) {
 	}
 	// A bad name is refused and audited like any invalid request.
 	err := c1.Call(ctx(t), protocol.MethodGrantsDrop, protocol.GrantsDropParams{Names: []string{"a b"}}, &dr)
-	if pe := callErr(err); pe == nil || pe.Code != protocol.CodeInvalidParams || pe.Data.EventSeq == 0 {
+	if pe := callErr(err); pe == nil || pe.Code != protocol.CodeInvalidParams || pe.Data.RequestID == "" {
 		t.Fatalf("got %v", err)
 	}
 

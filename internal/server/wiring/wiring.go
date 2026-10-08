@@ -238,7 +238,7 @@ func newCore(cfg *config.Config, paths config.Paths, auth plugin.Authenticator, 
 		}
 		secrets := static.NewVaults(vaults...)
 		inst := &core.Instance{
-			Name: ic.Name, Realm: ic.Realm, Vaults: ic.Vaults(),
+			Name: ic.Name, Realm: ic.Realm, Vaults: ic.Vaults(), GuestRelay: ic.GuestRelay,
 			Secrets: secrets,
 			Exposes: ic.Exposes,
 			Policy:  func(name string) policy.Policy { return cfg.SecretPolicy(ic, name) },

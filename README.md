@@ -106,7 +106,8 @@ services.foca = {
 };
 ```
 
-In a VM, `foca.nixosModules.guest` installs the client and sets `kernel.yama.ptrace_scope`.
+In a VM, `foca.nixosModules.guest` installs the client and sets `kernel.yama.ptrace_scope`;
+`services.foca-guest.relay.enable` adds the guest relay (below).
 On macOS (Apple silicon) the package is the release archive, installed as it is: its helper
 is signed and pinned into `foca`, so Nix must not strip or sign it again. Use `touchid` and
 `keychain` there.
@@ -188,6 +189,7 @@ foca run -e GH_TOKEN=dev:github-pat -- gh pr list
 | `foca actions` | anywhere | Actions you can run, with their parameters |
 | `foca exec <action> -p k=v` | anywhere | Run a host action and pass on its output and exit code |
 | `foca grants [--drop]` | anywhere | List or drop your reuse grants |
+| `foca relay serve` · `keygen` · `pubkey` | realm | The optional guest relay, as its own user (below) |
 
 Several secrets in one `get` or `run` take one approval. `get` won't write a secret to a
 terminal. `-f env` writes `NAME=value` lines for `docker run --env-file`, values taken raw;
@@ -296,8 +298,29 @@ vaults can hold the same name.
 
 Over a forwarded socket the host only sees `ssh`, so the program inside the VM is shown as
 a claim (`VM claims: gh via claude`). Run the optional guest relay inside the VM and the
-prompt names the program as verified by the VM's kernel, which also enables reuse scoped
-to one VM session or one program. See
+prompt names the process the VM's kernel reports (`let gh ⚠ use GitHub PAT in VM dev, via
+claude ⚠.`: the process is verified, its name is one it chose). It also enables reuse scoped to
+one terminal session in the VM (`scope = "guest-session"`) rather than the whole VM. That
+separates terminals only if what runs in one can't type into another: an agent running as your
+own user can drive your other tmux windows, so give it a user of its own.
+
+The relay runs as a user of its own, `foca`, and is the only process that can reach the
+forwarded socket. In the VM, `services.foca-guest.relay.enable = true` sets it up; then:
+
+```sh
+# in the VM: the key the relay made, for the host's config
+sudo -u foca foca relay pubkey --key-file /var/lib/foca-relay/relay.key
+# on the host: forward the socket to the relay's user
+ssh -N -R /var/lib/foca-relay/.foca.sock:$XDG_RUNTIME_DIR/foca/dev/client.sock foca@vm
+```
+
+```toml
+[instances.dev]
+realm       = { kind = "vm" }
+guest_relay = { public_key = "ed25519:…" }   # what foca relay pubkey printed
+```
+
+The instance then answers only its relay. Root in the VM can still impersonate it. See
 [design §14](docs/design.md#14-guest-verified-identity-the-guest-relay-optional).
 
 </details>

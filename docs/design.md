@@ -1,8 +1,8 @@
 # foca — design
 
-Status: **accepted**, and partly built (§17). This document is the specification foca is
-built to; a change to the code that changes the design updates it too. §16 lists the tests
-that hold each security property, and §17 what isn't built or verified yet.
+Status: **accepted**, and built. This document describes foca as it is; a change to the code
+that changes the design updates it too. §16 lists the tests that hold each security property,
+and §17 what isn't built or verified yet.
 
 foca is a small per-instance service, similar to `ssh-agent`. It hands credentials from a
 host (the owner's Mac) to processes and microVMs. Each access needs a deliberate user approval
@@ -203,10 +203,11 @@ type ApprovalResult struct {
   resource names and validated params. Example:
   `foca [dev]: read common:github-pat (via ssh forward)`. Callers can't supply a reason string,
   because a caller-chosen reason could put a reassuring lie on the prompt.
-- **The requesting process is shown on the prompt, labelled by trust level.** Only
-  `guest-verified:` comes from the optional guest relay (§14). `<Realm> claims:` (e.g. `VM claims:`) is the client's own,
-  unverified claim. Untrusted names are cut down to a short basename of ASCII letters, digits
-  and `._+-`, so they can't add words to the sentence. When the text is too long, they are
+- **The requesting process is shown on the prompt, placed by trust level.** A name the host
+  kernel or the optional guest relay (§14) verified is stated as fact; `<Realm> claims:` (e.g.
+  `VM claims:`) introduces the client's own, unverified claim. Untrusted names are cut down
+  to a short basename of ASCII letters, digits and `._+-`, so they can't add words to the
+  sentence. When the text is too long, they are
   dropped before any trusted field. `[approval] prompt_show_client = false`
   hides them. Exact wording: §4.1.1.
 - Implementations: `touchid` (helper), `polkit` (Linux, §4.1.2) and `fake` (test builds only,
@@ -235,14 +236,40 @@ To support this:
 
 - The CLI sends a short parent chain in `client`: up to 8 hops, each with exe, name, pid and
   start time.
-- For `run` it also sends the resolved target path and argv.
-- The relay reads the same chain from the VM kernel. For `run`, if the caller's exe hash
-  matches the genuine foca CLI, the relay treats that process's argv from
-  `/proc/<pid>/cmdline` as guest-verified too. That gives a verified target command for `run`.
+- For `run` it also sends `target`, the command it is about to exec: the resolved path and
+  the base name of argv[0], never the other arguments, which may hold anything. Neither
+  kernel can vouch for a process that hasn't started, so the target is only ever a claim:
+  with claimed identity it is `{program}`, ahead of the CLI's own chain, which gives
+  `{via}`. Verified identity (host or guest) keeps its verified names, which name the
+  program that called `foca run`.
+- The relay reads the same chain from the VM kernel, names only (§14): pids, start times and
+  `comm`, never an exe, so every guest-verified name is unsealed.
 
 **Names.** A process is named by its exe basename (falling back to `comm`). Nix wrapper names
 are unwrapped, so `.claude-wrapped` becomes `claude`; on a Nix system, `wrapProgram` would
 otherwise put that form into almost every prompt.
+
+A process whose name cleans to nothing (an exe called `@` in `/tmp`) is shown as `an unnamed
+program`, followed by `⚠` like any other name whose file isn't sealed. It is never skipped: an
+empty name is on no skip list, and skipping it would put its parent in its place. The phrase
+has spaces, which no sanitised name has, so no process can pass for it.
+
+**Credentials.** A secret is shown by its display name, or by its full name if it has none. A
+realm picks which secret it asks for, so no two secrets an instance can read are shown alike.
+A display name that another secret in the same vault also shows comes with the full name,
+`GitHub PAT (common:github-pat)`. An instance that reads several vaults shows every display
+name with its vault, `GitHub PAT (common)`: a request reads only the vaults it names, so the
+other vaults' names are never compared.
+
+Guest-verified names (§14) are `comm`, which the kernel cuts to 15 bytes. A name of the full 15
+bytes gets a trailing `…`, added by foca like the warning mark, so `git-credential-foca`
+shows as `git-credential-…` (a name exactly 15 bytes long gets it too). A Nix wrapper whose
+suffix was cut is still unwrapped: `.terraform-wrap` shows as `terraform`. A guest chain also
+ends at the leader of the caller's terminal session, the shell that owns the terminal: what
+runs the terminal (a tmux server, sshd, systemd) is never named. If every process left is
+skipped, as when you type `foca get` in a shell, that shell is named: `let zsh ⚠ use …` says
+the request came straight from a terminal. A leader is matched by pid and start time; if it
+isn't in the chain, the chain is kept whole and nothing is named in its place.
 
 **Sealed names.** The kernel vouches for the process, not for its file's name: anyone who can
 write a file can call it `gh`, and `comm` can be set to anything. So a verified name is stated
@@ -268,9 +295,17 @@ so a caller can't fake it or blur what it means. The mark is easy to overlook if
 it, so the docs for the approval prompt must explain it.
 
 - Rootless containers own their files, so their programs are never sealed. A rootful
-  container's image files can be.
-- `skip_ancestors` only skips sealed entries. An unsealed file called `env` or `foca` is
-  shown as the program, so a caller can't hide behind its parent.
+  container's image files can be, and so can any file its own root creates: a process
+  running as root in the container can write a root-owned `/usr/bin/gh`. In a direct
+  container realm, a sealed name is therefore only as trustworthy as the image and
+  whatever runs as root in it.
+- For host-verified names, `skip_ancestors` only skips sealed entries. An unsealed file
+  called `env` or `foca` is shown as the program, so a caller can't hide behind its parent.
+  Guest-verified and claimed names are all chosen by the process, so there it skips by name.
+- A name that repeats the program's isn't shown again as `{via}`: a program that runs
+  itself again (`herdr` under `herdr`) shows once, and the next name takes the slot. Only
+  an exact repeat counts, seal included, so an unsealed `gh` above a sealed one still
+  shows as `gh via gh ⚠`.
 - Client-reported data is never sealed, whatever it claims.
 
 **Templates.** These are fixed per operation. Untrusted slots are sanitised: the basename
@@ -280,11 +315,12 @@ dropped, so an exe called `gh use GitHub PAT. Then let aws` shows as
 
 | Case | Reason text (after "foca is trying to") |
 |---|---|
-| read, identity guest-verified | `let gh use GitHub PAT in VM dev, via claude.` |
+| read, identity guest-verified (names are always unsealed) | `let gh ⚠ use GitHub PAT in VM dev, via claude ⚠.` |
+| read, guest-verified, typed in a shell | `let zsh ⚠ use GitHub PAT in VM dev.` |
 | read, identity only claimed | `let a program use GitHub PAT in VM dev. VM claims: gh via claude.` |
 | `run`, identity only claimed | `let a program use npm token in VM dev. VM claims: npm via claude.` |
 | read, no identity at all | `let a program use GitHub PAT in VM dev.` |
-| action, guest-verified | `run "AWS credentials" with profile=dev-admin for aws in VM dev, via claude.` |
+| action, guest-verified | `run "AWS credentials" with profile=dev-admin for aws ⚠ in VM dev, via claude ⚠.` |
 | action using a secret, claimed | `run "List PRs" with repo=foca/foca (uses GitHub PAT) in VM dev. VM claims: gh via claude.` |
 | host-local client (host-verified) | `let gh use GitHub PAT, via claude.` |
 | host-verified, exe not sealed | `let gh ⚠ use GitHub PAT in container web, via conmon.` |
@@ -823,6 +859,10 @@ it (for example, `run` reporting the target command).
 | `action.run` `{name, params}` | **yes** | runs one host-declared action; `{exit_code, stdout, stdout_encoding, stderr_tail, stderr_encoding}` (§11) |
 | `grants.status` | no | caller's live reuse grants (none by default): the ones a request from this caller would reuse; not audited, since it changes nothing and returns no secret material; `foca grants` |
 | `grants.drop` `{names?}` | no | drop caller's grants, all or by name; tightening is always allowed; audited as `grants.drop`; `foca grants --drop` |
+| `relay.challenge`, `relay.hello` `{signature}` | no | the guest relay's handshake, only on an instance with `guest_relay` (§14) |
+
+Every request may also carry `guest_verified`, the caller as the guest relay read it (§14).
+Only a connection whose relay passed `relay.hello` may send it; anywhere else it is refused.
 
 Nothing on the socket changes state on the host. Management method names sent to it, such
 as `secret.add`, `vault.init` or `server.shutdown`, return `-32010 forbidden_on_socket` and
@@ -883,6 +923,7 @@ Client sockets sit in per-instance runtime directories, which are mode 0700.
 | -32008 | `param_rejected` | action parameter failed constraints |
 | -32010 | `forbidden_on_socket` | a management method sent to a socket; management is host CLI only |
 | -32011 | `protocol_unsupported` | the request's `min_protocol` is newer than the server |
+| -32012 | `relay_required` | the instance answers only its guest relay, the relay's handshake failed, or the relay broke its rules (§14) |
 
 `error.data` carries `{"name": "...", "request_id": "..."}`; the `request_id` finds the audit
 row. It never carries the event's `seq`: one log serves every instance, so a realm that saw seqs
@@ -1057,6 +1098,7 @@ keep_files        = 16             # rotated files kept, 1-1000
 # ---- instances: one per realm ----
 [instances.dev]
 realm   = { kind = "vm", name = "dev", peers = "opaque" }
+guest_relay = { public_key = "ed25519:…" }   # optional, §14: what foca relay keygen printed in the VM
 expose  = ["dev:*", "common:github-pat", "common:npm-token"]
 actions = ["aws-creds", "aws-sso-login"]
 
@@ -1219,7 +1261,10 @@ grants dropped) · `request.rejected`.
 with `reason` set to `forbidden_on_socket`, `parse_error`, `invalid_request` (including
 notifications), `method_not_found`, `invalid_params`, `protocol_unsupported`,
 `message_too_large`, `busy`, `rate_limited`, `too_many_running` (§11), `prompt_too_long`,
-`denial_backoff`, `prompt_cooldown`, or a connection-level reason (`too_many_connections`,
+`denial_backoff`, `prompt_cooldown`, no prompt shown (`auth_unavailable`, or `cancelled` while
+it waited, §9.6), the guest relay's (`relay_required`,
+`relay_hello_invalid`, `forged_guest_verified`, `guest_verified_missing`,
+`invalid_guest_verified`, `relay_multiplexed`, §14), or a connection-level reason (`too_many_connections`,
 `too_many_pipelined`, `connection_closed` for requests a client left queued when it hung up,
 and the identification refusals of §2.1). The method name a client sent is kept to
 method-name characters, at most 64 bytes. Bursts are coalesced (§9.6).
@@ -1231,7 +1276,7 @@ method-name characters, at most 64 bytes. Bursts are coalesced (§9.6).
 | Field group | Who fills it | Trusted for policy? | Shown in prompt |
 |---|---|---|---|
 | `peer.verified` | kernel (via peer identifier) | yes (uid check, session scope key) | yes |
-| `client.guest_verified` | guest relay, from the VM kernel (§14) | not yet (only to narrow, later) | yes, labelled "guest-verified:" |
+| `client.guest_verified` | guest relay, from the VM kernel (§14) | only for `guest-*` scope keys, on an instance with `guest_relay` | yes, in the sentence as a verified name |
 | `client.reported` | requesting client | **never** | yes, labelled "<Realm> claims:", sanitised |
 | `resource`, `params`, `instance` | host (resolved / validated) | yes | yes |
 
@@ -1290,8 +1335,8 @@ Each level holds one `Policy` value, or nothing at all.
 Policy  = Unset                              -- "no opinion" (table omitted)
         | EveryTime                          -- fresh approval for each access
         | Reuse{window: Duration, scope: Scope}
-Scope   = request < connection < guest-program < guest-session < peer-session < instance
-                                                                       (narrow → wide)
+Scope   = request < connection < guest-session < peer-session < instance
+                                                       (narrow → wide)
 ```
 
 A scope name says **who vouches for it**. No name means different things on different
@@ -1301,25 +1346,38 @@ transports without saying so.
 |---|---|---|---|
 | `request` | never; it covers this one request (a batch is one request) | — | — |
 | `connection` | the same socket connection | host kernel | — |
-| `guest-program` | same VM session **and** same requesting program (exe path + sha256) | VM kernel, via the relay | `guest_relay` (§14) |
 | `guest-session` | same VM terminal or ssh session (durable session walk inside the VM) | VM kernel, via the relay | `guest_relay` (§14) |
 | `peer-session` | same host-side session. **For a forwarded socket this is the whole VM**; for a host-local client it is one terminal session | host kernel | — |
 | `instance` | any caller of this instance | — | — (always capped by the code floor, §9.2) |
 
-**Scope safeguards.** These are the rules that keep the three VM-related levels (whole VM,
-VM session, VM session + program) from blurring:
+**What a guest session is.** The relay reads the caller's kernel session and climbs to the
+nearest ancestor session that has a controlling terminal, as on the host (§4.6). A process
+can't join a session it doesn't descend from, and the leader's start time is in the key, so a
+guest session is exactly one terminal (or ssh login) and what was started from it, agents
+included. It is not a boundary against code of the same VM user that can drive another
+terminal: `tmux send-keys`, `screen -X stuff`, a terminal emulator's remote control, or
+`TIOCSTI` where the kernel still allows it run a command in that terminal's session and
+reuse its grants. It separates terminals only when what runs in one can't type into another,
+for example an agent running as a user of its own.
+
+**Scope safeguards.** These are the rules that keep the two VM-related levels (whole VM, VM
+session) from blurring:
 
 1. **Scope keys contain verified data only.** Client-reported fields never go into a scope key.
    There is deliberately no scope built from client-reported session ids.
 2. **A scope is never silently widened.** Using `guest-*` on an instance without
    `guest_relay` is a **config error** at load time; it does not fall back to `peer-session`.
-   If the relay can't produce an identity for a request (process gone, `/proc` unreadable),
+   If the relay can't identify the caller at all (process gone, its `/proc` entry unreadable),
    the request is refused rather than handled under a wider scope.
 3. **A grant stores its exact key.** It records each component and who vouched for it, e.g.
-   `{instance: dev, peer_session: ssh:4711, guest_session: 780, guest_exe_sha256: …}`. A reuse
-   check compares every component; a missing component never counts as a match.
+   `{instance: dev, peer_session: sid:4690:…, guest_session: sid:780:…}`. A guest key keeps the host's peer session too, so a grant never
+   outlives the forwarded connection it was made on. A reuse check compares every component;
+   a missing component never counts as a match, and a guest pid the VM kernel didn't pin gives
+   no guest key at all.
 4. **Connections are never multiplexed.** The relay opens one upstream connection for each
    downstream connection, so `connection` scope means the same thing with or without it.
+   The host checks it too: a relayed connection that names a second caller is closed
+   (`relay_multiplexed`).
 5. **Callers can't choose a scope.** Scope comes only from host config, folded with "stricter
    wins". `grants.drop` is the only thing a caller can do to its grants.
 6. **The prompt states how far the approval reaches.** If approving creates a grant, the
@@ -1910,9 +1968,9 @@ and the upstream socket is mounted only into the relay's mount namespace or for 
  │  user dev:  gh / aws / agent ──► /run/foca/relay.sock (0666)          │
  │                                         │                             │
  │  user foca:  foca relay ◄───────────────┘  SO_PEERCRED (VM kernel)    │
- │        │   /proc/<pid>/exe + sha256, comm, start time, parent chain   │
+ │        │   /proc/<pid>/stat: comm, start time, session, parents       │
  │        ▼                                                              │
- │  /home/foca/.foca.sock  (0600, owner foca) ── ssh fwd ────────────────┼─► host
+ │  ~foca/.foca.sock  (0600, owner foca) ── ssh fwd ─────────────────────┼─► host
  └───────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -1921,49 +1979,97 @@ and the upstream socket is mounted only into the relay's mount namespace or for 
 - The ssh session that carries the `RemoteForward` logs in to the VM as a dedicated user,
   `foca`. `StreamLocalBindMask 0177` makes the forwarded socket owner-only, so processes
   running as `dev` can't connect to it directly.
-- `foca relay` runs as `foca` and listens on a socket that VM users *can* reach. For
+- `foca relay serve` runs as `foca` and listens on a socket that VM users *can* reach. For
   each connection it reads the caller's identity from the **VM kernel**:
-  - `SO_PEERCRED`: pid, uid, gid;
-  - `/proc/<pid>/exe` and its sha256;
-  - `comm`, start time, and the parent chain up to 8 hops.
-- The relay forwards each request upstream, replacing `params.client` with a
-  `guest_verified` identity. Anything the caller claims about itself is still passed along,
-  but stays in `client.reported`.
-- The host trusts `guest_verified` only if it arrives on an instance whose config says
-  `guest_relay = true`. With that setting, requests **without** `guest_verified` are refused.
-  This stops a connection that bypasses the relay from falling back to weaker identity.
+  - `SO_PEERCRED`: pid, uid, gid, and `SO_PEERPIDFD` to pin the process;
+  - `comm`, start time, the durable session (§4.6), and the parent chain up to 8 hops, from
+    `/proc/<pid>/stat`, which every user can read.
+
+  It reads no exe. Linux shows another user's `/proc/<pid>/exe` only to a process with
+  `CAP_SYS_PTRACE`, and with that capability whoever took over the relay's user could read
+  any process in the VM, so the relay doesn't hold it. Every name it reports is `comm`,
+  which a process sets itself: never sealed, so the prompt marks each one (§4.1.1), and the
+  skip list applies to them by name. A process that calls itself `bash` to be passed over
+  could as well call itself `gh`. The prompt ends the chain at the terminal's shell and marks
+  names the kernel cut (§4.1.1).
+- The relay opens one upstream connection per caller, with the caller's first request, and
+  proves itself on it (safeguard 1). It then forwards each request with the caller as
+  `params.guest_verified`, next to `params.client`. Anything the caller claims about itself
+  is still passed along, but stays in `client.reported`.
+- The host trusts `guest_verified` only on an instance whose config names the relay
+  (`guest_relay = { public_key = … }`), and only after `relay.hello`. On such an instance,
+  requests **without** `guest_verified` are refused. This stops a connection that bypasses
+  the relay from falling back to weaker identity.
 
 **Relay safeguards**
 
-1. **The relay proves itself to the host.** At setup, the relay generates an Ed25519 key pair,
-   kept 0600 by the `foca` VM user. Its public key goes into **host config**:
-   `guest_relay = { public_key = "ed25519:…" }`. Every upstream connection starts with
-   `relay.hello`, in which the relay signs a fresh server nonce, the instance name and the
-   connection id. Until that check passes, `guest_verified` data on the connection is not
-   accepted. So even if a `dev` process reaches the forwarded socket through a
-   misconfiguration (wrong login user, wrong bind mask), it can't pass itself off as the
-   relay.
-2. **Relay required means relay only.** On an instance with `guest_relay`, a connection
-   without a valid `relay.hello` is refused outright and audited as `request.rejected`
-   (`reason: relay_required`). It is not downgraded to `client.reported`.
+1. **The relay proves itself to the host.** `foca relay keygen` creates an Ed25519 key pair,
+   kept 0600 by the `foca` VM user, and prints the public key for **host config**:
+   `guest_relay = { public_key = "ed25519:…" }` (only on an opaque realm). Every upstream
+   connection starts with the handshake. The protocol has no server-to-client messages, so
+   it takes two calls: `relay.challenge` returns a fresh 32-byte nonce, the instance name and
+   the connection's id; `relay.hello` sends the relay's signature over
+   `"foca relay.hello v1\0" + instance + "\0" + connection + "\0" + nonce`. A nonce is used
+   once, pass or fail, and a connection gets one challenge. Until the check passes,
+   `guest_verified` data on the connection is not accepted. So even if a `dev` process
+   reaches the forwarded socket through a misconfiguration (wrong login user, wrong bind
+   mask), it can't pass itself off as the relay.
+2. **Relay required means relay only.** On an instance with `guest_relay`, any request
+   before a valid `relay.hello` is refused outright with `relay_required` and audited as
+   `request.rejected` (`reason: relay_required`, or `relay_hello_invalid` for a bad
+   signature or a misstep in the handshake), and the connection is closed. Input that isn't
+   a request at all (invalid JSON, a malformed envelope, a notification) is refused and
+   recorded as on any socket, and closes the connection too. It is not downgraded to
+   `client.reported`.
 3. **Forged fields are a hard error, never silently dropped.** The relay rejects any
-   downstream request that already contains `guest_verified`. It decodes requests with the
-   same strict rules as the host (§6) and re-encodes what it forwards; it never edits or scans
-   raw bytes. The host rejects
-   `guest_verified` on any connection that hasn't passed `relay.hello`.
+   downstream request that already contains `guest_verified`, in any spelling
+   `encoding/json` would fold to it (`Guest_Verified`, `gueſt_verified`), and calls of its
+   own handshake. It decodes requests with the same strict rules as the host (§6:
+   exact-case, unique keys, and the params of each method checked against the type the host
+   decodes them into, so an unknown key is refused here too) and re-encodes what it
+   forwards; it never edits or scans raw bytes. A method clients can't call (`secret.add`,
+   say) goes on without its params, for the host to refuse and record by name. A request
+   that would pass 1 MiB once the caller is added is refused with an answer, not cut off at
+   the host. The host rejects `guest_verified`, or a folded spelling of it, on any connection
+   that hasn't passed `relay.hello` (`forged_guest_verified`), and one it can't read
+   (`invalid_guest_verified`).
 4. **No pid reuse.** The relay identifies callers by pid **and** start time (pidfd where
-   available) and re-checks them just before forwarding. If the process has gone or changed,
-   the request is refused.
-5. **The relay checks its own setup.** At start it refuses to run unless:
-   - its upstream socket is owned by its own user with mode 0600;
-   - its key file is 0600;
-   - it isn't running as root.
+   available) and re-checks them just before forwarding each request. If the process has
+   gone or changed, the request is refused and the caller's connection closed. A pidfd is
+   checked by polling it, which needs no permission over another user's process.
+5. **The relay checks its own setup.** It refuses to run unless:
+   - it isn't running as root;
+   - its key file is a regular file of its own user that no one else can read;
+   - its upstream socket is a socket owned by its own user that no one else can reach. ssh
+     makes the socket again whenever the host reconnects, so this is checked before every
+     upstream connection too, and a relay may start before the socket exists;
+   - the directory of its listen socket can't be written by anyone else.
 
    The host can't check these from outside, so they are a convenience check. The signature
    in (1) is the real guard.
 6. **VM hardening.** The guest Nix module sets `kernel.yama.ptrace_scope = 1` or higher
    in the VM, so a `dev` process can't attach to a process in another session and borrow its
    grant.
+7. **The relay can't be used to crowd out others or hide.**
+   - It serves at most 8 callers of one uid and 32 in all (`--max-per-user`,
+     `--max-connections`, 1–1024); one more gets `busy` and is closed. A caller is counted
+     against the total before it is identified, so a flood costs only the accept. The
+     upstream connection is opened with a caller's first request, so connections that send
+     nothing don't take the host's `max_connections` (§9.6.1).
+   - A caller that sends no complete request for 2 min, the host's default `idle_timeout`,
+     is closed; the timeout is lifted while a request is in flight. When the host closes
+     the upstream connection (a reload, ssh reconnecting, its own idle timeout), the
+     caller's connection is closed too. A failing accept is retried after a pause, 5 ms
+     doubling up to 1 s.
+   - The host never sees what the relay refuses on its own (forged `guest_verified`, its
+     handshake's methods, malformed input, notifications, oversized or pipelined input, a
+     caller that has gone or can't be identified, the limits above), so the relay logs it as
+     a warning: the reason, and the caller's pid, uid and sanitised `comm`. As the host
+     coalesces such events (§9.6), each reason gets one line per 10 s; the next says how many
+     were left out, so a caller can't flood the journal.
+
+The relay is not made non-dumpable like `serve`: it runs as a user of its own, so the VM
+users it serves can't attach to it or read its memory or key anyway.
 
 **What it still doesn't cover:** root in the VM can read the relay key and impersonate it.
 `guest-*` scopes and `guest-verified` labels assume an uncompromised VM kernel and root, and the
@@ -1978,19 +2084,27 @@ prompt and docs say so.
 | `client.reported` | the client itself | nothing; it is informative only |
 
 Root in the VM can impersonate the relay, so `guest_verified` is **not** a boundary against a
-compromised guest. The prompt labels it accordingly, e.g.
-`guest-verified: /nix/store/…/bin/gh (pid 812)` vs `VM claims: gh`.
+compromised guest. The prompt puts a guest-verified name in the sentence with the unsealed
+mark, `let gh ⚠ use …`: the VM kernel vouches for the process, but the process chose the
+name. A claim only gets a trailing `VM claims: gh` (§4.1.1). The audit log keeps the two in
+`client.guest_verified` and `client.reported`.
 
-**Reuse scopes.** The relay makes `guest-session` and `guest-program` available (§9.1). On an
-instance with the relay, they are the recommended reuse scopes. Without the relay, reuse on a
+**Reuse scopes.** The relay makes `guest-session` available (§9.1): one terminal session in
+the VM rather than all of it, with the limit §9.1 states about terminals the same user can
+drive. On an instance with the relay, it is the recommended reuse scope. Without the relay, reuse on a
 forwarded socket can only be `peer-session`, which means the whole VM, and the prompt says so.
 
 **Possible later use.** Policy could also *narrow* on guest-verified identity. For example,
-allow `github-pat` only to an exe whose hash is in an allowlist. That would be an extra
+allow `github-pat` only to a given uid in the VM. That would be an extra
 condition on top of approval, never a replacement for it. It is not designed yet.
 
-**Prerequisites.** The guest Nix module creates the `foca` VM user, the ssh match block
-and the relay service.
+**Setup.** The guest Nix module (`services.foca-guest.relay`) creates the `foca` VM user, the
+sshd match block and the relay service, makes the key on first start and points `FOCA_SOCK`
+at the relay. The service runs sandboxed: no capabilities, no network but Unix sockets, a
+system-call filter, a read-only system but for its home and `/run/foca`. It keeps a full
+view of `/proc`, which it needs to identify callers. The host forwards with
+`ssh -N -R ~foca/.foca.sock:<client.sock> foca@vm`, and names the key `foca relay pubkey`
+prints in the instance's `guest_relay`.
 
 ---
 
@@ -1999,7 +2113,8 @@ and the relay service.
 ```
 cmd/foca/            main: runs internal/cli (serve and every CLI subcommand)
 internal/protocol/        wire contract shared by both sides: JSON-RPC framing, method types, error codes
-internal/client/          protocol client (CLI, tests, later the relay); must not import service-side code
+internal/client/          protocol client (CLI, tests, the relay); must not import service-side code
+internal/relay/           the guest relay (§14): caller identity, handshake, strict rewrite, setup checks
 internal/cli/             CLI commands
 internal/server/          listeners, per-connection identification, method dispatch
 internal/server/core/     request → approval → audit pipeline, prompt text, prompt queue,
@@ -2021,7 +2136,7 @@ internal/audit/           event types (v1), sinks (memory, rotating jsonl), the 
 internal/config/          TOML load and validation, paths
 internal/identity/        host-verified, guest-verified and reported identity, one distinct type each
 internal/fsutil/          trusted-file and private-directory checks, atomic writes, file locks
-internal/svcctl/          serve.pid and verified signalling for reload / stop
+internal/svcctl/          serve.pid, the instance lock, and verified signalling for reload / stop
 internal/ids/             sortable ids
 internal/format/          output formatters: raw, json, env
 helpers/darwin/           Swift package: foca-darwin
@@ -2029,9 +2144,9 @@ scripts/                  build-darwin.sh (signed helper, pinned into foca), bui
 .github/workflows/        test (every push and pull request), release (tip from main, v* tags, then the
                           macOS Nix pin on main)
 nix/                      the Linux package, the macOS package (the release archive, installed unchanged),
-                          NixOS modules (host: polkit action and TPM access; guest: ptrace hardening),
-                          the home-manager module (config, and systemd user units on Linux or launchd
-                          agents on macOS), and the flake checks that evaluate them
+                          NixOS modules (host: polkit action and TPM access; guest: ptrace hardening and
+                          the relay), the home-manager module (config, and systemd user units on Linux or
+                          launchd agents on macOS), and the flake checks that evaluate them
 flake.nix                 dev shell (go, gopls, socat; dbus for the logind and polkit tests; bubblewrap and
                           FOCA_POLKITD to run the real polkitd in tests; swtpm and FOCA_SWTPM for the
                           TPM tests; gcc only for `go test -race`); the package, the modules and
@@ -2075,7 +2190,7 @@ noted; packages are named as in `go test` output (`main` is `cmd/foca`, whose te
 | management methods refused and audited; only `client.sock` exists, 0600 in 0700 | `server.TestManagementMethodsRefusedAndAudited`, `server.TestSocketAndDirectoryModes` |
 | uid mismatch, wrong kind of peer, and every other refusal audited | `server.TestUIDMismatchIsRefusedAndAudited`, `server.TestNonProxyPeerRefusedOnOpaqueRealm`, `server.TestProxyPeerRefusedOnDirectRealm`, `server.TestEveryRefusedRequestIsAudited` |
 | verified, guest-verified and reported identity kept apart | `audit.TestVerifiedAndReportedStaySeparateOnTheWire`, `core.TestIdentityLevelsHaveDistinctTypes` |
-| prompts: claims never stated as fact, unsealed names marked, no name elided | `core.TestPromptWording`, `core.TestPromptNeverElidesCredentials`, `core.TestOversizedBatchRefusedBeforePrompting`, `peer.TestMountsCantLendASealedName`, `peer.TestLoadedCodeMustBeSealedToo` |
+| prompts: claims never stated as fact, unsealed names marked (never dropped as a repeat), no name elided | `core.TestPromptWording`, `core.TestPromptNeverElidesCredentials`, `core.TestOversizedBatchRefusedBeforePrompting`, `peer.TestMountsCantLendASealedName`, `peer.TestLoadedCodeMustBeSealedToo` |
 | a realm can't exhaust the service or flood the log | `server.TestConnectionCapPerInstance`, `core.TestReadsAndListsAreRateLimited`, `core.TestUnapprovedEventsAreCoalesced`, `core.TestTooManyRunningIsBusy` |
 | config rejections and file trust | `config.TestRejections`, `config.TestPolicyRejections`, `config.TestLoadChecksFileTrust` |
 | test-only plugins unreachable in a production build | `wiring.TestFakeAuthenticatorRefusedInProductionBuild`, `wiring.TestFileProtectorRefusedInProductionBuild`, `cli.TestProductionBuildLinksNoTestCode`, `cli.TestServiceDoesNotImportCLIUI` |
@@ -2092,7 +2207,7 @@ noted; packages are named as in `go test` output (`main` is `cmd/foca`, whose te
 | `--only` never splits a vault; one process per instance | `config.TestOnlyNeverSplitsAVault`, `main.TestBinaryOneProcessPerInstanceGroup`, `main.TestBinaryServesStartedTogetherRefuseAllButOne` |
 | **Policy, grants and wipes** | |
 | lattice laws; no setting loosens; the 8 h cap | `policy.TestLatticeLaws`, `policy.TestEffectiveNeverLoosens`, `policy.TestLooseningAttempts`, `core.TestEightHourCap` |
-| a grant key that differs in any component never reuses | `core.TestGrantKeyMismatchNeverReuses` |
+| a grant key that differs in any component never reuses | `core.TestGrantKeyMismatchNeverReuses`, `core.TestGuestSessionReusesOnlyOnItsWholeKey` |
 | sleep-jump watchdog; a missed sleep caught before reuse | `core.TestSleepJumpWatchdog`, `core.TestMissedSleepIsCaughtBeforeReuse` |
 | wipe on every event kind; a wipe during a prompt makes no grant | `core.TestWipeOnEveryEventKind`, `logind.TestLogindReportsEveryEventKind`, `core.TestWipeDuringPromptCreatesNoGrant` |
 | unhealthy or no events → every-time; only logind's signals count | `core.TestUnhealthyEventsMeanEveryTime`, `core.TestNoEventsSourceMeansEveryTime`, `logind.TestLogindIgnoresSignalsFromOthers`, `sysbus.TestSystemBusMustBeServedByRoot` |
@@ -2116,12 +2231,12 @@ noted; packages are named as in `go test` output (`main` is `cmd/foca`, whose te
 | backfill + live with no gaps, across writers and rotations | `audit.TestFollowBackfillsThenStreamsWithoutGap`, `audit.TestLogFollowSeesEveryWriterAcrossRotations`, `audit.TestLogFollowRefusesAGapLeftByRemovedFiles`, `audit.TestJSONLSeqUniqueAcrossProcesses` |
 | recorded names can't act on the terminal | `cli.TestEventsPrintNonPrintingRunesEscaped` |
 | **Guest relay** | |
-| bad or missing `relay.hello` refused | — |
-| forged `guest_verified` rejected on both sides | — |
-| no multiplexing | — |
-| pid reuse and exited callers refused | — |
-| the relay refuses an insecure setup | — |
-| reported fields can't overwrite guest-verified ones | — |
+| bad or missing `relay.hello` refused | `server.TestRequestWithoutRelayHelloRefused`, `server.TestBadRelayHelloRefused`, `server.TestRelayOnlyInstanceClosesOnAnyRefusalBeforeHello`, `main.TestBinaryGuestRelay` |
+| forged `guest_verified` rejected on both sides | `server.TestForgedGuestVerifiedRefusedByTheHost`, `server.TestGuestVerifiedVariantsAreRecordedAsForged`, `relay.TestRewriteRefusesForgedOrAmbiguousRequests`, `relay.TestRelayRefusesForgedGuestVerified` |
+| no multiplexing | `relay.TestRelayNeverMultiplexes`, `server.TestRelayedRequestsNeedOneGuestPerConnection` |
+| pid reuse and exited callers refused | `peer.TestCheckRefusesAnExitedCaller`, `peer.TestCheckRefusesAReusedPID`, `relay.TestRelayRefusesACallerThatIsGone` |
+| the relay refuses an insecure setup | `relay.TestRelayRefusesInsecureSetup`, `relay.TestKeygenAndLoadKey` |
+| reported fields can't overwrite guest-verified ones | `server.TestReportedFieldsCantOverwriteGuestVerified` |
 
 The real-polkitd tests need `FOCA_POLKITD` and bubblewrap, and the TPM tests `FOCA_SWTPM`;
 without them they skip (the dev shell and CI set both). The Nix modules are checked by
@@ -2133,10 +2248,10 @@ without them they skip (the dev shell and CI set both). The Nix modules are chec
 
 **Not built**
 
-- The guest relay, guest-verified identity and the `guest-*` scopes, which are a config
-  error until then.
 - `foca reset` and its `vault.reset` event; `[approval] list_requires_approval` (D16); a
   custom `--format`; the `secure-enclave`, `libsecret` and `keyring` key protectors.
+- A relay module or recipe for containers (§2.1), and narrowing policy on guest identity
+  (§14).
 - macOS container runtimes' proxies in the default `opaque_peers` (§2.1).
 - A hash chain over the audit log; retention is by file count only. `foca events follow`
   polls every 200 ms, and only `--after-seq` skips rotated files, so a query by time reads
@@ -2159,7 +2274,8 @@ without them they skip (the dev shell and CI set both). The Nix modules are chec
   the action file). Over ssh the host CLI has no agent and gets `auth_unavailable`, unless
   the user runs `pkttyagent`.
 - A hardware TPM, and PCR 7 across a real firmware update; the tests use swtpm.
-- The NixOS modules in a booted VM (`pkgs.testers.runNixOSTest` needs KVM).
+- The NixOS modules in a booted VM (`pkgs.testers.runNixOSTest` needs KVM), and the relay
+  behind a real ssh forward.
 - The macOS package and the home-manager launchd agents on a Mac: the flake checks evaluate the
   agents on Linux, but neither has run on a Mac. The package also needs a published release
   pinned in `nix/darwin-release.nix`.
@@ -2183,10 +2299,9 @@ Decided in the design review:
    Guest-verified identity comes from the optional guest relay.
 5. **Host-side use:** part of the command provider, not a new provider (§11.1).
 
-6. **Narrowing reuse inside a VM:** there are three explicitly named scopes:
+6. **Narrowing reuse inside a VM:** there are two explicitly named scopes:
    - `peer-session`: the whole VM, verified by the host;
-   - `guest-session`: the same VM session, verified by the relay;
-   - `guest-program`: the same VM session and the same program, verified by the relay.
+   - `guest-session`: the same VM session, verified by the relay.
 
    Scopes are never built from client-reported data, and a scope is never silently widened.
    See the safeguards in §9.1 and §14.

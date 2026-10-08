@@ -6,6 +6,8 @@
 package identity
 
 import (
+	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"unicode"
@@ -113,20 +115,59 @@ type Target struct {
 }
 
 // GuestInfo is a caller's identity as read from a realm's own kernel by the
-// guest relay. It is a separate type from ClientInfo, with no
+// guest relay (design §14). It is a separate type from ClientInfo, with no
 // conversion helpers, so a client's claim can never be stored as guest
 // verified by accident: the assignment doesn't compile.
+//
+// It carries no exe: the relay runs as its own user, and Linux shows another
+// user's /proc/<pid>/exe only to a process with CAP_SYS_PTRACE, which the
+// relay doesn't hold. Names are comm, which a process sets itself, so no
+// name here is ever sealed.
 type GuestInfo struct {
+	Source    string `json:"source,omitempty"`
 	PID       int    `json:"pid"`
 	StartTime uint64 `json:"start_time,omitempty"`
 	UID       int    `json:"uid"`
-	Exe       string `json:"exe,omitempty"`
-	ExeSHA256 string `json:"exe_sha256,omitempty"`
-	ExeSealed bool   `json:"exe_sealed"`
+	GID       int    `json:"gid"`
+	// PIDStable: the VM kernel pinned the process (a pidfd), as for
+	// VerifiedPeer. Without it no guest-* scope applies.
+	PIDStable bool   `json:"pid_stable"`
 	Name      string `json:"name,omitempty"`
 	Session   string `json:"session,omitempty"`
-	// Parents is the ancestor chain, nearest first, as the relay read it.
+	// Parents is the ancestor chain, nearest first, as the relay read it:
+	// pids, start times and names only.
 	Parents []Proc `json:"parents,omitempty"`
+}
+
+// Clean returns a copy with control characters removed and sizes bounded,
+// as for ClientInfo, or an error if it can't describe a process or claims
+// more than the relay can read.
+func (g GuestInfo) Clean() (GuestInfo, error) {
+	if g.PID <= 0 {
+		return g, errors.New("guest_verified: pid must be positive")
+	}
+	if g.UID < 0 || g.GID < 0 {
+		return g, errors.New("guest_verified: uid and gid must not be negative")
+	}
+	if len(g.Parents) > MaxClientParents {
+		return g, fmt.Errorf("guest_verified: at most %d parents", MaxClientParents)
+	}
+	g.Source = cleanString(g.Source, MaxClientString)
+	g.Name = cleanString(g.Name, MaxClientString)
+	g.Session = cleanString(g.Session, MaxClientString)
+	parents := make([]Proc, len(g.Parents))
+	for i, p := range g.Parents {
+		if p.Exe != "" || p.Sealed {
+			return g, errors.New("guest_verified: the relay reads no exe, so a parent can't have one or be sealed")
+		}
+		p.Name = cleanString(p.Name, MaxClientString)
+		parents[i] = p
+	}
+	if len(parents) == 0 {
+		parents = nil
+	}
+	g.Parents = parents
+	return g, nil
 }
 
 // Limits applied to client-reported data before it is stored anywhere.

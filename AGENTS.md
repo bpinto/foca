@@ -29,7 +29,9 @@ The human overview is [README.md](README.md); the full specification is
 In order: `--socket PATH`, `$FOCA_SOCK`, `--instance NAME` / `$FOCA_INSTANCE` (host only:
 that instance's socket in the runtime directory), `~/.foca.sock` (the usual forwarded
 socket in a realm), then the only instance in the host config. "service not running (no
-socket at …)" means none of these is listening.
+socket at …)" means none of these is listening. In a realm with the guest relay, `FOCA_SOCK`
+points at the relay's socket (`/run/foca/relay.sock`); the forwarded one answers only the
+relay (`relay_required`).
 
 ## Discovering what you may use
 
@@ -106,25 +108,28 @@ The CLI prints `foca: <name>: <message>` on stderr and exits 1 (2 for a usage er
 | `not_initialized` | -32003 | the vault hasn't been created | the user runs `foca init` on the host |
 | `auth_unavailable` | -32004 | no prompt can be shown (no GUI session, no Touch ID, no polkit agent) | ask the user |
 | `timeout` | -32005 | nobody answered the prompt, or the action timed out | ask the user before trying again |
-| `busy` | -32006 | too many prompts queued, too many requests (30, then 5/s), or 4 actions already running | wait a few seconds |
+| `busy` | -32006 | too many prompts queued, too many requests (30, then 5/s), 4 actions already running, or too many connections to the guest relay (8 per user by default) | wait a few seconds |
 | `audit_failed` | -32007 | the host couldn't record the request, so it refused | tell the user |
 | `param_rejected` | -32008 | an action param is unknown, missing or fails its check | fix the params; see `foca actions` |
 | `forbidden_on_socket` | -32010 | a host-only operation (add, init, …) | only the user can do this, on the host |
 | `protocol_unsupported` | -32011 | the client needs a newer server | update foca on the host |
-| `invalid_params` | -32602 | malformed request, or names that don't fit one prompt | split or fix the request |
+| `relay_required` | -32012 | this socket answers only the realm's guest relay | use the relay's socket (`$FOCA_SOCK`) |
+| `invalid_params` | -32602 | malformed request, names that don't fit one prompt, or values that don't fit one answer (1 MiB) | split or fix the request |
 
 ## Talking to the socket directly
 
 Newline-delimited JSON-RPC 2.0 over the Unix socket; messages at most 1 MiB; keys
-snake_case, case-sensitive, unique; unknown fields are refused. Requests run in order, at
+snake_case, case-sensitive, unique; unknown fields are refused. An `id` is a string or an
+integer, at most 64 bytes; a request without one gets no answer. Requests run in order, at
 most 4 waiting per connection. Every request may carry `min_protocol` and `client` (your
-own, unverified description of yourself).
+own, unverified description of yourself). `guest_verified` is the guest relay's alone: a
+request that carries it is refused.
 
 | Method | Params | Result |
 |---|---|---|
 | `server.hello` | `{protocol: 1}` | `{protocol, instance, realm, server_version, features}` |
 | `secret.list` | `{}` | `{secrets: [{name, display_name?, description?}]}` |
-| `secret.read` | `{names: [...]}` | `{secrets: [{name, value, encoding: "utf8"\|"base64"}]}` |
+| `secret.read` | `{names: [...]}` | `{secrets: [{name, value, encoding: "utf8"\|"base64"}]}` (base64 for non-UTF-8 values, or when shorter) |
 | `action.list` | `{}` | `{actions: [{name, description?, params: [{name, description?, allowed?, pattern?, allow_leading_dash?}]}]}` |
 | `action.run` | `{name, params?: {k: v}}` | `{exit_code, stdout?, stdout_encoding?, stderr_tail?, stderr_encoding?}` |
 | `grants.status` | `{}` | `{grants: [{name, kind, params?, scope, approval_id, expires_at}]}` |
@@ -170,6 +175,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"secret.list","params":{}}' \
 cmd/foca/                 main: runs internal/cli
 internal/protocol/        wire types, JSON-RPC framing, strict decoding, error codes
 internal/client/          socket client; imports no service code
+internal/relay/           the guest relay (foca relay): caller identity, handshake, strict rewrite
 internal/cli/             every command (kong; huh for interactive forms)
 internal/server/          sockets, peer admission, dispatch (conn.go)
 internal/server/core/     the pipeline: resolve → policy → grants → prompt → audit → serve
@@ -187,8 +193,8 @@ internal/identity/        verified, guest and reported identity types
 internal/fsutil/          trusted-file checks, private dirs, atomic writes, locks
 internal/svcctl/          serve.pid, the instance lock, and verified signalling (reload, lock, stop)
 helpers/darwin/           foca-darwin (Swift): Touch ID, Keychain, sleep and lock events
-nix/                      packages (Linux from source, macOS the release archive), NixOS modules (host,
-                          guest), home-manager module (systemd or launchd), flake checks
+nix/                      packages (Linux from source, macOS the release archive), NixOS modules (host, guest
+                          with the relay), home-manager module (systemd or launchd), flake checks
 ```
 
 ## Build and test

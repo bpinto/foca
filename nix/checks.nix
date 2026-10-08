@@ -18,6 +18,13 @@ let
     boot.kernel.sysctl = sysctl;
   }).config;
 
+  relayed = (pkgs.nixos {
+    imports = [ self.nixosModules.guest ];
+    services.foca-guest = { enable = true; relay = { enable = true; authorizedKeys = [ "ssh-ed25519 AAAA host" ]; }; };
+    services.openssh.enable = true;
+  }).config;
+  relayUnit = relayed.systemd.services.foca-relay.serviceConfig;
+
   homeOn = pkgs: module: (home-manager.lib.homeManagerConfiguration {
     inherit pkgs;
     modules = [ self.homeManagerModules.default module ];
@@ -48,7 +55,12 @@ let
     plugins = { authenticator = "polkit"; key_protector = "tpm"; };
     vaults.common = { };
     instances = {
-      dev = { realm.kind = "vm"; expose = [ "dev:*" "common:github-pat" ]; };
+      dev = {
+        realm.kind = "vm";
+        expose = [ "dev:*" "common:github-pat" ];
+        guest_relay.public_key = "ed25519:11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=";
+        policy = { approval = "reuse"; window = "15m"; scope = "guest-session"; };
+      };
       work = { realm.kind = "vm"; expose = [ "common:*" ]; };
       web = { realm = { kind = "container"; peers = "direct"; }; };
     };
@@ -78,6 +90,23 @@ in
     assert !failed (guest { "kernel.yama.ptrace_scope" = 2; }).assertions;
     assert failed (guest { "kernel.yama.ptrace_scope" = 0; }).assertions;
     pkgs.runCommand "foca-check-nixos-guest" { } "touch $out";
+
+  # The relay: its own user, a forward only it can reach, no capabilities,
+  # and the VM's processes pointed at its socket.
+  nixos-guest-relay =
+    assert relayed.users.users.foca.isSystemUser && relayed.users.users.foca.homeMode == "700";
+    assert relayed.users.users.foca.openssh.authorizedKeys.keys == [ "ssh-ed25519 AAAA host" ];
+    assert lib.hasInfix "Match User foca" relayed.services.openssh.extraConfig;
+    assert lib.hasInfix "StreamLocalBindMask 0177" relayed.services.openssh.extraConfig;
+    assert relayUnit.User == "foca" && relayUnit.CapabilityBoundingSet == "" && !(relayUnit ? AmbientCapabilities);
+    assert lib.hasInfix "relay serve --listen /run/foca/relay.sock --upstream /var/lib/foca-relay/.foca.sock" relayUnit.ExecStart;
+    assert lib.hasInfix "--max-connections 32 --max-per-user 8" relayUnit.ExecStart;
+    # Sandboxed, but still seeing every caller in /proc.
+    assert relayUnit.PrivateNetwork && relayUnit.RestrictAddressFamilies == [ "AF_UNIX" ] && relayUnit.UMask == "0077";
+    assert relayUnit.SystemCallFilter == [ "@system-service" ] && relayUnit.MemoryDenyWriteExecute;
+    assert !(relayUnit ? ProtectProc) && !(relayUnit ? ProcSubset) && !(relayUnit ? PrivateUsers) && !(relayUnit ? ProtectHome);
+    assert relayed.environment.variables.FOCA_SOCK == "/run/foca/relay.sock";
+    pkgs.runCommand "foca-check-nixos-guest-relay" { } "touch $out";
 
   # The config is foca's, checked by foca; one service per process group.
   home-manager =

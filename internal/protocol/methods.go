@@ -1,9 +1,13 @@
 package protocol
 
 import (
+	"bytes"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -26,6 +30,10 @@ const (
 type Common struct {
 	MinProtocol int                  `json:"min_protocol,omitempty"`
 	Client      *identity.ClientInfo `json:"client,omitempty"`
+	// GuestVerified is the caller as the guest relay read it from the
+	// realm's kernel (design §14). Only a connection that passed relay.hello
+	// may carry it, and on an instance with a relay every request must.
+	GuestVerified *identity.GuestInfo `json:"guest_verified,omitempty"`
 }
 
 func (c Common) Base() Common { return c }
@@ -260,4 +268,51 @@ func ActionRunLen(exitCode int, stdout, stderrTail []byte) int {
 		return MaxMessage + 1
 	}
 	return len(b) + n
+}
+
+// GuestKey reports whether params name guest_verified as a key of their
+// own: exactly, or in a spelling encoding/json would fold to it
+// (Guest_Verified, gueſt_verified). Strict decoding refuses a variant as an
+// unknown key; this tells a forgery from any other unknown key.
+func GuestKey(params json.RawMessage) (exact, variant bool) {
+	var m map[string]json.RawMessage
+	if json.Unmarshal(params, &m) != nil {
+		return false, false
+	}
+	for k := range m {
+		switch {
+		case k == guestKey:
+			exact = true
+		case strings.EqualFold(k, guestKey):
+			variant = true
+		}
+	}
+	return exact, variant
+}
+
+const guestKey = "guest_verified"
+
+var paramsTypes = map[string]reflect.Type{
+	MethodHello:        reflect.TypeOf(HelloParams{}),
+	MethodSecretList:   reflect.TypeOf(SecretListParams{}),
+	MethodSecretRead:   reflect.TypeOf(SecretReadParams{}),
+	MethodGrantsStatus: reflect.TypeOf(GrantsStatusParams{}),
+	MethodGrantsDrop:   reflect.TypeOf(GrantsDropParams{}),
+	MethodActionList:   reflect.TypeOf(ActionListParams{}),
+	MethodActionRun:    reflect.TypeOf(ActionRunParams{}),
+}
+
+// CheckParams applies the host's strict check to the params of a client
+// method, so that a relay refuses what the host would and can't be told
+// apart from it by input another parser reads differently. ok is false for
+// a method clients can't call.
+func CheckParams(method string, raw json.RawMessage) (ok bool, err error) {
+	t, ok := paramsTypes[method]
+	if !ok {
+		return false, nil
+	}
+	if len(bytes.TrimSpace(raw)) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return true, nil
+	}
+	return true, CheckStrict(raw, t)
 }

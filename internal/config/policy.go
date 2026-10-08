@@ -54,17 +54,19 @@ func parsePolicy(r *rawPolicy) (policy.Policy, error) {
 
 // checkGuestScopes refuses guest-* scopes on instances without the guest
 // relay. Such a scope is never widened to peer-session in its place (design
-// §9.1, safeguard 2). The relay isn't built yet, so no instance
-// has one and every guest-* scope is an error.
+// §9.1, safeguard 2). A level that applies to several instances needs the
+// relay on every one of them.
 func (c *Config) checkGuestScopes() []error {
 	var errs []error
 	check := func(where string, p policy.Policy, applies []Instance) {
 		if p.Kind != policy.Reuse || !p.Scope.NeedsRelay() {
 			return
 		}
-		names := make([]string, len(applies))
-		for i, inst := range applies {
-			names[i] = inst.Name
+		var names []string
+		for _, inst := range applies {
+			if inst.GuestRelay == nil {
+				names = append(names, inst.Name)
+			}
 		}
 		if len(names) == 0 {
 			return

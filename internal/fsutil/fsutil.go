@@ -171,3 +171,21 @@ func ensurePrivateDir(dir string) error {
 	}
 	return nil
 }
+
+// CheckTrustedDir checks that dir and every directory on the way to it,
+// including those reached through a symlink, are owned by the current user
+// or root and not writable by group or others (sticky ones like /tmp
+// excepted; see walk), so no one else can replace what is in it.
+func CheckTrustedDir(dir string) error {
+	if !filepath.IsAbs(dir) {
+		return fmt.Errorf("%s: path must be absolute", dir)
+	}
+	resolved, fi, err := walk(dir)
+	if err != nil {
+		return err
+	}
+	if !fi.IsDir() {
+		return fmt.Errorf("%s: not a directory", resolved)
+	}
+	return nil
+}
