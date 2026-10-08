@@ -273,3 +273,90 @@ func TestMissingVaultIsNotInitialized(t *testing.T) {
 		t.Fatal("prompted for a vault that doesn't exist")
 	}
 }
+
+// Recovery names every realm of the vault and the protector, records what it
+// replaced, and is undone if it can't be recorded.
+func TestRecoverVaultNamesItsUsersAndUndoesUnrecorded(t *testing.T) {
+	v := newSharedVault(t)
+	ctx := context.Background()
+	resealed, undone := 0, 0
+	reseal := func(context.Context) ([]string, func(context.Context) error, error) {
+		resealed++
+		return []string{"tpm"}, func(context.Context) error { undone++; return nil }, nil
+	}
+	if err := v.svc.RecoverVault(ctx, v.call, "common", "tpm", reseal); err != nil {
+		t.Fatal(err)
+	}
+	if got := v.lastPrompt(); got != "seal vault common's key again with tpm using its recovery key, for VM dev and VM work." {
+		t.Fatalf("prompt %q", got)
+	}
+	e := v.lastEvent(audit.TypeVaultRecover)
+	if e.Outcome != audit.OutcomeOK || e.Vault != "common" || e.Params["protector"] != "tpm" || e.Params["replaced"] != "tpm" || e.Params["used_by"] != "dev,work" {
+		t.Fatalf("event %+v", e)
+	}
+
+	v.auth.Default = fake.Deny
+	if err := v.svc.RecoverVault(ctx, v.call, "common", "tpm", reseal); code(err) != protocol.CodeDenied || resealed != 1 {
+		t.Fatalf("denied recover: %v, resealed %d", err, resealed)
+	}
+	v.auth.Default = fake.Approve
+	v.sink.set(audit.TypeVaultRecover)
+	if err := v.svc.RecoverVault(ctx, v.call, "common", "tpm", reseal); code(err) != protocol.CodeAuditFailed || undone != 1 {
+		t.Fatalf("unrecorded recover: %v, undone %d", err, undone)
+	}
+	v.sink.set("")
+	failing := func(context.Context) ([]string, func(context.Context) error, error) {
+		return nil, nil, errors.New("no TPM")
+	}
+	if err := v.svc.RecoverVault(ctx, v.call, "common", "tpm", failing); code(err) != protocol.CodeInternal {
+		t.Fatalf("failed reseal: %v", err)
+	}
+	if e := v.lastEvent(audit.TypeVaultRecover); e.Outcome != audit.OutcomeError || !strings.Contains(e.Error.Message, "no TPM") {
+		t.Fatalf("failed reseal not audited: %+v", e)
+	}
+}
+
+// A rekey names every realm of the vault and the protector, records the old
+// and new vault ids, and is undone if it can't be recorded.
+func TestRekeyVaultNamesItsUsersAndUndoesUnrecorded(t *testing.T) {
+	v := newSharedVault(t)
+	ctx := context.Background()
+	rekeyed, undone := 0, 0
+	rekey := func(context.Context) (Rekeyed, func(context.Context) error, error) {
+		rekeyed++
+		return Rekeyed{OldVaultID: "01OLD", VaultID: "01NEW", Replaced: []string{"tpm"}, Recovery: true},
+			func(context.Context) error { undone++; return nil }, nil
+	}
+	if err := v.svc.RekeyVault(ctx, v.call, "common", "tpm", rekey); err != nil {
+		t.Fatal(err)
+	}
+	if got := v.lastPrompt(); got != "encrypt vault common again under a new key, sealed with tpm, for VM dev and VM work." {
+		t.Fatalf("prompt %q", got)
+	}
+	e := v.lastEvent(audit.TypeVaultRekey)
+	if e.Outcome != audit.OutcomeOK || e.Vault != "common" || e.Approval == nil || e.Params["protector"] != "tpm" ||
+		e.Params["old_vault_id"] != "01OLD" || e.Params["vault_id"] != "01NEW" || e.Params["replaced"] != "tpm" ||
+		e.Params["recovery_key"] != "true" || e.Params["used_by"] != "dev,work" {
+		t.Fatalf("event %+v", e)
+	}
+
+	v.auth.Default = fake.Deny
+	if err := v.svc.RekeyVault(ctx, v.call, "common", "tpm", rekey); code(err) != protocol.CodeDenied || rekeyed != 1 {
+		t.Fatalf("denied rekey: %v, rekeyed %d", err, rekeyed)
+	}
+	v.auth.Default = fake.Approve
+	v.sink.set(audit.TypeVaultRekey)
+	if err := v.svc.RekeyVault(ctx, v.call, "common", "tpm", rekey); code(err) != protocol.CodeAuditFailed || undone != 1 {
+		t.Fatalf("unrecorded rekey: %v, undone %d", err, undone)
+	}
+	v.sink.set("")
+	failing := func(context.Context) (Rekeyed, func(context.Context) error, error) {
+		return Rekeyed{}, nil, errors.New("no TPM")
+	}
+	if err := v.svc.RekeyVault(ctx, v.call, "common", "tpm", failing); code(err) != protocol.CodeInternal {
+		t.Fatalf("failed rekey: %v", err)
+	}
+	if e := v.lastEvent(audit.TypeVaultRekey); e.Outcome != audit.OutcomeError || !strings.Contains(e.Error.Message, "no TPM") {
+		t.Fatalf("failed rekey not audited: %+v", e)
+	}
+}

@@ -24,7 +24,6 @@ authenticator = "fake"
 platform_events = "none"
 secret_store = "vault-file"
 key_protector = "file"
-insecure_file_protector = true
 [instances.dev]
 realm = { kind = "host" }
 actions = ["hello", "fails"]

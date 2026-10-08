@@ -25,9 +25,9 @@ every attempt lands in an audit log.
 
 ## Why foca
 
-- 🔐 **Every access approved.** Touch ID on macOS, polkit on Linux.
-  Every time, unless your config opts in to a reuse window. Stricter settings always
-  win, and reuse is capped at 8 hours.
+- 🔐 **Every access approved.** Touch ID on macOS, your desktop's polkit password dialog on
+  Linux. Every time, unless your config opts in to a reuse window. Stricter settings
+  always win, and reuse is capped at 8 hours.
 - 🧭 **Prompts you can trust.** A program is named as fact only when a kernel vouches for
   it. What a VM merely claims is labelled as a claim, and nothing a caller sends can add
   words to the prompt.
@@ -98,20 +98,36 @@ nix profile install github:bpinto/foca
 version = 1
 
 [plugins]
-authenticator = "touchid"         # Linux: "polkit"
-key_protector = "keychain"
+authenticator = "touchid"         # Linux: "polkit" (below)
+key_protector = "keychain"        # Linux: "tpm"
 
 [instances.dev]                   # one per realm; this one is a VM
 realm = { kind = "vm" }
 ```
 
+On Linux, use `authenticator = "polkit"` and `key_protector = "tpm"`: each vault key is sealed
+to the machine's TPM and bound to the Secure Boot state and keys (PCR 7), so the vault opens
+only on this machine, with Secure Boot on and its keys unchanged. foca refuses PCR 7 with
+Secure Boot off; listing more PCRs in `[key_protectors.tpm] pcrs` binds to more of what boots
+(design §4.2.1). You need access to `/dev/tpmrm0` (usually the `tss` group). polkit needs
+foca's action installed once:
+
+```sh
+foca polkit-policy | sudo tee /usr/share/polkit-1/actions/io.github.bpinto.foca.policy
+```
+
 **2. Create a vault, add a secret, start the service:**
 
 ```sh
-foca init                         # creates the vault; its key goes to the Keychain
+foca init --recovery              # creates the vault; its key goes to the Keychain or TPM
 foca add dev:github-pat           # in vault dev; value from a hidden prompt or stdin
 foca serve                        # run it under launchd or systemd for daily use
 ```
+
+`--recovery` also makes a recovery key and prints it once, on stdout: copy it down and keep it
+away from this machine (`foca init --recovery | pass insert -m foca/dev` keeps it in a
+password manager). After a firmware or Secure Boot change the TPM won't release the vault
+key, and `foca recover` uses the recovery key to seal it again. On Linux, `init` requires it.
 
 **3. Forward the socket into the VM** (`~/.ssh/config` on the host):
 
@@ -136,6 +152,8 @@ foca run -e GH_TOKEN=dev:github-pat -- gh pr list
 |---|---|---|
 | `foca serve` | host | Run the service for every instance in the config |
 | `foca init` · `add` · `edit` · `remove` | host | Manage vaults and secrets, each approved |
+| `foca recover` | host | Seal a vault's key again with its recovery key, after a firmware or Secure Boot change |
+| `foca rekey` | host | Encrypt a vault again under a new key and recovery key, so the old recovery key and copies of the old file open nothing in it from then on (a copy still holds the secrets as they were) |
 | `foca reload` · `stop` | host | Reload the config, or stop the service |
 | `foca lock` | host | Drop every reuse grant now |
 | `foca policy explain [names…]` | host | What the config allows, in the prompt's own words |
@@ -259,7 +277,7 @@ approving blindly, or malware running as your user on the host. Full threat mode
 ## Development
 
 ```sh
-nix develop                       # Go, gopls, socat, dbus
+nix develop                       # Go, gopls, socat, dbus, polkit, bubblewrap, swtpm
 go test ./...                     # everything that runs on Linux
 go test -tags foca_testing ./...  # + end-to-end tests with a fake authenticator
 scripts/build-darwin.sh           # macOS build with the signed, pinned helper

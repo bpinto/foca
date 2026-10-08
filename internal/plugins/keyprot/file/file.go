@@ -1,8 +1,7 @@
-// Package file is the insecure file key protector: the key that wraps a
-// vault's data key lives in a 0600 file in the data dir. Anyone who can read
-// that directory as the user can decrypt the vault, so config must opt in
-// with insecure_file_protector = true. It exists for tests, headless Linux
-// hosts until there is a TPM protector, and scratch instances.
+// Package file is the test key protector: the key that wraps a vault's data
+// key lives in a 0600 file in the data dir, so anyone who can read that
+// directory as the user can decrypt the vault. Only test builds (-tags
+// foca_testing) can select it.
 package file
 
 import (

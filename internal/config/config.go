@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"runtime"
 	"slices"
@@ -43,6 +44,8 @@ type Config struct {
 	Actions map[string]*action.Spec
 	// TouchID holds [authenticators.touchid] options.
 	TouchID TouchID
+	// TPM holds [key_protectors.tpm] options.
+	TPM TPM
 }
 
 type Plugins struct {
@@ -53,9 +56,6 @@ type Plugins struct {
 	AuditSink      string
 	// PlatformEvents reports sleep and screen lock, so grants can be wiped.
 	PlatformEvents string
-	// InsecureFileProtector allows key_protector = "file", which keeps the
-	// key that unlocks the vault in a plain file next to it.
-	InsecureFileProtector bool
 }
 
 // TouchID options. The password fallback is off unless config opts in
@@ -63,6 +63,16 @@ type Plugins struct {
 type TouchID struct {
 	AllowPasswordFallback bool
 }
+
+// TPM options (design §4.2). The vault key is sealed to the SHA-256 bank of
+// PCRs; none means it opens whatever the boot state.
+type TPM struct {
+	Device string
+	PCRs   []int
+}
+
+// DefaultTPM binds to PCR 7, the Secure Boot state.
+var DefaultTPM = TPM{Device: "/dev/tpmrm0", PCRs: []int{7}}
 
 type Approval struct {
 	PromptTimeout    time.Duration
@@ -181,6 +191,13 @@ type rawFile struct {
 	Secrets        map[string]rawPolicyTable   `toml:"secrets"`
 	Authenticators map[string]rawAuthenticator `toml:"authenticators"`
 	Actions        map[string]rawAction        `toml:"actions"`
+	KeyProtectors  map[string]rawKeyProtector  `toml:"key_protectors"`
+}
+
+// rawKeyProtector is [key_protectors.<name>]: options for that protector.
+type rawKeyProtector struct {
+	Device *string `toml:"device"`
+	PCRs   *[]int  `toml:"pcrs"`
 }
 
 // rawAction is [actions.<id>] (design §11).
@@ -211,13 +228,12 @@ type rawParam struct {
 }
 
 type rawPlugins struct {
-	Authenticator         string `toml:"authenticator"`
-	SecretStore           string `toml:"secret_store"`
-	KeyProtector          string `toml:"key_protector"`
-	PeerIdentifier        string `toml:"peer_identifier"`
-	AuditSink             string `toml:"audit_sink"`
-	PlatformEvents        string `toml:"platform_events"`
-	InsecureFileProtector bool   `toml:"insecure_file_protector"`
+	Authenticator  string `toml:"authenticator"`
+	SecretStore    string `toml:"secret_store"`
+	KeyProtector   string `toml:"key_protector"`
+	PeerIdentifier string `toml:"peer_identifier"`
+	AuditSink      string `toml:"audit_sink"`
+	PlatformEvents string `toml:"platform_events"`
 }
 
 type rawApproval struct {
@@ -413,8 +429,6 @@ func validate(raw *rawFile) (*Config, error) {
 		AuditSink:      orDefault(raw.Plugins.AuditSink, "jsonl"),
 		PlatformEvents: orDefault(raw.Plugins.PlatformEvents, "auto"),
 		KeyProtector:   raw.Plugins.KeyProtector,
-
-		InsecureFileProtector: raw.Plugins.InsecureFileProtector,
 	}
 	if c.Plugins.Authenticator == "" {
 		fail("plugins.authenticator is required")
@@ -424,17 +438,19 @@ func validate(raw *rawFile) (*Config, error) {
 		fail("plugins.key_protector is required with secret_store = \"vault-file\"")
 	case c.Plugins.SecretStore != "vault-file" && c.Plugins.KeyProtector != "":
 		fail("plugins.key_protector is only used with secret_store = \"vault-file\"")
-	case c.Plugins.KeyProtector == "file" && !c.Plugins.InsecureFileProtector:
-		// The file protector keeps the key next to the vault, so anyone who
-		// can read the data dir can decrypt it. It must be asked for by name.
-		fail("plugins.key_protector = \"file\" keeps the vault key in a plain file; set insecure_file_protector = true to allow it")
-	case c.Plugins.InsecureFileProtector && c.Plugins.KeyProtector != "file":
-		fail("plugins.insecure_file_protector is set but key_protector is not \"file\"")
 	}
 	if goos != "darwin" && !darwinPluginsAnywhere {
 		if uses := c.darwinPlugins(); len(uses) > 0 {
 			fail("plugins: %s only work on macOS", strings.Join(uses, ", "))
 		}
+	}
+	// polkit is a Linux service; nothing stands in for it on macOS.
+	if goos != "linux" && c.Plugins.Authenticator == "polkit" {
+		fail("plugins: authenticator = \"polkit\" only works on Linux")
+	}
+	// The TPM protector reaches the TPM through Linux's device files.
+	if goos != "linux" && c.Plugins.KeyProtector == "tpm" {
+		fail("plugins: key_protector = \"tpm\" only works on Linux")
 	}
 
 	// approval
@@ -637,6 +653,33 @@ func validate(raw *rawFile) (*Config, error) {
 				fail("authenticators.%s.allow_password_fallback: only touchid has a password fallback", name)
 			}
 			c.TouchID.AllowPasswordFallback = *ra.AllowPasswordFallback
+		}
+	}
+
+	// key protector options
+	c.TPM = TPM{Device: DefaultTPM.Device, PCRs: append([]int(nil), DefaultTPM.PCRs...)}
+	for name, rk := range raw.KeyProtectors {
+		if name != "tpm" {
+			fail("key_protectors.%s: only tpm takes options", name)
+			continue
+		}
+		if rk.Device != nil {
+			c.TPM.Device = *rk.Device
+			if !filepath.IsAbs(c.TPM.Device) || filepath.Clean(c.TPM.Device) != c.TPM.Device {
+				fail("key_protectors.tpm.device %q must be a clean absolute path", c.TPM.Device)
+			}
+		}
+		if rk.PCRs != nil {
+			c.TPM.PCRs = append([]int(nil), *rk.PCRs...)
+			sort.Ints(c.TPM.PCRs)
+			for i, p := range c.TPM.PCRs {
+				switch {
+				case p < 0 || p > 23:
+					fail("key_protectors.tpm.pcrs: PCR %d is outside 0..23", p)
+				case i > 0 && p == c.TPM.PCRs[i-1]:
+					fail("key_protectors.tpm.pcrs: PCR %d is listed twice", p)
+				}
+			}
 		}
 	}
 	errs = append(errs, c.checkGuestScopes()...)

@@ -8,12 +8,15 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/bpinto/foca/internal/client"
 	"github.com/bpinto/foca/internal/config"
 	"github.com/bpinto/foca/internal/plugin"
+	"github.com/bpinto/foca/internal/plugins/authn/polkit"
+	"github.com/bpinto/foca/internal/plugins/authn/polkit/polkittest"
 	"github.com/bpinto/foca/internal/protocol"
 )
 
@@ -60,5 +63,19 @@ func TestBuildFromConfigEndToEnd(t *testing.T) {
 	log, _ := os.ReadFile(paths.AuditLog())
 	if len(log) == 0 || strings.Contains(string(log), `"v1"`) {
 		t.Fatalf("audit log empty or contains the secret value:\n%s", log)
+	}
+}
+
+// In test builds, FOCA_SYSTEM_BUS points polkit at a private system bus.
+func TestPolkitWiresToTheSystemBus(t *testing.T) {
+	addr := polkittest.Bus(t)
+	polkittest.StartFake(t, addr, polkit.Message, "unix-user:"+strconv.Itoa(os.Getuid()))
+	t.Setenv("FOCA_SYSTEM_BUS", addr)
+	a, err := authenticator(&env{}, "polkit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, why := a.Available(context.Background()); a.Name() != "polkit" || !ok {
+		t.Fatalf("%s: available %v %q", a.Name(), ok, why)
 	}
 }

@@ -2,7 +2,7 @@
 //
 // A random 256-bit data key (DEK) encrypts everything. It is stored only
 // wrapped, in key slots: one per key protector, plus an optional recovery
-// passphrase. Metadata and each value are separate AES-256-GCM boxes, with a
+// key. Metadata and each value are separate AES-256-GCM boxes, with a
 // fresh random nonce on every write and AAD that binds each box to its place:
 //
 //	format|version|vault_id|vault|<entry-id or "meta">
@@ -51,8 +51,8 @@ const (
 	maxFile = 64 << 20
 )
 
-// SlotPassphrase is the type of the optional recovery key slot.
-const SlotPassphrase = "passphrase"
+// SlotRecovery is the type of the optional recovery key slot.
+const SlotRecovery = "recovery-key"
 
 type file struct {
 	Format   string         `json:"format"`
@@ -65,8 +65,8 @@ type file struct {
 	Entries  map[string]box `json:"entries"`
 }
 
-// KeySlot holds the DEK wrapped by one protector, or by the recovery
-// passphrase. []byte fields are base64 in the file.
+// KeySlot holds the DEK wrapped by one protector, or by the recovery key.
+// []byte fields are base64 in the file.
 type KeySlot struct {
 	Type      string     `json:"type"`
 	Sealed    []byte     `json:"sealed,omitempty"`
@@ -160,7 +160,8 @@ func (s *Store) Lock() (unlock func() error, err error) {
 
 // CreateOptions are the choices made at init.
 type CreateOptions struct {
-	// Recovery, if set, adds a passphrase key slot. The caller zeroes it.
+	// Recovery, if set, adds a recovery key slot for this key, from
+	// NewRecoveryKey. The caller zeroes it.
 	Recovery []byte
 	// KDF overrides the recovery slot's Argon2id cost (tests only).
 	KDF *KDFParams
@@ -184,18 +185,19 @@ func (s *Store) Create(ctx context.Context, protector plugin.KeyProtector, opts 
 	defer zero(dek)
 	f := &file{Format: Format, Version: Version, VaultID: ids.New(), Vault: s.vault, Cipher: Cipher,
 		Entries: map[string]box{}}
+	var recovery []KeySlot
+	if opts.Recovery != nil {
+		slot, err := recoverySlot(f, dek, opts.Recovery, opts.KDF)
+		if err != nil {
+			return Header{}, err
+		}
+		recovery = append(recovery, slot)
+	}
 	sealed, err := protector.Seal(ctx, plugin.KeyRef{Vault: s.vault, VaultID: f.VaultID}, dek)
 	if err != nil {
 		return Header{}, fmt.Errorf("seal the vault key: %w", err)
 	}
-	f.KeySlots = append(f.KeySlots, KeySlot{Type: protector.Name(), Sealed: sealed})
-	if opts.Recovery != nil {
-		slot, err := passphraseSlot(f, dek, opts.Recovery, opts.KDF)
-		if err != nil {
-			return Header{}, err
-		}
-		f.KeySlots = append(f.KeySlots, slot)
-	}
+	f.KeySlots = append([]KeySlot{{Type: protector.Name(), Sealed: sealed}}, recovery...)
 	if err := s.sealMeta(f, dek, metaPlain{Secrets: []metaEntry{}}); err != nil {
 		return Header{}, err
 	}
@@ -236,22 +238,32 @@ func (s *Store) DEKFunc(protector plugin.KeyProtector) plugin.DEKFunc {
 		if err != nil {
 			return nil, nil, err
 		}
-		for _, k := range f.KeySlots {
-			if k.Type != protector.Name() {
-				continue
-			}
-			dek, err := protector.Unseal(ctx, plugin.KeyRef{Vault: f.Vault, VaultID: f.VaultID}, k.Sealed)
-			if err != nil {
-				return nil, nil, fmt.Errorf("vault %s: unseal: %w", s.vault, err)
-			}
-			if len(dek) != dekSize {
-				zero(dek)
-				return nil, nil, fmt.Errorf("vault %s: unsealed key has the wrong size", s.vault)
-			}
-			return dek, func() { zero(dek) }, nil
+		dek, _, err := s.unseal(ctx, f, protector)
+		if err != nil {
+			return nil, nil, err
 		}
-		return nil, nil, fmt.Errorf("vault %s has no key slot for protector %q", s.vault, protector.Name())
+		return dek, func() { zero(dek) }, nil
 	}
+}
+
+// unseal unseals f's DEK through protector, and returns it with the slot it
+// came from. The caller zeroes the DEK.
+func (s *Store) unseal(ctx context.Context, f *file, protector plugin.KeyProtector) (dek, sealed []byte, err error) {
+	for _, k := range f.KeySlots {
+		if k.Type != protector.Name() {
+			continue
+		}
+		dek, err := protector.Unseal(ctx, plugin.KeyRef{Vault: f.Vault, VaultID: f.VaultID}, k.Sealed)
+		if err != nil {
+			return nil, nil, fmt.Errorf("vault %s: unseal: %w", s.vault, err)
+		}
+		if len(dek) != dekSize {
+			zero(dek)
+			return nil, nil, fmt.Errorf("vault %s: unsealed key has the wrong size", s.vault)
+		}
+		return dek, k.Sealed, nil
+	}
+	return nil, nil, fmt.Errorf("vault %s has no key slot for protector %q", s.vault, protector.Name())
 }
 
 // ---- SecretStore ----

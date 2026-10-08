@@ -29,6 +29,8 @@ const (
 	TypeSecretUpdate    = "secret.update"
 	TypeSecretRemove    = "secret.remove"
 	TypeVaultInit       = "vault.init"
+	TypeVaultRecover    = "vault.recover"
+	TypeVaultRekey      = "vault.rekey"
 	TypeConfigReload    = "config.reload"
 	TypeLock            = "lock"
 	TypeRequestRejected = "request.rejected"

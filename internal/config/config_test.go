@@ -55,7 +55,7 @@ func TestSecretStoreDefaultsToVaultFile(t *testing.T) {
 	if _, err := Parse([]byte(noStore)); err == nil || !strings.Contains(err.Error(), "key_protector is required") {
 		t.Fatalf("no store and no protector: %v", err)
 	}
-	c, err := Parse([]byte(strings.Replace(noStore, "[plugins]", "[plugins]\nkey_protector = \"file\"\ninsecure_file_protector = true", 1)))
+	c, err := Parse([]byte(strings.Replace(noStore, "[plugins]", "[plugins]\nkey_protector = \"file\"", 1)))
 	if err != nil || c.Plugins.SecretStore != "vault-file" {
 		t.Fatalf("store %q, %v", c.Plugins.SecretStore, err)
 	}
@@ -82,8 +82,6 @@ secret_store = "memory"`, "at least one"},
 		"too many connections":         {minimal + "\n[limits]\nmax_connections = 5000\n", "max_connections"},
 		"idle timeout too short":       {minimal + "\n[limits]\nidle_timeout = \"1s\"\n", "idle_timeout"},
 		"vault-file without protector": {strings.Replace(minimal, "secret_store = \"memory\"", "secret_store = \"vault-file\"", 1), "key_protector is required"},
-		"file protector not opted in":  {strings.Replace(minimal, "secret_store = \"memory\"", "secret_store = \"vault-file\"\nkey_protector = \"file\"", 1), "insecure_file_protector = true"},
-		"opt-in without file":          {strings.Replace(minimal, "secret_store = \"memory\"", "secret_store = \"vault-file\"\nkey_protector = \"keychain\"\ninsecure_file_protector = true", 1), "not \"file\""},
 		"protector without vault-file": {strings.Replace(minimal, "[plugins]", "[plugins]\nkey_protector = \"file\"", 1), "only used with"},
 	}
 	for name, tc := range cases {
@@ -291,13 +289,42 @@ func TestDirectContainerRefusedOnMacOS(t *testing.T) {
 	}
 }
 
-func TestFileProtectorWhenOptedIn(t *testing.T) {
-	c, err := Parse([]byte(strings.Replace(minimal, "secret_store = \"memory\"", "secret_store = \"vault-file\"\nkey_protector = \"file\"\ninsecure_file_protector = true", 1)))
+func TestKeyProtectorOptions(t *testing.T) {
+	defer func(old string) { goos = old }(goos)
+	goos = "linux"
+	tpm := strings.Replace(minimal, "secret_store = \"memory\"", "secret_store = \"vault-file\"\nkey_protector = \"tpm\"", 1)
+	c, err := Parse([]byte(tpm))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Plugins.KeyProtector != "file" || !c.Plugins.InsecureFileProtector {
-		t.Fatalf("%+v", c.Plugins)
+	if c.TPM.Device != "/dev/tpmrm0" || len(c.TPM.PCRs) != 1 || c.TPM.PCRs[0] != 7 {
+		t.Fatalf("defaults %+v", c.TPM)
+	}
+	c, err = Parse([]byte(tpm + "[key_protectors.tpm]\ndevice = \"/dev/tpm0\"\npcrs = [7, 0]\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.TPM.Device != "/dev/tpm0" || len(c.TPM.PCRs) != 2 || c.TPM.PCRs[0] != 0 {
+		t.Fatalf("options %+v", c.TPM)
+	}
+	if c, err = Parse([]byte(tpm + "[key_protectors.tpm]\npcrs = []\n")); err != nil || len(c.TPM.PCRs) != 0 {
+		t.Fatalf("no pcrs: %+v %v", c.TPM, err)
+	}
+	for name, tc := range map[string]struct{ cfg, want string }{
+		"pcr out of range":  {tpm + "[key_protectors.tpm]\npcrs = [24]\n", "PCR 24 is outside 0..23"},
+		"pcr twice":         {tpm + "[key_protectors.tpm]\npcrs = [7, 7]\n", "PCR 7 is listed twice"},
+		"relative device":   {tpm + "[key_protectors.tpm]\ndevice = \"tpmrm0\"\n", "clean absolute path"},
+		"other protector":   {tpm + "[key_protectors.keychain]\n", "only tpm takes options"},
+		"unknown option":    {tpm + "[key_protectors.tpm]\nsrk = 1\n", "unknown keys"},
+		"old insecure flag": {strings.Replace(tpm, "key_protector = \"tpm\"", "key_protector = \"file\"\ninsecure_file_protector = true", 1), "unknown keys: plugins.insecure_file_protector"},
+	} {
+		if _, err := Parse([]byte(tc.cfg)); err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: got %v, want %q", name, err, tc.want)
+		}
+	}
+	goos = "darwin"
+	if _, err := Parse([]byte(tpm)); err == nil || !strings.Contains(err.Error(), "key_protector = \"tpm\" only works on Linux") {
+		t.Fatalf("tpm on darwin: %v", err)
 	}
 }
 
@@ -461,5 +488,20 @@ func TestDarwinPluginsOnlyOnMacOS(t *testing.T) {
 	goos, darwinPluginsAnywhere = "linux", true
 	if _, err := Parse([]byte(base + "authenticator = \"touchid\"\nkey_protector = \"keychain\"")); err != nil {
 		t.Fatalf("test build: %v", err)
+	}
+}
+
+func TestPolkitOnlyOnLinux(t *testing.T) {
+	defer func(os string) { goos = os }(goos)
+	conf := "version = 1\n[instances.dev]\n[plugins]\nauthenticator = \"polkit\"\nsecret_store = \"memory\"\n"
+	goos = "linux"
+	if _, err := Parse([]byte(conf)); err != nil {
+		t.Fatalf("on linux: %v", err)
+	}
+	for _, os := range []string{"darwin", "freebsd"} {
+		goos = os
+		if _, err := Parse([]byte(conf)); err == nil || !strings.Contains(err.Error(), "only works on Linux") {
+			t.Errorf("on %s: %v", os, err)
+		}
 	}
 }

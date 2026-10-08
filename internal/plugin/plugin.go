@@ -67,7 +67,7 @@ type ApprovalRequest struct {
 
 type ApprovalResult struct {
 	Approved bool
-	Method   string // e.g. "biometry"
+	Method   string // e.g. "biometry", "polkit-auth_self"
 	Detail   string // free text for audit only
 }
 

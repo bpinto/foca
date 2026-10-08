@@ -100,6 +100,18 @@ func render(in PromptInput, a actor) string {
 			users = " for " + realmList(in.VisibleTo)
 		}
 		return fmt.Sprintf("create vault %s%s.", in.Vault, users)
+	case "vault.recover":
+		users := ""
+		if len(in.VisibleTo) > 0 {
+			users = " for " + realmList(in.VisibleTo)
+		}
+		return fmt.Sprintf("seal vault %s's key again with %s using its recovery key%s.", in.Vault, in.Params["protector"], strings.Replace(users, " for ", ", for ", 1))
+	case "vault.rekey":
+		users := ""
+		if len(in.VisibleTo) > 0 {
+			users = ", for " + realmList(in.VisibleTo)
+		}
+		return fmt.Sprintf("encrypt vault %s again under a new key, sealed with %s%s.", in.Vault, in.Params["protector"], users)
 	case "action.run":
 		what := runPhrase(in)
 		switch a.trust {

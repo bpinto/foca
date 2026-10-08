@@ -6,12 +6,16 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/alecthomas/kong"
+
+	"github.com/bpinto/foca/internal/plugins/authn/polkit"
+	"github.com/bpinto/foca/internal/plugins/store/vaultfile"
 )
 
 // testEnv is a non-interactive environment with captured output.
@@ -40,7 +44,7 @@ func TestNoSecretInArgv(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	banned := []string{"value", "secret", "password", "passphrase", "token", "recovery-passphrase", "key", "data"}
+	banned := []string{"value", "secret", "password", "passphrase", "token", "recovery-passphrase", "recovery-key", "key", "data"}
 	var walk func(n *kong.Node)
 	walk = func(n *kong.Node) {
 		for _, f := range n.Flags {
@@ -186,18 +190,29 @@ func TestReadValueSources(t *testing.T) {
 	}
 }
 
-func TestReadPassphraseConfirms(t *testing.T) {
-	env, _, _ := testEnv(t, nil)
+// A recovery key is read from a hidden prompt or the first line of stdin,
+// however it was copied down, and nothing else passes for one.
+func TestReadRecoveryKey(t *testing.T) {
+	key, _ := vaultfile.NewRecoveryKey()
+	written := string(vaultfile.FormatRecoveryKey(key))
+	env, _, errb := testEnv(t, nil)
 	env.StdinTTY, env.StderrTTY = true, true
-	answers := [][]byte{[]byte("one"), []byte("two")}
-	env.ReadPassword = func() ([]byte, error) { a := answers[0]; answers = answers[1:]; return a, nil }
-	if _, err := readPassphrase(env, "recovery passphrase"); err == nil || !strings.Contains(err.Error(), "don't match") {
-		t.Fatalf("mismatch: %v", err)
+	env.ReadPassword = func() ([]byte, error) { return []byte(strings.ToLower(written)), nil }
+	if got, err := readRecoveryKey(env, "common"); err != nil || !bytes.Equal(got, key) {
+		t.Fatalf("prompt: %x %v", got, err)
+	}
+	if !strings.Contains(errb.String(), "recovery key for vault common (input hidden)") {
+		t.Fatalf("prompt text %q", errb.String())
 	}
 	env, _, _ = testEnv(t, nil)
-	env.Stdin = strings.NewReader("pass phrase\nrest")
-	if b, err := readPassphrase(env, "p"); err != nil || string(b) != "pass phrase" {
-		t.Fatalf("stdin: %q %v", b, err)
+	env.Stdin = strings.NewReader(strings.ReplaceAll(written, "-", " ") + "\r\nrest")
+	if got, err := readRecoveryKey(env, "common"); err != nil || !bytes.Equal(got, key) {
+		t.Fatalf("stdin: %x %v", got, err)
+	}
+	env, _, _ = testEnv(t, nil)
+	env.Stdin = strings.NewReader("correct horse\n")
+	if _, err := readRecoveryKey(env, "common"); err == nil || !strings.Contains(err.Error(), "32 characters") {
+		t.Fatalf("a passphrase: %v", err)
 	}
 }
 
@@ -404,4 +419,43 @@ func mustRead(t *testing.T, path string) []byte {
 		t.Fatal(err)
 	}
 	return b
+}
+
+func TestPolkitPolicyNamesTheUsers(t *testing.T) {
+	env, out, _ := testEnv(t, nil)
+	if code := Main([]string{"polkit-policy", "bruno", "1001"}, env, "x"); code != 0 {
+		t.Fatalf("exit %d", code)
+	}
+	want, _ := polkit.PolicyFile("bruno", "1001")
+	if out.String() != string(want) {
+		t.Fatalf("got\n%s", out)
+	}
+	env, out, _ = testEnv(t, nil)
+	if code := Main([]string{"polkit-policy"}, env, "x"); code != 0 {
+		t.Fatalf("exit %d", code)
+	}
+	u, _ := user.Current()
+	if !strings.Contains(out.String(), ">unix-user:"+u.Username+"</annotate>") {
+		t.Fatalf("default owner missing:\n%s", out)
+	}
+	env, _, errOut := testEnv(t, nil)
+	if code := Main([]string{"polkit-policy", "a b"}, env, "x"); code != 1 || !strings.Contains(errOut.String(), "not a user name") {
+		t.Fatalf("exit %d: %s", code, errOut)
+	}
+}
+
+// A production build links no test code: not the fake authenticator or the
+// file key protector, not the test harnesses, not the testing package.
+func TestProductionBuildLinksNoTestCode(t *testing.T) {
+	out, err := exec.Command("go", "list", "-deps", "github.com/bpinto/foca/cmd/foca").Output()
+	if err != nil {
+		t.Skipf("go list unavailable: %v", err)
+	}
+	for _, dep := range strings.Fields(string(out)) {
+		if dep == "testing" || strings.HasPrefix(dep, "github.com/bpinto/foca/") &&
+			(strings.HasSuffix(dep, "/fake") || strings.HasSuffix(dep, "test") || strings.Contains(dep, "fakehelper") ||
+				strings.HasSuffix(dep, "/keyprot/file")) {
+			t.Errorf("the production build links %s", dep)
+		}
+	}
 }

@@ -11,6 +11,7 @@ import (
 	"syscall"
 
 	"github.com/bpinto/foca/internal/fsutil"
+	"github.com/bpinto/foca/internal/plugins/store/vaultfile"
 )
 
 // maxValue bounds a secret value. A value must fit in one protocol message
@@ -49,9 +50,26 @@ func readValue(e *Env, what, fromFile string) ([]byte, error) {
 	return b, nil
 }
 
-// readPassphrase reads a passphrase from a hidden prompt, asked twice, or
-// from the first line of stdin when stdin isn't a terminal.
-func readPassphrase(e *Env, what string) ([]byte, error) {
+// readRecoveryKey reads a vault's recovery key: from a hidden prompt, or
+// from the first line of stdin when stdin isn't a terminal. The caller
+// zeroes the result.
+func readRecoveryKey(e *Env, vault string) ([]byte, error) {
+	what := "recovery key for vault " + vault
+	typed, err := readLine(e, what)
+	if err != nil {
+		return nil, err
+	}
+	defer zero(typed)
+	key, err := vaultfile.ParseRecoveryKey(typed)
+	if err != nil {
+		return nil, fmt.Errorf("the %s: %w", what, err)
+	}
+	return key, nil
+}
+
+// readLine reads one hidden line: from a prompt, or from the first line of
+// stdin when stdin isn't a terminal.
+func readLine(e *Env, what string) ([]byte, error) {
 	if !e.StdinTTY {
 		b, err := readLimited(e.Stdin)
 		if i := bytes.IndexByte(b, '\n'); i >= 0 {
@@ -69,27 +87,16 @@ func readPassphrase(e *Env, what string) ([]byte, error) {
 		return nil, fmt.Errorf("no %s given: pipe it on stdin (a hidden prompt needs stdin and stderr to be a terminal)", what)
 	}
 	fmt.Fprintf(e.Stderr, "%s (input hidden): ", what)
-	a, err := e.ReadPassword()
-	fmt.Fprintln(e.Stderr)
-	if err != nil {
-		return nil, err
-	}
-	fmt.Fprintf(e.Stderr, "Repeat %s: ", what)
 	b, err := e.ReadPassword()
 	fmt.Fprintln(e.Stderr)
-	defer zero(b)
 	if err != nil {
-		zero(a)
+		zero(b)
 		return nil, err
 	}
-	if len(a) == 0 {
+	if len(b) == 0 {
 		return nil, fmt.Errorf("the %s is empty", what)
 	}
-	if !bytes.Equal(a, b) {
-		zero(a)
-		return nil, fmt.Errorf("the %s entries don't match", what)
-	}
-	return a, nil
+	return b, nil
 }
 
 func readLimited(r io.Reader) ([]byte, error) {

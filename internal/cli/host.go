@@ -13,6 +13,7 @@ import (
 	"github.com/charmbracelet/huh"
 
 	"github.com/bpinto/foca/internal/config"
+	"github.com/bpinto/foca/internal/fsutil"
 	"github.com/bpinto/foca/internal/identity"
 	"github.com/bpinto/foca/internal/ids"
 	"github.com/bpinto/foca/internal/plugin"
@@ -141,7 +142,7 @@ func visibility(c core.Change) string {
 
 type InitCmd struct {
 	Vault    string `help:"Vault to create (default: the only vault in the config)."`
-	Recovery bool   `help:"Add a recovery passphrase, read from a hidden prompt or the first line of stdin."`
+	Recovery bool   `help:"Also make a recovery key, which opens the vault without its key protector. It is written to stdout once."`
 }
 
 func (c *InitCmd) Run(g *Globals, e *Env) error {
@@ -153,18 +154,24 @@ func (c *InitCmd) Run(g *Globals, e *Env) error {
 	if op.store.Exists() {
 		return fmt.Errorf("vault %s already exists (%s)", op.vault, op.store.Path())
 	}
-	var pass []byte
+	// A key bound to the boot state stays sealed after a firmware or Secure
+	// Boot change until the recovery key seals it again: without one, such
+	// a change would lose the vault.
+	if err := needsRecovery(op, c.Recovery); err != nil {
+		return err
+	}
+	var key []byte
 	if c.Recovery {
-		if pass, err = readPassphrase(e, "recovery passphrase"); err != nil {
+		if key, err = vaultfile.NewRecoveryKey(); err != nil {
 			return err
 		}
-		defer zero(pass)
+		defer zero(key)
 	}
 	prot := op.host.Protector
 	ctx, done := opContext(e)
 	defer done()
 	err = op.host.Core.InitVault(ctx, op.call, op.vault, func(ctx context.Context) (string, func(context.Context) error, error) {
-		h, err := op.store.Create(ctx, prot, vaultfile.CreateOptions{Recovery: pass})
+		h, err := op.store.Create(ctx, prot, vaultfile.CreateOptions{Recovery: key})
 		if err != nil {
 			return "", nil, err
 		}
@@ -178,6 +185,38 @@ func (c *InitCmd) Run(g *Globals, e *Env) error {
 		return err
 	}
 	fmt.Fprintf(e.Stderr, "created vault %s at %s\n", op.vault, op.store.Path())
+	if key != nil {
+		return showRecoveryKey(e, op.vault, key)
+	}
+	return nil
+}
+
+// needsRecovery refuses a vault without a recovery key when the TPM binds
+// its key to the boot state.
+func needsRecovery(op *hostOp, recovery bool) error {
+	if op.host.Protector.Name() == "tpm" && len(op.cfg.TPM.PCRs) > 0 && !recovery {
+		return fmt.Errorf("the tpm key protector binds vault %s to PCR %v, so a firmware or Secure Boot change locks it until it is recovered: pass --recovery to make a recovery key", op.vault, op.cfg.TPM.PCRs)
+	}
+	return nil
+}
+
+// showRecoveryKey writes a new recovery key to stdout, the only time it is
+// ever shown. A terminal shows it to be copied down; a pipe or a file takes
+// it as one line, say for a password manager. It never goes to stderr, a
+// log or the audit log.
+func showRecoveryKey(e *Env, vault string, key []byte) error {
+	k := vaultfile.FormatRecoveryKey(key)
+	defer zero(k)
+	if e.StdoutTTY {
+		fmt.Fprintf(e.Stderr, "Recovery key for vault %s, shown only this once. Keep it away from this machine: with a copy of the vault file it opens every secret. foca recover asks for it.\n", vault)
+	}
+	_, err := e.Stdout.Write(k)
+	if err == nil {
+		_, err = e.Stdout.Write([]byte("\n"))
+	}
+	if err != nil {
+		return fmt.Errorf("vault %s's recovery key could not be written (%v): run foca rekey --vault %s for a new one", vault, err, vault)
+	}
 	return nil
 }
 
@@ -356,4 +395,119 @@ func splitName(name string) (vault, id string, err error) {
 		return "", "", fmt.Errorf("invalid secret name %q: name secrets <vault>:<secret>", name)
 	}
 	return vault, id, nil
+}
+
+// ---- recover ----
+
+type RecoverCmd struct {
+	Vault string `help:"Vault to recover (default: the only vault in the config)."`
+}
+
+// Run seals the vault's key again with the configured key protector, using
+// the recovery key from a hidden prompt or the first line of stdin, after
+// the boot state a TPM key is bound to changed.
+func (c *RecoverCmd) Run(g *Globals, e *Env) error {
+	op, err := g.openHost(e, c.Vault)
+	if err != nil {
+		return err
+	}
+	defer op.close()
+	h, err := op.store.Header(background())
+	if err != nil {
+		return err
+	}
+	if !slices.Contains(h.SlotTypes, vaultfile.SlotRecovery) {
+		return fmt.Errorf("vault %s has no recovery key, so it can't be recovered", op.vault)
+	}
+	key, err := readRecoveryKey(e, op.vault)
+	if err != nil {
+		return err
+	}
+	defer zero(key)
+	// Check the key before asking for approval.
+	dek, err := op.store.UnsealRecovery(key)
+	if err != nil {
+		return err
+	}
+	zero(dek)
+	before, err := os.ReadFile(op.store.Path())
+	if err != nil {
+		return err
+	}
+	prot := op.host.Protector
+	ctx, done := opContext(e)
+	defer done()
+	err = op.host.Core.RecoverVault(ctx, op.call, op.vault, prot.Name(), func(ctx context.Context) ([]string, func(context.Context) error, error) {
+		replaced, err := op.store.Reseal(ctx, prot, key)
+		undo := func(context.Context) error { return fsutil.WriteFileAtomic(op.store.Path(), before, 0o600) }
+		return replaced, undo, err
+	})
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(e.Stderr, "sealed vault %s's key again with %s\n", op.vault, prot.Name())
+	return nil
+}
+
+// ---- rekey ----
+
+type RekeyCmd struct {
+	Vault    string `help:"Vault to rekey (default: the only vault in the config)."`
+	Recovery bool   `help:"Make a recovery key even if the vault had none. A vault that had one always gets a new one, written to stdout once."`
+}
+
+// Run encrypts the vault again under a new key and vault id, with a new
+// protector slot and a new recovery key, then destroys the old protector
+// entry. Copies of the old file keep opening with their old slots; from
+// now on, nothing of theirs opens this vault.
+func (c *RekeyCmd) Run(g *Globals, e *Env) error {
+	op, err := g.openHost(e, c.Vault)
+	if err != nil {
+		return err
+	}
+	defer op.close()
+	h, err := op.store.Header(background())
+	if err != nil {
+		return err
+	}
+	recovery := c.Recovery || slices.Contains(h.SlotTypes, vaultfile.SlotRecovery)
+	if err := needsRecovery(op, recovery); err != nil {
+		return err
+	}
+	var key []byte
+	if recovery {
+		if key, err = vaultfile.NewRecoveryKey(); err != nil {
+			return err
+		}
+		defer zero(key)
+	}
+	before, err := os.ReadFile(op.store.Path())
+	if err != nil {
+		return err
+	}
+	prot := op.host.Protector
+	var r vaultfile.Rekeyed
+	ctx, done := opContext(e)
+	defer done()
+	err = op.host.Core.RekeyVault(ctx, op.call, op.vault, prot.Name(), func(ctx context.Context) (core.Rekeyed, func(context.Context) error, error) {
+		var err error
+		r, err = op.store.Rekey(ctx, prot, vaultfile.CreateOptions{Recovery: key})
+		undo := func(ctx context.Context) error {
+			return errors.Join(fsutil.WriteFileAtomic(op.store.Path(), before, 0o600), prot.Destroy(ctx, r.New, r.NewSealed))
+		}
+		return core.Rekeyed{OldVaultID: r.Old.VaultID, VaultID: r.New.VaultID, Replaced: r.Replaced, Recovery: key != nil}, undo, err
+	})
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(e.Stderr, "encrypted vault %s again under a new key\n", op.vault)
+	var errs []error
+	// Recorded: now the old protector entry can go.
+	if err := prot.Destroy(background(), r.Old, r.OldSealed); err != nil {
+		errs = append(errs, fmt.Errorf("vault %s's old %s key entry could not be removed: %w", op.vault, prot.Name(), err))
+	}
+	if key != nil {
+		errs = append(errs, showRecoveryKey(e, op.vault, key))
+	}
+	return errors.Join(errs...)
 }

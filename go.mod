@@ -11,6 +11,7 @@ require (
 	github.com/alecthomas/kong v1.16.1
 	github.com/charmbracelet/huh v1.0.0
 	github.com/godbus/dbus/v5 v5.2.2
+	github.com/google/go-tpm v0.9.8
 	golang.org/x/crypto v0.57.0
 	golang.org/x/term v0.46.0
 )

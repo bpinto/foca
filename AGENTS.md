@@ -11,8 +11,9 @@ The human overview is [README.md](README.md); the full specification is
 
 ## What to expect
 
-- Every `get`, `run` and `exec` may show the user a Touch ID prompt and **block until they
-  answer** (60 s by default). Don't set short timeouts around foca calls.
+- Every `get`, `run` and `exec` may show the user an approval prompt (Touch ID, or polkit
+  on Linux) and **block until they answer** (60 s by default). Don't set short timeouts
+  around foca calls.
 - The prompt names your program and the credential, so ask for exactly what the task needs,
   in one call. Several names in one `get` or `run` are **one** prompt.
 - A denial is the user's decision. Don't retry it: repeated denials are refused without a
@@ -103,7 +104,7 @@ The CLI prints `foca: <name>: <message>` on stderr and exits 1 (2 for a usage er
 | `denied` | -32001 | the user refused, or a recent denial or cooldown is still running | stop; tell the user what you needed |
 | `not_found` | -32002 | no such secret or action here, or an action uses a secret this realm can't read | check `foca list` / `foca actions` |
 | `not_initialized` | -32003 | the vault hasn't been created | the user runs `foca init` on the host |
-| `auth_unavailable` | -32004 | no prompt can be shown (no GUI session, no Touch ID) | ask the user |
+| `auth_unavailable` | -32004 | no prompt can be shown (no GUI session, no Touch ID, no polkit agent) | ask the user |
 | `timeout` | -32005 | nobody answered the prompt, or the action timed out | ask the user before trying again |
 | `busy` | -32006 | too many prompts queued, too many requests (30, then 5/s), or 4 actions already running | wait a few seconds |
 | `audit_failed` | -32007 | the host couldn't record the request, so it refused | tell the user |
@@ -155,11 +156,13 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"secret.list","params":{}}' \
   argv, logs or audit events.
 - **Strict everywhere.** Config rejects unknown keys and out-of-range values (never clamps
   silently); the protocol rejects unknown, duplicate or case-variant keys.
-- **No cgo.** macOS APIs go through the `foca-darwin` helper over stdio.
+- **No cgo.** macOS APIs go through the `foca-darwin` helper over stdio; polkit and logind
+  are reached over D-Bus in pure Go.
 - **Boundaries are tested.** `internal/client` must not import service-side packages
   (`client/boundary_test.go`); the CLI's UI stack (`huh`) stays out of `internal/server`.
-- **Test-only plugins** (the `fake` authenticator) exist only in builds tagged
-  `foca_testing`. Never make them reachable otherwise.
+  A production build links no test code (`cli.TestProductionBuildLinksNoTestCode`).
+- **Test-only plugins** (the `fake` authenticator, the `file` key protector) exist only in
+  builds tagged `foca_testing`. Never make them reachable otherwise.
 
 ## Layout
 
@@ -174,8 +177,9 @@ internal/server/wiring/   config → plugins; test-only plugins behind foca_test
 internal/config/          TOML loading and validation, policy folding, paths
 internal/policy/          the "stricter wins" lattice and its plain-language wording
 internal/action/          action specs: param checks, argv templates, output formats, masking
-internal/plugin/          plugin interfaces; helper/ is the stdio helper adapter
-internal/plugins/         authn/fake, store/{memory,vaultfile}, keyprot/file,
+internal/plugin/          plugin interfaces; helper/ is the stdio helper adapter; authntest/ is the
+                          authenticator conformance suite every authenticator runs
+internal/plugins/         authn/{fake,polkit}, store/{memory,vaultfile}, keyprot/{file,tpm},
                           provider/{static,command}, peer (linux, darwin), events/logind
 internal/audit/           event types (v1), JSONL and memory sinks
 internal/identity/        verified, guest and reported identity types
@@ -187,7 +191,9 @@ helpers/darwin/           foca-darwin (Swift): Touch ID, Keychain, sleep and loc
 ## Build and test
 
 ```sh
-nix develop                                             # dev shell: go, gopls, socat, dbus
+nix develop                                             # dev shell: go, gopls, socat, dbus,
+                                                        # bubblewrap; FOCA_POLKITD for the real polkitd,
+                                                        # FOCA_SWTPM for the software TPM
 go test ./...                                           # all Linux tests
 go test -tags foca_testing ./...                        # + CLI end-to-end and binary tests
 CGO_ENABLED=1 go test -race ./...                       # race detector (gcc from the shell)

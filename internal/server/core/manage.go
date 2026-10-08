@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/bpinto/foca/internal/audit"
@@ -378,3 +379,103 @@ func displayOr(d, id string) string {
 }
 
 func quote(s string) string { return `"` + s + `"` }
+
+// ---- vault.recover ----
+
+// VaultResealer seals the vault's key again once approval is given, and
+// returns the types of the key slots it replaced. undo puts the vault back
+// as it was if the audit record can't be written.
+type VaultResealer func(ctx context.Context) (replaced []string, undo func(context.Context) error, err error)
+
+// RecoverVault seals vault's key again with protector after approval, using
+// its recovery key, after the boot state a TPM key is bound to
+// changed. The caller has already checked the key, under the vault's
+// write lock.
+func (s *Service) RecoverVault(ctx context.Context, c Call, vault, protector string, reseal VaultResealer) error {
+	if _, perr := s.store(c, vault); perr != nil {
+		return perr
+	}
+	c = inVault(c, vault)
+	users, userNames := s.usersOf(vault)
+	a := ask{op: "vault.recover", accessType: audit.TypeVaultRecover,
+		refs: []plugin.ResourceRef{{Kind: "vault", ID: vault, Display: vault}}, visible: users,
+		params: map[string]string{"protector": protector}}
+	release, err := s.admit(ctx, c, a)
+	if err != nil {
+		return err
+	}
+	appr, err := s.ask(ctx, c, a, release)
+	if err != nil {
+		return err
+	}
+	replaced, undo, err := reseal(ctx)
+	if err != nil {
+		e := s.Event(c, audit.TypeVaultRecover, audit.OutcomeError)
+		e.Resource = &audit.Resource{Kind: "vault", ID: vault}
+		e.Error = &audit.ErrorInfo{Code: "internal", Message: err.Error()}
+		seq, aerr := s.record(ctx, c, e)
+		if aerr != nil {
+			return aerr
+		}
+		return s.fail(c, protocol.CodeInternal, seq, "could not recover vault %s: %v", vault, err)
+	}
+	e := s.Event(c, audit.TypeVaultRecover, audit.OutcomeOK)
+	e.Resource = &audit.Resource{Kind: "vault", ID: vault}
+	e.Params = map[string]string{"protector": protector, "replaced": strings.Join(replaced, ","), "used_by": strings.Join(userNames, ",")}
+	e.Approval = appr
+	return s.recordOrUndo(ctx, c, e, "vault "+quote(vault)+" was sealed again with "+protector, undo)
+}
+
+// ---- vault.rekey ----
+
+// Rekeyed is what a rekey changed, for the audit record.
+type Rekeyed struct {
+	OldVaultID, VaultID string
+	// Replaced are the protector slots the old file had.
+	Replaced []string
+	// Recovery reports whether the new file has a recovery key.
+	Recovery bool
+}
+
+// VaultRekeyer encrypts the vault again under a new key once approval is
+// given. undo puts the old vault back if the audit record can't be written.
+type VaultRekeyer func(ctx context.Context) (Rekeyed, func(context.Context) error, error)
+
+// RekeyVault encrypts vault again under a new key, sealed with protector,
+// after approval. The caller holds the vault's write lock.
+func (s *Service) RekeyVault(ctx context.Context, c Call, vault, protector string, rekey VaultRekeyer) error {
+	if _, perr := s.store(c, vault); perr != nil {
+		return perr
+	}
+	c = inVault(c, vault)
+	users, userNames := s.usersOf(vault)
+	a := ask{op: "vault.rekey", accessType: audit.TypeVaultRekey,
+		refs: []plugin.ResourceRef{{Kind: "vault", ID: vault, Display: vault}}, visible: users,
+		params: map[string]string{"protector": protector}}
+	release, err := s.admit(ctx, c, a)
+	if err != nil {
+		return err
+	}
+	appr, err := s.ask(ctx, c, a, release)
+	if err != nil {
+		return err
+	}
+	r, undo, err := rekey(ctx)
+	if err != nil {
+		e := s.Event(c, audit.TypeVaultRekey, audit.OutcomeError)
+		e.Resource = &audit.Resource{Kind: "vault", ID: vault}
+		e.Error = &audit.ErrorInfo{Code: "internal", Message: err.Error()}
+		seq, aerr := s.record(ctx, c, e)
+		if aerr != nil {
+			return aerr
+		}
+		return s.fail(c, protocol.CodeInternal, seq, "could not rekey vault %s: %v", vault, err)
+	}
+	e := s.Event(c, audit.TypeVaultRekey, audit.OutcomeOK)
+	e.Resource = &audit.Resource{Kind: "vault", ID: vault}
+	e.Params = map[string]string{"protector": protector, "old_vault_id": r.OldVaultID, "vault_id": r.VaultID,
+		"replaced": strings.Join(r.Replaced, ","), "recovery_key": strconv.FormatBool(r.Recovery),
+		"used_by": strings.Join(userNames, ",")}
+	e.Approval = appr
+	return s.recordOrUndo(ctx, c, e, "vault "+quote(vault)+" was encrypted again under a new key", undo)
+}

@@ -26,8 +26,15 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-      # dbus-daemon for the logind tests, which skip without it.
-      - run: sudo apt-get update && sudo apt-get install -y dbus
+      # dbus-daemon for the logind and polkit tests, which skip without it.
+      # The polkit tests also run the real polkitd under bubblewrap, which
+      # needs unprivileged user namespaces (Ubuntu restricts them). swtpm is
+      # the software TPM the TPM key protector tests run against.
+      - run: |
+          sudo apt-get update && sudo apt-get install -y dbus polkitd bubblewrap swtpm
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          echo "FOCA_POLKITD=/usr/lib/polkit-1/polkitd" >> "$GITHUB_ENV"
+          echo "FOCA_SWTPM=/usr/bin/swtpm" >> "$GITHUB_ENV"
       - run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
       - run: go vet ./... && go vet -tags foca_testing ./...
       - run: go test -count=1 ./...

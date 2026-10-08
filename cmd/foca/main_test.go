@@ -26,7 +26,6 @@ const config = `version = 1
 authenticator = "fake"
 secret_store = "vault-file"
 key_protector = "file"
-insecure_file_protector = true
 [instances.dev]
 realm = { kind = "host" }
 `
@@ -403,7 +402,6 @@ func TestBinaryHelperPin(t *testing.T) {
 authenticator   = "touchid"
 secret_store    = "vault-file"
 key_protector   = "file"
-insecure_file_protector = true
 platform_events = "none"
 [instances.dev]
 realm = { kind = "host" }

@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+	"os/user"
 	"slices"
 	"sort"
 	"strings"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/bpinto/foca/internal/action"
 	"github.com/bpinto/foca/internal/config"
+	"github.com/bpinto/foca/internal/plugins/authn/polkit"
 	"github.com/bpinto/foca/internal/policy"
 	"github.com/bpinto/foca/internal/protocol"
 	"github.com/bpinto/foca/internal/secretname"
@@ -195,4 +197,28 @@ func (c *GrantsCmd) Run(g *Globals, e *Env) error {
 		fmt.Fprintf(w, "%s\t%s\t%s\n", clean(name), clean(gr.Scope), gr.ExpiresAt.Local().Format(time.DateTime))
 	}
 	return w.Flush()
+}
+
+// PolkitPolicyCmd prints the action file for polkit's actions directory.
+// It names the users who run foca: polkit shows foca's prompt text only for
+// an action's owners.
+type PolkitPolicyCmd struct {
+	Users []string `arg:"" optional:"" help:"Users who run foca, by name or uid (default: you)."`
+}
+
+func (c *PolkitPolicyCmd) Run(g *Globals, e *Env) error {
+	users := c.Users
+	if len(users) == 0 {
+		u, err := user.Current()
+		if err != nil {
+			return fmt.Errorf("can't tell who you are (%v); name the users", err)
+		}
+		users = []string{u.Username}
+	}
+	b, err := polkit.PolicyFile(users...)
+	if err != nil {
+		return err
+	}
+	_, err = e.Stdout.Write(b)
+	return err
 }

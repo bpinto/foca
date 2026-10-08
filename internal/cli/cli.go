@@ -95,22 +95,25 @@ type Globals struct {
 type CLI struct {
 	Globals
 
-	Serve   ServeCmd   `cmd:"" help:"Run the service for every instance in the config."`
-	Init    InitCmd    `cmd:"" help:"Create an encrypted vault (host)."`
-	Add     AddCmd     `cmd:"" help:"Add a secret to a vault (host)."`
-	Edit    EditCmd    `cmd:"" help:"Change a secret's value or metadata (host)."`
-	Remove  RemoveCmd  `cmd:"" aliases:"rm" help:"Remove a secret from a vault (host)."`
-	List    ListCmd    `cmd:"" aliases:"ls" help:"List the secrets this realm can see."`
-	Get     GetCmd     `cmd:"" help:"Read secrets to a pipe or a file."`
-	Run     RunCmd     `cmd:"" help:"Run a command with secrets in its environment."`
-	Exec    ExecCmd    `cmd:"" help:"Run an action the host config offers here."`
-	Actions ActionsCmd `cmd:"" help:"List the actions this realm can run."`
-	Reload  ReloadCmd  `cmd:"" help:"Make the running service reload its config (host)."`
-	Lock    LockCmd    `cmd:"" help:"Drop every reuse grant now, so the next access asks again (host)."`
-	Stop    StopCmd    `cmd:"" help:"Stop the running service (host)."`
-	Policy  PolicyCmd  `cmd:"" help:"Explain the approval policy the config sets (host)."`
-	Grants  GrantsCmd  `cmd:"" help:"List or drop your reuse grants."`
-	Version VersionCmd `cmd:"" help:"Print the version."`
+	Serve        ServeCmd        `cmd:"" help:"Run the service for every instance in the config."`
+	Init         InitCmd         `cmd:"" help:"Create an encrypted vault (host)."`
+	Recover      RecoverCmd      `cmd:"" help:"Seal a vault's key again with the configured key protector, using its recovery key (host)."`
+	Rekey        RekeyCmd        `cmd:"" help:"Encrypt a vault again under a new key, with a new recovery key (host)."`
+	Add          AddCmd          `cmd:"" help:"Add a secret to a vault (host)."`
+	Edit         EditCmd         `cmd:"" help:"Change a secret's value or metadata (host)."`
+	Remove       RemoveCmd       `cmd:"" aliases:"rm" help:"Remove a secret from a vault (host)."`
+	List         ListCmd         `cmd:"" aliases:"ls" help:"List the secrets this realm can see."`
+	Get          GetCmd          `cmd:"" help:"Read secrets to a pipe or a file."`
+	Run          RunCmd          `cmd:"" help:"Run a command with secrets in its environment."`
+	Exec         ExecCmd         `cmd:"" help:"Run an action the host config offers here."`
+	Actions      ActionsCmd      `cmd:"" help:"List the actions this realm can run."`
+	Reload       ReloadCmd       `cmd:"" help:"Make the running service reload its config (host)."`
+	Lock         LockCmd         `cmd:"" help:"Drop every reuse grant now, so the next access asks again (host)."`
+	Stop         StopCmd         `cmd:"" help:"Stop the running service (host)."`
+	Policy       PolicyCmd       `cmd:"" help:"Explain the approval policy the config sets (host)."`
+	Grants       GrantsCmd       `cmd:"" help:"List or drop your reuse grants."`
+	PolkitPolicy PolkitPolicyCmd `cmd:"" name:"polkit-policy" help:"Print the polkit action the polkit authenticator needs (host, Linux)."`
+	Version      VersionCmd      `cmd:"" help:"Print the version."`
 }
 
 type exitCode int
@@ -210,4 +213,4 @@ var background = context.Background
 // service, and the host commands that unseal a vault. Socket clients aren't
 // among them: the service identifies them through /proc, which a hardened
 // process hides.
-var hardened = map[string]bool{"serve": true, "init": true, "add": true, "edit": true, "remove": true}
+var hardened = map[string]bool{"serve": true, "init": true, "add": true, "edit": true, "remove": true, "recover": true, "rekey": true}

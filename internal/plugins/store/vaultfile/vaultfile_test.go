@@ -370,32 +370,87 @@ func TestCreateKeepsTheKeyOfAVaultWrittenButNotDurable(t *testing.T) {
 	}
 }
 
+// The recovery slot opens the vault with the recovery key, and only with it.
 func TestRecoverySlot(t *testing.T) {
 	dir := t.TempDir()
 	prot := keyfile.New(filepath.Join(dir, "keys"))
 	s := New(filepath.Join(dir, "vaults", "dev.fcv"), "dev")
-	h, err := s.Create(ctx, prot, CreateOptions{Recovery: []byte("correct horse"), KDF: cheapKDF})
+	key := newRecoveryKey(t)
+	h, err := s.Create(ctx, prot, CreateOptions{Recovery: key, KDF: cheapKDF})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(h.SlotTypes) != 2 || h.SlotTypes[1] != SlotPassphrase {
+	if len(h.SlotTypes) != 2 || h.SlotTypes[1] != SlotRecovery {
 		t.Fatalf("slots %v", h.SlotTypes)
 	}
 	dek, release, _ := s.DEKFunc(prot)(ctx)
 	defer release()
-	got, err := s.UnsealPassphrase([]byte("correct horse"))
+	got, err := s.UnsealRecovery(key)
 	if err != nil || !bytes.Equal(got, dek) {
 		t.Fatalf("recovery: %v", err)
 	}
-	if _, err := s.UnsealPassphrase([]byte("wrong")); err == nil {
-		t.Fatal("wrong passphrase accepted")
+	if _, err := s.UnsealRecovery(newRecoveryKey(t)); err == nil || !strings.Contains(err.Error(), "wrong recovery key") {
+		t.Fatalf("another key: %v", err)
+	}
+	if raw, _ := os.ReadFile(s.Path()); bytes.Contains(raw, FormatRecoveryKey(key)) {
+		t.Fatal("the recovery key is in the vault file")
 	}
 	// A crafted file can't ask for absurd KDF memory.
 	f := readRaw(t, s.Path())
 	f["key_slots"].([]any)[1].(map[string]any)["kdf_params"] = map[string]any{"t": 3, "m": 1 << 30, "p": 4}
 	writeRaw(t, s.Path(), f)
-	if _, err := New(s.Path(), "dev").UnsealPassphrase([]byte("correct horse")); err == nil || !strings.Contains(err.Error(), "unsupported") {
+	if _, err := New(s.Path(), "dev").UnsealRecovery(key); err == nil || !strings.Contains(err.Error(), "unsupported") {
 		t.Fatalf("huge kdf: %v", err)
+	}
+	web := New(filepath.Join(dir, "vaults", "web.fcv"), "web")
+	if _, err := web.Create(ctx, prot, CreateOptions{Recovery: []byte("correct horse"), KDF: cheapKDF}); err == nil || web.Exists() {
+		t.Fatal("a chosen passphrase was taken as a recovery key")
+	}
+}
+
+func newRecoveryKey(t *testing.T) []byte {
+	t.Helper()
+	key, err := NewRecoveryKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return key
+}
+
+// A recovery key has 160 random bits, written in eight groups of four, and
+// reads back however it is typed: any case, with or without dashes and
+// spaces, I, L and O for 1, 1 and 0.
+func TestRecoveryKeyFormat(t *testing.T) {
+	key := newRecoveryKey(t)
+	if len(key) != 20 || bytes.Equal(key, newRecoveryKey(t)) {
+		t.Fatalf("key %x", key)
+	}
+	written := string(FormatRecoveryKey(key))
+	groups := strings.Split(written, "-")
+	if len(groups) != 8 {
+		t.Fatalf("written %q", written)
+	}
+	for _, g := range groups {
+		if len(g) != 4 || strings.Trim(g, "0123456789ABCDEFGHJKMNPQRSTVWXYZ") != "" {
+			t.Fatalf("written %q", written)
+		}
+	}
+	for _, typed := range []string{
+		written,
+		strings.ToLower(written),
+		strings.ReplaceAll(written, "-", ""),
+		strings.ReplaceAll(written, "-", " "),
+		" " + strings.ReplaceAll(strings.ReplaceAll(written, "1", "l"), "0", "O") + " ",
+	} {
+		got, err := ParseRecoveryKey([]byte(typed))
+		if err != nil || !bytes.Equal(got, key) {
+			t.Errorf("%q: %x %v", typed, got, err)
+		}
+	}
+	for _, bad := range []string{"", written[:len(written)-1], written + "0", "U" + written[1:], "correct horse battery staple"} {
+		if _, err := ParseRecoveryKey([]byte(bad)); err == nil {
+			t.Errorf("%q parsed", bad)
+		}
 	}
 }
 
@@ -406,5 +461,239 @@ func TestUnknownFieldsRefused(t *testing.T) {
 	writeRaw(t, v.Path(), f)
 	if _, err := New(v.Path(), "dev").Header(ctx); err == nil {
 		t.Fatal("unknown field accepted")
+	}
+}
+
+// renamed is a protector under another name, as after moving a vault to
+// another key protector.
+type renamed struct {
+	plugin.KeyProtector
+	name string
+}
+
+func (r renamed) Name() string { return r.name }
+
+// The recovery key seals the key again with the configured
+// protector: the data and DEK stay, the old protector slots go, and the
+// recovery slot stays for next time. A wrong key changes nothing.
+func TestResealWithTheRecoveryKey(t *testing.T) {
+	dir := t.TempDir()
+	prot := keyfile.New(filepath.Join(dir, "keys"))
+	s := New(filepath.Join(dir, "vaults", "dev.fcv"), "dev")
+	key := newRecoveryKey(t)
+	if _, err := s.Create(ctx, prot, CreateOptions{Recovery: key, KDF: cheapKDF}); err != nil {
+		t.Fatal(err)
+	}
+	dek, release, _ := s.DEKFunc(prot)(ctx)
+	if err := s.Put(ctx, dek, plugin.SecretMeta{ID: "a"}, plugin.SecretValue{Bytes: []byte("value")}); err != nil {
+		t.Fatal(err)
+	}
+	release()
+	before, _ := os.ReadFile(s.Path())
+
+	next := renamed{keyfile.New(filepath.Join(dir, "other-keys")), "next"}
+	if _, err := s.Reseal(ctx, next, newRecoveryKey(t)); err == nil || !strings.Contains(err.Error(), "wrong recovery key") {
+		t.Fatalf("wrong key: %v", err)
+	}
+	if after, _ := os.ReadFile(s.Path()); !bytes.Equal(before, after) {
+		t.Fatal("a refused reseal changed the file")
+	}
+
+	replaced, err := s.Reseal(ctx, next, key)
+	if err != nil || len(replaced) != 1 || replaced[0] != "file" {
+		t.Fatalf("reseal: %v %v", replaced, err)
+	}
+	h, _ := New(s.Path(), "dev").Header(ctx)
+	if len(h.SlotTypes) != 2 || h.SlotTypes[0] != "next" || h.SlotTypes[1] != SlotRecovery {
+		t.Fatalf("slots %v", h.SlotTypes)
+	}
+	s2 := New(s.Path(), "dev")
+	if _, _, err := s2.DEKFunc(prot)(ctx); err == nil {
+		t.Fatal("the replaced protector still opens the vault")
+	}
+	dek2, release2, err := s2.DEKFunc(next)(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release2()
+	if _, v, err := s2.Read(ctx, dek2, "a"); err != nil || string(v.Bytes) != "value" {
+		t.Fatalf("read after reseal: %q %v", v.Bytes, err)
+	}
+
+	noRecovery := newVault(t, t.TempDir(), "web")
+	if _, err := noRecovery.Reseal(ctx, next, key); err == nil || !strings.Contains(err.Error(), "has no recovery slot") {
+		t.Fatalf("vault without recovery: %v", err)
+	}
+}
+
+// A recovery slot that the key opens but that wraps some other DEK is
+// refused before anything is sealed or written: the working protector slot
+// stays.
+func TestResealRefusesARecoverySlotForAnotherKey(t *testing.T) {
+	dir := t.TempDir()
+	prot := keyfile.New(filepath.Join(dir, "keys"))
+	s := New(filepath.Join(dir, "vaults", "dev.fcv"), "dev")
+	key := newRecoveryKey(t)
+	if _, err := s.Create(ctx, prot, CreateOptions{Recovery: key, KDF: cheapKDF}); err != nil {
+		t.Fatal(err)
+	}
+	f, _ := s.load()
+	f = f.clone()
+	slot, err := recoverySlot(f, bytes.Repeat([]byte{7}, dekSize), key, cheapKDF)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.KeySlots[1] = slot
+	if err := s.write(f); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := os.ReadFile(s.Path())
+
+	next := renamed{keyfile.New(filepath.Join(dir, "other-keys")), "next"}
+	if _, err := s.Reseal(ctx, next, key); err == nil || !strings.Contains(err.Error(), "doesn't open this vault") {
+		t.Fatalf("reseal: %v", err)
+	}
+	if after, _ := os.ReadFile(s.Path()); !bytes.Equal(before, after) {
+		t.Fatal("a refused reseal changed the file")
+	}
+	if _, _, err := New(s.Path(), "dev").DEKFunc(prot)(ctx); err != nil {
+		t.Fatalf("the working slot was lost: %v", err)
+	}
+}
+
+// Rekey encrypts every value and the metadata again under a new DEK and a
+// new vault id, with fresh entry ids and nonces. The secrets come through
+// intact; the old DEK, the old recovery key and, once destroyed, the old
+// protector entry open nothing in the new file. A copy of the old file
+// still opens with its old recovery key: rekey can't reach copies.
+func TestRekeyReplacesEveryKeyAndKeepsTheSecrets(t *testing.T) {
+	dir := t.TempDir()
+	prot := keyfile.New(filepath.Join(dir, "keys"))
+	s := New(filepath.Join(dir, "vaults", "dev.fcv"), "dev")
+	oldKey := newRecoveryKey(t)
+	h, err := s.Create(ctx, prot, CreateOptions{Recovery: oldKey, KDF: cheapKDF})
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldDEK, _, _ := s.DEKFunc(prot)(ctx)
+	bin := []byte{0, 0xff, '\n'}
+	s.Put(ctx, oldDEK, plugin.SecretMeta{ID: "a", Description: "about a"}, plugin.SecretValue{Bytes: []byte("value-a")})
+	s.Put(ctx, oldDEK, plugin.SecretMeta{ID: "bin"}, plugin.SecretValue{Bytes: bin})
+	before, _ := s.List(ctx, oldDEK)
+	oldRaw, _ := os.ReadFile(s.Path())
+	copyPath := filepath.Join(dir, "copy", "vaults", "dev.fcv")
+	os.MkdirAll(filepath.Dir(copyPath), 0o700)
+	os.WriteFile(copyPath, oldRaw, 0o600)
+
+	newKey := newRecoveryKey(t)
+	r, err := s.Rekey(ctx, prot, CreateOptions{Recovery: newKey, KDF: cheapKDF})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Old.VaultID != h.VaultID || r.New.VaultID == h.VaultID || len(r.Replaced) != 1 || r.Replaced[0] != "file" {
+		t.Fatalf("rekeyed %+v", r)
+	}
+	if err := prot.Destroy(ctx, r.Old, r.OldSealed); err != nil {
+		t.Fatal(err)
+	}
+
+	s2 := New(s.Path(), "dev")
+	hdr, _ := s2.Header(ctx)
+	if hdr.VaultID != r.New.VaultID || len(hdr.SlotTypes) != 2 || hdr.SlotTypes[1] != SlotRecovery {
+		t.Fatalf("header %+v", hdr)
+	}
+	dek, release, err := s2.DEKFunc(prot)(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	if bytes.Equal(dek, oldDEK) {
+		t.Fatal("the DEK didn't change")
+	}
+	after, err := s2.List(ctx, dek)
+	if err != nil || len(after) != 2 || after[0] != before[0] || after[1] != before[1] {
+		t.Fatalf("metadata %v: %+v, was %+v", err, after, before)
+	}
+	if _, v, err := s2.Read(ctx, dek, "a"); err != nil || string(v.Bytes) != "value-a" {
+		t.Fatalf("read a: %q %v", v.Bytes, err)
+	}
+	if _, v, err := s2.Read(ctx, dek, "bin"); err != nil || !bytes.Equal(v.Bytes, bin) {
+		t.Fatalf("read bin: %x %v", v.Bytes, err)
+	}
+	// Nothing of the old file is reused.
+	oldF, newF := readRaw(t, copyPath), readRaw(t, s.Path())
+	for id := range oldF["entries"].(map[string]any) {
+		if _, ok := newF["entries"].(map[string]any)[id]; ok {
+			t.Fatal("an entry id was kept")
+		}
+	}
+	if oldF["meta"].(map[string]any)["nonce"] == newF["meta"].(map[string]any)["nonce"] {
+		t.Fatal("the meta nonce was kept")
+	}
+
+	if _, err := s2.List(ctx, oldDEK); err == nil {
+		t.Fatal("the old DEK opens the new file")
+	}
+	if _, err := s2.UnsealRecovery(oldKey); err == nil || !strings.Contains(err.Error(), "wrong recovery key") {
+		t.Fatalf("the old recovery key: %v", err)
+	}
+	if got, err := s2.UnsealRecovery(newKey); err != nil || !bytes.Equal(got, dek) {
+		t.Fatalf("the new recovery key: %v", err)
+	}
+	// The old file's protector slot names the old entry, which is gone.
+	f := readRaw(t, s.Path())
+	f["key_slots"].([]any)[0] = oldF["key_slots"].([]any)[0]
+	writeRaw(t, s.Path(), f)
+	if _, _, err := New(s.Path(), "dev").DEKFunc(prot)(ctx); err == nil {
+		t.Fatal("the old protector slot opens the new file")
+	}
+	old := New(copyPath, "dev")
+	if _, _, err := old.DEKFunc(prot)(ctx); err == nil {
+		t.Fatal("the old copy still opens through the destroyed protector entry")
+	}
+	if got, err := old.UnsealRecovery(oldKey); err != nil || !bytes.Equal(got, oldDEK) {
+		t.Fatalf("the old copy with its old recovery key: %v", err)
+	}
+}
+
+// failingSeal is a protector whose Seal fails.
+type failingSeal struct{ plugin.KeyProtector }
+
+func (failingSeal) Seal(context.Context, plugin.KeyRef, []byte) ([]byte, error) {
+	return nil, errors.New("no TPM")
+}
+
+// A rekey that fails part way leaves the old vault as it was, openable, and
+// no protector entry for the new one behind.
+func TestRekeyFailingMidwayLeavesTheOldVault(t *testing.T) {
+	defer func() { writeFileAtomic = fsutil.WriteFileAtomic }()
+	dir := t.TempDir()
+	prot := keyfile.New(filepath.Join(dir, "keys"))
+	v := newVault(t, dir, "dev")
+	v.put(t, "a", "value-a")
+	before, _ := os.ReadFile(v.Path())
+
+	if _, err := v.Rekey(ctx, failingSeal{prot}, CreateOptions{}); err == nil {
+		t.Fatal("rekey without a seal")
+	}
+	writeFileAtomic = func(string, []byte, os.FileMode) error { return errors.New("disk full") }
+	if _, err := v.Rekey(ctx, prot, CreateOptions{}); err == nil || errors.Is(err, fsutil.ErrNotDurable) {
+		t.Fatalf("rekey with a failing write: %v", err)
+	}
+	writeFileAtomic = fsutil.WriteFileAtomic
+
+	if after, _ := os.ReadFile(v.Path()); !bytes.Equal(before, after) {
+		t.Fatal("a failed rekey changed the file")
+	}
+	if keys, _ := filepath.Glob(filepath.Join(dir, "keys", "*")); len(keys) != 1 {
+		t.Fatalf("protector entries left: %v", keys)
+	}
+	dek, release, err := New(v.Path(), "dev").DEKFunc(prot)(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	if _, val, err := v.Read(ctx, dek, "a"); err != nil || string(val.Bytes) != "value-a" {
+		t.Fatalf("read: %q %v", val.Bytes, err)
 	}
 }

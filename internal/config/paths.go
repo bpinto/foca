@@ -94,7 +94,7 @@ func (p Paths) VaultFile(vault string) string {
 	return filepath.Join(p.VaultsDir(), vault+".fcv")
 }
 
-// KeysDir holds the file key protector's keys (insecure, opt-in).
+// KeysDir holds the file key protector's keys (test builds only).
 func (p Paths) KeysDir() string { return filepath.Join(p.DataDir, "keys") }
 
 // PIDFile is where serve records its pid so the host CLI can signal it.

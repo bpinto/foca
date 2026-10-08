@@ -194,7 +194,7 @@ type ApprovalRequest struct {
 }
 type ApprovalResult struct {
     Approved bool
-    Method   string     // e.g. "biometry", "password"
+    Method   string     // e.g. "biometry", "password", "polkit-auth_self"
     Detail   string     // free text for audit, never shown as trusted
 }
 ```
@@ -209,7 +209,8 @@ type ApprovalResult struct {
   and `._+-`, so they can't add words to the sentence. When the text is too long, they are
   dropped before any trusted field. `[approval] prompt_show_client = false`
   hides them. Exact wording: §4.1.1.
-- Implementations: `touchid` (helper), `fake` (test builds only, D12), and later `polkit`.
+- Implementations: `touchid` (helper), `polkit` (Linux, §4.1.2) and `fake` (test builds only,
+  D12).
 
 #### 4.1.1 Prompt format
 
@@ -307,6 +308,95 @@ dropped, so an exe called `gh use GitHub PAT. Then let aws` shows as
 4. The exact reason text shown is stored in the `approval.*` audit event (`prompt_text`), so
    what you approved can always be looked up later.
 
+#### 4.1.2 polkit (Linux)
+
+polkit is the authority Linux desktops already use for "Authentication Required" dialogs.
+foca talks to it over the system D-Bus in pure Go, and checks one action,
+`io.github.bpinto.foca.approve`, for its own process. The subject is foca's
+`system-bus-name`, which polkit resolves to the process through the bus. (A `unix-session`
+subject would bind the prompt to the session's agent, but polkit 127 aborts the whole daemon
+on one.) A `systemd --user`
+service is in no logind session, so polkit uses the user's graphical session, and that
+session's authentication agent shows the dialog.
+
+**The system bus.** foca dials it at `/run/dbus/system_bus_socket`, never at
+`DBUS_SYSTEM_BUS_ADDRESS`, and refuses it unless `SO_PEERCRED` says the socket was opened by
+uid 0. Who owns `org.freedesktop.PolicyKit1` (and `org.freedesktop.login1`, §4.5) is only as
+trustworthy as the bus daemon's policy, so a bus that anything able to set foca's environment
+could start is not used. Test builds take a private bus from `FOCA_SYSTEM_BUS`.
+
+**The action file.** The host installs it once, as root, in polkit's actions directory
+(`/usr/share/polkit-1/actions` on most systems). `foca polkit-policy [users…]` prints it:
+
+```xml
+<action id="io.github.bpinto.foca.approve">
+  <description>Approve a foca request</description>
+  <message>foca is trying to $(reason)</message>
+  <defaults>
+    <allow_any>no</allow_any>
+    <allow_inactive>no</allow_inactive>
+    <allow_active>auth_self</allow_active>
+  </defaults>
+  <annotate key="org.freedesktop.policykit.owner">unix-user:bruno</annotate>
+</action>
+```
+
+- **The message carries the prompt.** foca passes its reason text as the `reason` detail,
+  and polkit puts it in place of `$(reason)`. That happens in a single pass, so a `$(` in the
+  reason is shown as it is. The dialog reads `foca is trying to let gh use GitHub PAT in VM
+  dev, via claude.`, the same sentence Touch ID shows (§4.1.1). Some agents read the message
+  as Pango markup or Qt rich text, where a `<` in a param value could open a tag that hides
+  the text after it, so `<`, `>` and `&` go to polkit as `\u003c`, `\u003e` and `\u0026`,
+  which every agent shows alike, as text. (`&lt;` would read as `<` in one agent and as
+  itself in another.) A param value can't fake an escape: it is quoted, so its own
+  backslashes show doubled. The audit records the prompt as the core wrote it.
+- **The owner annotation lets the text through.** polkit takes details only from root or
+  from an action's owners, so a process can't put words on a dialog for another program's
+  action. The file therefore names every user who runs foca.
+- **Every time, never kept.** The defaults ask an active local session for the user's own
+  password (or whatever the PAM stack behind the agent accepts, such as a fingerprint).
+  `auth_admin` works too. foca never uses `*_keep` or `yes`: reuse is the job of its own
+  grants, which a lock or sleep wipes (§9.5).
+
+**Checks before every prompt.** `Available` and `Approve` both:
+
+1. read the action through `EnumerateActions`. It must exist, its message must be exactly
+   `foca is trying to $(reason)`, and its owner annotation must list this user, by name or
+   uid. polkit gives an agent the message in the agent's own locale (its `LANG`, or
+   `en_US.UTF-8` without one), where a translation in the file (`<message xml:lang=…>`, or a
+   gettext domain) would replace foca's text. foca can't see an agent's locale, so the message
+   must be exact as written and in `C`, `en_US.UTF-8` and the service's own `LC_ALL`,
+   `LC_MESSAGES` and `LANG`;
+2. ask `CheckAuthorization` with the same details and **no** interaction, so no UI is shown.
+   polkit answers with what it would require once rules are applied. "Already authorized"
+   (a rule says yes, or an approval polkit kept) is refused. So is "not authorized, no
+   challenge" (an inactive or remote session), a challenge polkit would retain
+   (`polkit.retains_authorization_after_challenge`), and a `polkit.result` other than
+   `auth_self` or `auth_admin`. polkit before 127 sends no `polkit.result`; a challenge it
+   won't retain is then still one of the two.
+
+A failed check means no prompt can be shown: `auth_unavailable`, with the reason.
+
+**The prompt.** It is a second `CheckAuthorization` with `AllowUserInteraction`, on the same
+connection, with the request id as the cancellation id. polkit's answers map like this:
+
+| polkit answers | foca |
+|---|---|
+| authorized | approved, method `polkit-auth_self` or `polkit-auth_admin` (`polkit` when polkit didn't say which) |
+| authorized with a temporary authorization id | revoked through `RevokeTemporaryAuthorizationById`, then an error: polkit kept it, so it could answer the next prompt by itself |
+| not authorized, challenge | no agent took the prompt: `auth_unavailable` |
+| not authorized, `polkit.dismissed` | denied (`dismissed`) |
+| not authorized | denied (`authentication failed`) |
+| error `Cancelled` foca didn't ask for | timeout |
+
+When the deadline passes or the client hangs up, foca calls `CancelCheckAuthorization`, and
+polkit takes the dialog down.
+
+**Trust.** As with logind, foca trusts the system bus to give `org.freedesktop.PolicyKit1`
+only to polkitd. polkitd itself checks the answer: an agent can only pass the user's
+password to polkit's setuid helper, and polkit takes the result only from uid 0. The agent
+does draw the dialog, though, and it runs as the user (§12.4).
+
 ### 4.2 Key protector: "keep the vault's data key safe"
 
 The vault is encrypted with a random 256-bit **data encryption key (DEK)**. A key protector
@@ -331,9 +421,57 @@ type KeyRef struct {
 - Keychain account = `foca:<vault>:<vault-id>`. Every vault gets its own entry, and
   initialising a scratch vault can never overwrite another one. The account is keyed by a
   stable id, not the file path, so moving the file doesn't strand the key.
-- Implementations: `file` (KEK in a 0600 file; refused unless config sets
-  `insecure_file_protector = true`), `keychain` (helper, §5), and later `secure-enclave`,
-  `tpm`, `libsecret`, `keyring`.
+- Implementations: `keychain` (macOS, helper, §5), `tpm` (Linux, below), `file` (KEK in a
+  0600 file next to the vault: test builds only, like the `fake` authenticator, so no config
+  line can leave a vault key in plain sight), and later `secure-enclave`, `libsecret`,
+  `keyring`.
+
+#### 4.2.1 TPM (Linux)
+
+`key_protector = "tpm"` seals each vault's DEK to the machine's TPM 2.0, pure Go
+(`github.com/google/go-tpm`) over `/dev/tpmrm0` (`[key_protectors.tpm] device`).
+
+- **Sealed under the storage key.** Each seal and unseal creates the storage key again from
+  the owner hierarchy's seed (the standard ECC P-256 template), so nothing is kept in the
+  TPM or on disk. The DEK becomes a sealed data object under it, `fixedTPM` and
+  `fixedParent`, and the slot holds its public and private parts. Another machine's TPM, or
+  this one after its owner hierarchy is cleared, can't load it.
+- **Bound to the boot state.** By default the object's policy is PolicyPCR over PCR 7 in the
+  SHA-256 bank. PCR 7 measures the Secure Boot state and its keys (PK, KEK, db, dbx) and the
+  certificates that verified what booted. It doesn't measure the kernel, its command line or
+  the initrd: any boot chain signed with the same keys leaves it unchanged, whether another
+  distribution's signed shim or this one's bootloader with an edited kernel command line.
+  With Secure Boot off it reads the same whatever boots, so sealing to PCR 7 (at `init`,
+  `recover` and `rekey`) needs Secure Boot on: foca reads the firmware's `SecureBoot`
+  variable and refuses when it is off or can't be read. `[key_protectors.tpm] pcrs` changes
+  the list (each 0–23, no repeats), and choosing a list without 7 is how a machine without
+  Secure Boot opts out of that check. Adding PCRs narrows the binding: 0 and 2 (firmware and
+  option ROMs), 4 (the boot manager and what it loads), 8 and 9 (GRUB's commands and the
+  files it reads, the kernel command line among them), 11 (systemd-boot's unified kernel
+  image). Each one also changes with updates to what it measures, and every such change
+  needs `foca recover` afterwards. `pcrs = []` binds to none. A key sealed under other PCRs
+  than the config names is refused, never opened under the weaker binding. `noDA` keeps a
+  failing unseal from counting towards the TPM's dictionary-attack lockout.
+- **Never on the bus in clear.** Every command that carries the DEK runs in a session salted
+  with the storage key and encrypted with AES-128 (`encryptIn` to seal, `encryptOut` to
+  unseal). Someone listening on the bus to a discrete TPM sees only ciphertext. The slot
+  records the storage key's name when the DEK is sealed, and an unseal refuses a storage key
+  with another name before it salts anything, so something on the bus that answers
+  `CreatePrimary` with its own key can't read the DEK. `init` and `recover` take the storage
+  key as the TPM gives it, since a cleared TPM legitimately has a new one; `rekey` unseals
+  first, so its new slot is sealed under the key the old one named.
+- **Recovery.** If the PCRs change (firmware, Secure Boot keys or settings), the TPM refuses
+  to unseal: reads fail as internal errors, audited with the way out. The slot records the
+  digest of the PCR values it was sealed to, so a slot whose record doesn't match the sealed
+  object's policy is reported as altered rather than as a boot change. `foca recover --vault
+  <name>` unlocks the DEK with the vault's recovery key and seals it again in today's
+  state (§10). Because of that, `foca init` with a PCR binding requires `--recovery`.
+- **What it protects against.** A copied disk or data directory, a vault file restored to
+  another machine, and with PCR 7, this machine booted with Secure Boot turned off or its keys
+  changed; with more PCRs, also a different bootloader, kernel or command line, as far as
+  those PCRs measure them. It doesn't stop code running as the user on this machine while it
+  is booted as sealed: that code can ask the TPM to unseal just as foca does, which is why
+  every access still needs approval (§12.4).
 
 ### 4.3 Secret store: "hold encrypted values and their metadata"
 
@@ -695,7 +833,7 @@ the host, working directly on host files:
 
 | Host CLI operation | How | Approval |
 |---|---|---|
-| `init`, `add`, `edit`, `remove` (`reset` is reserved, not built) | takes an exclusive `flock` on the vault, asks through the configured authenticator, unseals the DEK through the key protector, writes atomically, appends the audit event | **yes** |
+| `init`, `add`, `edit`, `remove`, `recover`, `rekey` (`reset` is reserved, not built) | takes an exclusive `flock` on the vault, asks through the configured authenticator, unseals the DEK through the key protector (`recover`: through the recovery key), writes atomically, appends the audit event | **yes** |
 | `lock` (wipe now) | sends `SIGUSR1` to the service | no (tightening) |
 | `reload` (config) | checks the config, then sends `SIGHUP`; a config that fails validation keeps the old one. A good one replaces the running service: open connections close and pending approvals are cancelled | no |
 | `stop` | sends `SIGTERM`, or uses launchctl / systemctl | no |
@@ -792,6 +930,7 @@ treated as config (rule 3).
 - The exposure rules in §7.1 hold. For example, a vault can't be shared by accident.
 - `touchid`, `keychain` and `platform_events = "darwin"` are refused on any OS but macOS
   (test builds excepted, so the fake helper can stand in on Linux).
+- `authenticator = "polkit"` is refused on any OS but Linux.
 
 ### 7.1 Instances, vaults and exposure (D20)
 
@@ -880,11 +1019,15 @@ opaque_peers = ["ssh", "sshd", "sshd-session", "socat", "nc", "ncat", "systemd-s
 
 [plugins]
 authenticator   = "touchid"        # touchid | polkit   (fake: test builds only)
-key_protector   = "keychain"       # keychain | file | ...
+key_protector   = "keychain"       # keychain (macOS) | tpm (Linux)   (file: test builds only)
 secret_store    = "vault-file"     # the default; memory is for tests
 peer_identifier = "auto"           # by OS
 platform_events = "auto"           # darwin | logind | none
 audit_sink      = "jsonl"
+
+[key_protectors.tpm]               # with key_protector = "tpm" on Linux (§4.2.1)
+device = "/dev/tpmrm0"
+pcrs   = [7]                       # Secure Boot state and keys (needs it on); [] binds to none
 
 [approval]
 prompt_timeout = "60s"
@@ -1044,7 +1187,7 @@ continues.
 `server.start` · `server.stop` · `config.load` · `config.reload` · `approval.granted` ·
 `approval.denied` · `approval.reused` · `approval.timeout` · `secret.list` · `secret.read` ·
 `action.list` · `action.run` · `secret.add` · `secret.update` · `secret.remove` · `vault.init`
-· `vault.reset` (reserved for `reset`, not built) · `grants.drop` · `lock` (with `reason`: `sleep`, `screen-lock`,
+· `vault.recover` · `vault.rekey` · `vault.reset` (reserved for `reset`, not built) · `grants.drop` · `lock` (with `reason`: `sleep`, `screen-lock`,
 `session-end`, `shutdown`, `reload`, `manual`, `expired`, `events-unhealthy`, and `count`, the
 grants dropped) · `request.rejected`.
 
@@ -1361,7 +1504,7 @@ planned but not built (§17).
   "vault_id": "01J…", "vault": "common", "cipher": "aes-256-gcm",
   "key_slots": [
     { "type": "keychain",   "sealed": "<base64>" },
-    { "type": "passphrase", "kdf": "argon2id",
+    { "type": "recovery-key", "kdf": "argon2id",
       "kdf_params": {"t":3,"m":65536,"p":4}, "salt": "<b64>", "nonce": "<b64>", "wrapped": "<b64>" }
   ],
   "meta":    { "nonce": "<b64>", "ct": "<b64>" },
@@ -1370,7 +1513,7 @@ planned but not built (§17).
 ```
 
 - **Random DEK, wrapped in key slots** (like LUKS). Changing the protector or the recovery
-  passphrase never re-encrypts the data. The data key is never derived from the passphrase
+  key never re-encrypts the data. The data key is never derived from the recovery key
   directly.
 - **`meta`** is the encrypted list of `SecretMeta` plus `id → entry-id`. Entry ids are random,
   so the plaintext file doesn't reveal secret names.
@@ -1387,8 +1530,32 @@ planned but not built (§17).
   crash, but nothing is rolled back: `init` keeps the protector entry the new file needs.
 - **Fresh 96-bit random nonce on every write.** Writes are atomic: temp file in the same
   directory, `fsync`, `rename`, `fsync` the directory. Mode 0600, data dir 0700.
-- The passphrase slot is optional and set by `foca init --recovery` through an
-  interactive prompt or stdin, never argv. KDF is Argon2id from `golang.org/x/crypto`.
+- **The recovery key slot is optional**, made by `foca init --recovery`. foca makes the key:
+  160 random bits, never a passphrase someone picks. With a TPM, the slot is the one way
+  into a copied vault file, so it must be out of reach of an offline guess, and a chosen
+  passphrase often isn't. The slot wraps the DEK with a key derived by Argon2id from
+  `golang.org/x/crypto`; KDF parameters read from a file are bounded. The key is written as
+  eight groups of four Crockford base32 characters (`7KQ2-…`), to stdout and only once: a
+  terminal shows it to be copied down, a pipe or file takes it as one line (for a password
+  manager). It never goes to stderr, argv, a log or the audit log. `foca recover` reads it
+  from a hidden prompt or stdin; case, dashes and spaces don't matter, and I, L and O read as
+  1, 1 and 0. It unlocks the DEK with it, checks that this DEK opens the vault, and replaces
+  every protector slot with one sealed by the configured protector, after a TPM's boot state
+  changed. It asks for approval and is audited as `vault.recover`; the recovery slot stays.
+- **`foca rekey` replaces the DEK.** It unseals the DEK through the key protector, decrypts
+  the metadata and every value, and encrypts them again under a new random DEK and a new
+  `vault_id`, with fresh entry ids and nonces. The new file gets a protector slot and, if the
+  vault had a recovery key (or with `--recovery`), a new recovery key, shown once like
+  `init`'s. It replaces the file atomically, asks for approval and is audited as
+  `vault.rekey` (`old_vault_id`, `vault_id`, `protector`, `replaced`, `recovery_key`); once
+  that is recorded, the old protector entry is destroyed (a Keychain item; a TPM slot lives
+  only in the file, so there is nothing to destroy). If the write or the record fails, the old
+  file stays, or is put back, and the new protector entry goes.
+  Rekey is how to revoke what a copy of the file holds, going forward: from then on, the old
+  recovery key, the old DEK and the old protector slot open nothing in the vault. It can't
+  revoke a copy already taken: that copy still opens with its old recovery key, and on the
+  same TPM with its old slot, and shows the secrets as they were then. Secrets that a copy
+  may have exposed have to be changed where they are issued.
 
 ---
 
@@ -1569,8 +1736,10 @@ Secret values; the DEK; the ability to run host actions; config integrity; audit
 - **Loosening policy.** Policy lives only in host config, combines "stricter wins", has an 8 h
   cap in code, and is always wiped on sleep, lock and shutdown.
 - **Secrets at rest.** AES-256-GCM vault with per-entry AAD. The DEK is sealed by a platform
-  protector and is never stored in plaintext on disk. Secrets never appear in argv or shell
-  history.
+  protector (Keychain on macOS, the TPM on Linux) and is never stored in plaintext on disk; a
+  copied disk or data directory can't be opened elsewhere, and the optional recovery slot
+  takes a 160-bit key foca makes, not a passphrase that could be guessed offline. Secrets
+  never appear in argv or shell history.
 - **Unattended machine.** Sleep, screen lock and session end wipe grants and the DEK. A
   wall-clock watchdog backs this up.
 - **Prompt floods and confusing prompts.** One prompt at a time, across the service and the
@@ -1599,16 +1768,24 @@ Secret values; the DEK; the ability to run host actions; config integrity; audit
     the loosened policy a read or action still needs at least one approval, and the reload
     and every access are audited;
   - on macOS, read daemon memory (a debugger). On Linux the service and the host commands
-    that unseal a vault (`init`, `add`, `edit`, `remove`) aren't dumpable, so only root can
-    attach to them or read their memory, environment or executable through `/proc`. Socket
-    clients stay readable: the service identifies them through `/proc`;
+    that unseal a vault (`init`, `add`, `edit`, `remove`, `recover`, `rekey`) aren't dumpable, so only
+    root can attach to them or read their memory, environment or executable through
+    `/proc`. Socket clients stay readable: the service identifies them through `/proc`;
   - drive the helper;
+  - on Linux, register a polkit authentication agent for foca's process. polkit asks that
+    agent before the session's, and allows any process of the same user to register one.
+    It can't approve without the user's password (polkit takes the answer only from its
+    setuid helper), but it can show other text, or ask for the password and keep it. Where
+    the desktop's own agent is a separate process (KDE, most others), such code can also
+    replace it;
   - under ad-hoc signing, read the plain Keychain item holding the DEK, because Touch ID is
     enforced by our code and not by the item (§5).
+  - on Linux, ask the TPM to unseal a vault key, as foca does: the TPM binds the key to this
+    machine and its boot state, not to foca or to the user's presence (§4.2.1).
 
-  This is not a boundary. A Secure Enclave
-  protector that needs user presence for every unseal would raise the bar, but needs a signed
-  `.app`.
+  This is not a boundary. A Secure Enclave protector that needs user presence for every
+  unseal would raise the bar, but needs a signed `.app`; on Linux, a FIDO2 key's
+  `hmac-secret` with a touch for every unseal would do the same.
 - **Go memory hygiene.** Values are kept as `[]byte` and zeroed after use, but the GC may have
   copied them, and the JSON encoder makes intermediate copies. This is best effort.
 - **Children that leave an action's process group.** foca kills what is left of the group
@@ -1789,11 +1966,14 @@ internal/server/wiring/   config → plugins; test-only plugins gated by the foc
 internal/plugin/          plugin interfaces
 internal/plugin/helper/   helper adapter (authenticator, key protector, events over stdio), the Go fake
                           helper and the conformance suite
+internal/plugin/authntest/ authenticator conformance suite, run by every authenticator
 internal/darwinproc/      macOS process reads without cgo: audit token, pid version, exe path
 internal/policy/          approval-policy lattice: meet, effective policy, the code floor, reach wording
 internal/action/          action specs: param checks, argument templates, output formats, masking
-internal/plugins/…        authn/fake, store/memory, store/vaultfile, keyprot/file, provider/static,
-                          provider/command, peer (linux, darwin), events/logind; later keyprot/*
+internal/plugins/…        authn/fake, authn/polkit (and its test harness, polkittest), store/memory,
+                          store/vaultfile, keyprot/file (test builds only), keyprot/tpm (and its
+                          test harness, tpmtest), provider/static, provider/command, peer (linux,
+                          darwin), events/logind; later keyprot/*
 internal/audit/           event types (v1) + sinks: memory, jsonl
 internal/config/          TOML load and validation, paths
 internal/identity/        host-verified, guest-verified and reported identity, one distinct type each
@@ -1804,7 +1984,9 @@ internal/format/          output formatters: raw, json, env
 helpers/darwin/           Swift package: foca-darwin
 scripts/                  build-darwin.sh (signed helper, pinned into foca), build-linux.sh
 .github/workflows/        test (every push and pull request), release (tip from main, v* tags)
-flake.nix                 dev shell (go, gopls, socat, dbus for the logind tests; gcc only for `go test -race`)
+flake.nix                 dev shell (go, gopls, socat; dbus for the logind and polkit tests; bubblewrap and
+                          FOCA_POLKITD to run the real polkitd in tests; swtpm and FOCA_SWTPM for the
+                          TPM tests; gcc only for `go test -race`)
 ```
 
 A test, `internal/client/boundary_test.go`, fails if client-side code ever imports
@@ -1812,8 +1994,8 @@ A test, `internal/client/boundary_test.go`, fails if client-side code ever impor
 the vault, keys or plugins.
 
 Dependencies:
-- Core: `golang.org/x/sys`, `golang.org/x/crypto`, `BurntSushi/toml`, `godbus/dbus/v5` (logind).
-  The ids package is in-house.
+- Core: `golang.org/x/sys`, `golang.org/x/crypto`, `BurntSushi/toml`, `godbus/dbus/v5` (logind and
+  polkit), `google/go-tpm` (TPM key protector). The ids package is in-house.
 - CLI (D21): `alecthomas/kong`, `charmbracelet/huh` (with Lip Gloss) and `golang.org/x/term`.
   These are imported only by `internal/cli`, never by the service packages. A boundary test
   keeps `huh` and its UI stack out of `internal/server`.
@@ -1847,7 +2029,7 @@ noted; packages are named as in `go test` output (`main` is `cmd/foca`, whose te
 | prompts: claims never stated as fact, unsealed names marked, no name elided | `core.TestPromptWording`, `core.TestPromptNeverElidesCredentials`, `core.TestOversizedBatchRefusedBeforePrompting`, `peer.TestMountsCantLendASealedName`, `peer.TestLoadedCodeMustBeSealedToo` |
 | a realm can't exhaust the service or flood the log | `server.TestConnectionCapPerInstance`, `core.TestReadsAndListsAreRateLimited`, `core.TestUnapprovedEventsAreCoalesced`, `core.TestTooManyRunningIsBusy` |
 | config rejections and file trust | `config.TestRejections`, `config.TestPolicyRejections`, `config.TestLoadChecksFileTrust` |
-| test-only plugins unreachable in a production build | `wiring.TestFakeAuthenticatorRefusedInProductionBuild`, `cli.TestServiceDoesNotImportCLIUI` |
+| test-only plugins unreachable in a production build | `wiring.TestFakeAuthenticatorRefusedInProductionBuild`, `wiring.TestFileProtectorRefusedInProductionBuild`, `cli.TestProductionBuildLinksNoTestCode`, `cli.TestServiceDoesNotImportCLIUI` |
 | **Vaults, exposure and the host CLI** | |
 | a vault shared without explicit `expose` is a config error | `config.TestImplicitPrivateVaultCollisionCountsAsSharing` |
 | an unexposed secret looks like `not_found` and is audited; private vaults can't see each other | `core.TestUnexposedLooksLikeMissingButIsAuditedWithReason`, `cli.TestHostCLIAndClientEndToEnd` |
@@ -1857,7 +2039,7 @@ noted; packages are named as in `go test` output (`main` is `cmd/foca`, whose te
 | formatters | `format.TestJSONGolden`, `format.TestEnvGolden`, `format.TestEnvRefusesWhatItCantHold` |
 | add, edit and remove name every realm affected | `core.TestAddNamesEveryRealmThatWillSeeTheSecret`, `core.TestEditNamesEveryRealmThatReadsIt`, `core.TestRemoveNamesRealmsThatLoseIt` |
 | signals only reach a verified service | `svcctl.TestSignalRefusesUnverifiedProcesses`, `svcctl.TestSignalRefusesOtherUID`, `svcctl.TestPinRefusesAChangedProcess` (macOS) |
-| key holders hide their memory | `main.TestBinaryKeyHoldersHideTheirMemory` |
+| key holders hide their memory | `main.TestBinaryKeyHoldersHideTheirMemory`, `cli.TestKeyHoldingCommandsArePrivate` |
 | `--only` never splits a vault; one process per instance | — |
 | **Policy, grants and wipes** | |
 | lattice laws; no setting loosens; the 8 h cap | `policy.TestLatticeLaws`, `policy.TestEffectiveNeverLoosens`, `policy.TestLooseningAttempts`, `core.TestEightHourCap` |
@@ -1874,10 +2056,10 @@ noted; packages are named as in `go test` output (`main` is `cmd/foca`, whose te
 | masked output holds no encoding of a secret | `action.TestMaskTailNeverShowsAPartialSecret`, `action.TestOverlappingSecretsAreMaskedTogether`, `command.TestMaskedOutputContainsNoSecretEncoding` |
 | an action can't loosen its secrets; a grant covers only its params | `config.TestActionPolicyMeetsItsSecrets`, `core.TestActionGrantCoversOnlyItsParams` |
 | **Authenticators and key protectors** | |
-| authenticator conformance (`authntest`) | — |
-| polkit shows nothing it can't control | — |
-| TPM: round trip, the key never on the bus in clear, a boot change refuses until `recover`, another TPM or storage key can't unseal | — |
-| recovery keys shown once; rekey leaves the old keys opening nothing | — |
+| authenticator conformance (`authntest`) | `polkit.TestConformanceFakeAuthority`, `polkit.TestConformanceRealPolkitd` (every case but approval, which only uid 0 can give), `helper` and `fake` run it too |
+| polkit shows nothing it can't control | `polkit.TestRealPolkitdRefusesWhatWouldNotAsk`, `polkit.TestActionMustBeInstalledAsFocaNeedsIt`, `polkit.TestRealPolkitdTranslatedMessageIsRefused`, `polkit.TestMarkupInThePromptReachesPolkitEscaped`, `main.TestBinaryPolkit` |
+| TPM: round trip, the key never on the bus in clear, a boot change refuses until `recover`, another TPM or storage key can't unseal | `tpm.TestSealUnsealRoundTrip`, `tpm.TestTheKeyNeverCrossesTheBusInClear`, `tpm.TestBootStateChangeRefusesUnseal`, `tpm.TestAnotherTPMCantUnseal`, `tpm.TestAnotherStorageKeyIsRefused`, `tpm.TestTamperedOrForeignBlobsAreRefused`, `tpm.TestPCR7NeedsSecureBootOn`, `cli.TestRecoverAfterTheBootStateChanged` |
+| recovery keys shown once; rekey leaves the old keys opening nothing | `cli.TestInitWritesTheRecoveryKeyOnce`, `vaultfile.TestRekeyReplacesEveryKeyAndKeepsTheSecrets` |
 | helper: strict answers, trust checks, the pin, sleep acked only after the wipe | `helper.TestApproveAnswers`, `helper.TestDecodeResponseIsStrict`, `helper.TestHelperTrustChecks`, `wiring.TestDarwinHelperNeedsABuiltInPin`, `main.TestBinaryHelperPin`, `helper.TestSleepAckedOnlyAfterTheCoreHandledIt`, `main.TestBinaryDarwinHelper` |
 | helper conformance and the macOS peer identifier (on a Mac, in CI) | `internal/plugin/helper/conformance_test.go` against the signed `foca-darwin`, `peer.TestDarwinIdentifiesRealPeer`, `peer.TestDarwinPeerThatExecsIsNamedAfterItsNewProgram`, `peer.TestSealedPath` |
 | **Events** | |
@@ -1892,23 +2074,25 @@ noted; packages are named as in `go test` output (`main` is `cmd/foca`, whose te
 | the relay refuses an insecure setup | — |
 | reported fields can't overwrite guest-verified ones | — |
 
+The real-polkitd tests need `FOCA_POLKITD` and bubblewrap, and the TPM tests `FOCA_SWTPM`;
+without them they skip (the dev shell and CI set both).
+
 ---
 
 ## 17. Not built or not verified yet
 
 **Not built**
 
-- polkit and the TPM key protector, with `foca recover` and `foca rekey`: on Linux, `serve`
-  and the host commands have no real authenticator and run only in `foca_testing` builds.
 - Audit log rotation, and `foca events query` and `follow`.
 - Nix packaging, and `serve --only` for one process per instance or group.
 - The guest relay, guest-verified identity and the `guest-*` scopes, which are a config
   error until then.
-- A command that opens a vault with its recovery passphrase: `init --recovery` writes the
-  slot, but nothing reads it yet.
 - `foca reset` and its `vault.reset` event; `[approval] list_requires_approval` (D16); a
   custom `--format`; the `secure-enclave`, `libsecret` and `keyring` key protectors.
 - macOS container runtimes' proxies in the default `opaque_peers` (§2.1).
+- User presence for the vault key on Linux: the TPM binds it to the machine and its boot
+  state, not to a touch (a FIDO2 key's `hmac-secret` would add that, §12.4). The first seal
+  takes the TPM's storage key on trust; an endorsement-key certificate chain would anchor it.
 
 **Not verified on real hardware or desktops**
 
@@ -1918,6 +2102,12 @@ noted; packages are named as in `go test` output (`main` is `cmd/foca`, whose te
   conformance run skips the prompt cases.
 - Actions against the real `granted` and `gh`; the AWS targets are tested through config
   and the `aws-credential-process` validator.
+- polkit with GNOME, KDE, `pkttyagent` or fprintd; no test approves through the real
+  polkitd. foca can't see an agent's locale, so a translation for a locale other than
+  foca's own, `C` and `en_US.UTF-8` would still reach such an agent (only root can install
+  the action file). Over ssh the host CLI has no agent and gets `auth_unavailable`, unless
+  the user runs `pkttyagent`.
+- A hardware TPM, and PCR 7 across a real firmware update; the tests use swtpm.
 - `darwinproc` reaches `getsockopt` and `proc_info` through `unix.Syscall6`, which goes
   through libc's deprecated `syscall()`. It works on current macOS; if Apple removes it,
   those two calls need another route.

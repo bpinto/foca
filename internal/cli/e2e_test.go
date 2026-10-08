@@ -5,6 +5,7 @@ package cli
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"github.com/bpinto/foca/internal/audit"
 	"github.com/bpinto/foca/internal/config"
 	"github.com/bpinto/foca/internal/identity"
+	"github.com/bpinto/foca/internal/plugins/store/vaultfile"
 	"github.com/bpinto/foca/internal/server/wiring"
 )
 
@@ -25,7 +27,6 @@ authenticator = "fake"
 platform_events = "none"
 secret_store = "vault-file"
 key_protector = "file"
-insecure_file_protector = true
 [vaults.common]
 [instances.dev]
 realm = { kind = "host" }
@@ -297,22 +298,110 @@ func contains(ss []string, s string) bool {
 	return false
 }
 
-func TestInitWithRecoveryPassphraseFromStdin(t *testing.T) {
+// init --recovery makes the recovery key and writes it once, to stdout:
+// never to stderr, the vault file or the audit log. It opens the vault.
+func TestInitWritesTheRecoveryKeyOnce(t *testing.T) {
 	w := newWorld(t)
-	w.ok("correct horse\n", "init", "--vault", "common", "--recovery")
+	out, errs, code := w.run("", "init", "--vault", "common", "--recovery")
+	if code != 0 {
+		t.Fatalf("init: %d %s", code, errs)
+	}
+	written := strings.TrimSuffix(string(out), "\n")
+	key, err := vaultfile.ParseRecoveryKey([]byte(written))
+	if err != nil || len(written) != 39 || strings.Count(string(out), "\n") != 1 {
+		t.Fatalf("stdout %q: %v", out, err)
+	}
 	b, _ := os.ReadFile(w.paths.VaultFile("common"))
-	if !strings.Contains(string(b), `"type": "passphrase"`) || strings.Contains(string(b), "correct horse") {
+	if !strings.Contains(string(b), `"type": "recovery-key"`) || strings.Contains(string(b), written) {
 		t.Fatalf("vault file:\n%s", b)
+	}
+	log, _ := os.ReadFile(w.paths.AuditLog())
+	if strings.Contains(errs, written) || strings.Contains(string(log), written) {
+		t.Fatal("the recovery key was written somewhere other than stdout")
+	}
+	if dek, err := vaultfile.New(w.paths.VaultFile("common"), "common").UnsealRecovery(key); err != nil || len(dek) != 32 {
+		t.Fatalf("the key doesn't open the vault: %v", err)
 	}
 }
 
 func TestHostCLIRefusesMemoryStore(t *testing.T) {
 	w := newWorld(t)
 	cfg := strings.Replace(e2eConfig, `secret_store = "vault-file"
-key_protector = "file"
-insecure_file_protector = true`, "", 1)
+key_protector = "file"`, "", 1)
 	os.WriteFile(w.vars["FOCA_CONFIG"], []byte(cfg), 0o600)
 	if _, errs, code := w.run("", "init", "--vault", "common"); code != 1 || !strings.Contains(errs, "vault-file") {
 		t.Fatalf("%d %s", code, errs)
+	}
+}
+
+// rekey encrypts the vault again under a new key after approval, records
+// vault.rekey with both vault ids, removes the old protector entry, and
+// writes a new recovery key once; the old recovery key no longer opens it,
+// and the service reads the secrets as before.
+func TestRekeyEndToEnd(t *testing.T) {
+	w := newWorld(t)
+	oldKey := string(w.ok("", "init", "--vault", "common", "--recovery"))
+	w.ok("ghp_123", "add", "common:github-pat")
+	oldKeys, _ := filepath.Glob(filepath.Join(w.paths.KeysDir(), "common-*"))
+
+	out, errs, code := w.run("", "rekey", "--vault", "common")
+	if code != 0 || !strings.Contains(errs, "encrypted vault common again under a new key") {
+		t.Fatalf("rekey: %d %s", code, errs)
+	}
+	newKey := strings.TrimSuffix(string(out), "\n")
+	if _, err := vaultfile.ParseRecoveryKey([]byte(newKey)); err != nil || newKey == strings.TrimSuffix(oldKey, "\n") {
+		t.Fatalf("new recovery key %q: %v", out, err)
+	}
+	keys, _ := filepath.Glob(filepath.Join(w.paths.KeysDir(), "common-*"))
+	if len(oldKeys) != 1 || len(keys) != 1 || keys[0] == oldKeys[0] {
+		t.Fatalf("protector entries before %v, after %v", oldKeys, keys)
+	}
+	var e audit.Event
+	for _, ev := range w.events() {
+		if ev.Type == audit.TypeVaultRekey {
+			e = ev
+		}
+	}
+	if e.Outcome != audit.OutcomeOK || e.Approval == nil || e.Params["protector"] != "file" || e.Params["recovery_key"] != "true" ||
+		e.Params["old_vault_id"] == "" || e.Params["vault_id"] == e.Params["old_vault_id"] ||
+		!strings.HasSuffix(keys[0], e.Params["vault_id"]+".key") {
+		t.Fatalf("rekey event %+v", e)
+	}
+	log, _ := os.ReadFile(w.paths.AuditLog())
+	if strings.Contains(errs, newKey) || strings.Contains(string(log), newKey) {
+		t.Fatal("the recovery key was written somewhere other than stdout")
+	}
+
+	if _, errs, code := w.run(oldKey, "recover", "--vault", "common"); code != 1 || !strings.Contains(errs, "wrong recovery key") {
+		t.Fatalf("recover with the old key: %d %s", code, errs)
+	}
+	stop := w.serve()
+	defer stop()
+	if got := w.ok("", "get", "-i", "work", "common:github-pat"); string(got) != "ghp_123" {
+		t.Fatalf("get after rekey: %q", got)
+	}
+
+	// A vault without a recovery key gets none, unless asked.
+	w.ok("", "init", "--vault", "dev")
+	if out := w.ok("", "rekey", "--vault", "dev"); len(out) != 0 {
+		t.Fatalf("rekey of a vault without recovery wrote %q", out)
+	}
+	if out := w.ok("", "rekey", "--vault", "dev", "--recovery"); len(out) != 40 {
+		t.Fatalf("rekey --recovery wrote %q", out)
+	}
+}
+
+// The commands that hold vault keys or values make their process private
+// before they read anything, and refuse to run if they can't.
+func TestKeyHoldingCommandsArePrivate(t *testing.T) {
+	w := newWorld(t)
+	for _, args := range [][]string{{"init"}, {"add", "common:x"}, {"edit", "common:x", "--value"}, {"remove", "common:x"}, {"recover"}, {"rekey"}} {
+		var errb bytes.Buffer
+		env := &Env{Stdin: strings.NewReader(""), Stdout: io.Discard, Stderr: &errb,
+			Getenv: func(k string) string { return w.vars[k] },
+			Harden: func() error { return errors.New("no prctl") }}
+		if code := Main(args, env, "test"); code != 1 || !strings.Contains(errb.String(), "can't keep this process private") {
+			t.Errorf("%v: %d %s", args, code, errb.String())
+		}
 	}
 }

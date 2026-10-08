@@ -3,6 +3,9 @@
 package wiring
 
 import (
+	"github.com/google/go-tpm/tpm2/transport"
+	"github.com/google/go-tpm/tpm2/transport/linuxtpm"
+
 	"context"
 	"errors"
 	"fmt"
@@ -18,7 +21,8 @@ import (
 	"github.com/bpinto/foca/internal/fsutil"
 	"github.com/bpinto/foca/internal/plugin"
 	"github.com/bpinto/foca/internal/plugin/helper"
-	keyfile "github.com/bpinto/foca/internal/plugins/keyprot/file"
+	"github.com/bpinto/foca/internal/plugins/authn/polkit"
+	"github.com/bpinto/foca/internal/plugins/keyprot/tpm"
 	"github.com/bpinto/foca/internal/plugins/provider/command"
 	"github.com/bpinto/foca/internal/plugins/provider/static"
 	"github.com/bpinto/foca/internal/plugins/store/memory"
@@ -111,6 +115,7 @@ func (e *env) darwinKinds() (kinds, uses []string) {
 // authenticators maps config names to constructors. Test-only entries are
 // added by files built with the foca_testing tag.
 var authenticators = map[string]func(*env) (plugin.Authenticator, error){
+	"polkit": func(*env) (plugin.Authenticator, error) { return polkit.New(), nil },
 	"touchid": func(e *env) (plugin.Authenticator, error) {
 		h, err := e.darwinHelper()
 		if err != nil {
@@ -126,9 +131,6 @@ var testOnly = map[string]bool{"fake": true}
 // TestBuild is true in binaries built with -tags foca_testing.
 var TestBuild = false
 
-// planned lists names that are part of the design but not built yet.
-var planned = map[string]bool{"polkit": true, "fido2": true, "pinentry": true}
-
 func authenticator(e *env, name string) (plugin.Authenticator, error) {
 	if mk, ok := authenticators[name]; ok {
 		return mk(e)
@@ -136,21 +138,31 @@ func authenticator(e *env, name string) (plugin.Authenticator, error) {
 	if testOnly[name] {
 		return nil, fmt.Errorf("authenticator %q is only available in test builds (built with -tags foca_testing)", name)
 	}
-	if planned[name] {
-		return nil, fmt.Errorf("authenticator %q is not implemented yet", name)
-	}
 	return nil, fmt.Errorf("unknown authenticator %q", name)
 }
 
 // plannedProtectors are key protectors the design names but foca doesn't
 // have yet.
-var plannedProtectors = map[string]bool{"secure-enclave": true, "tpm": true, "libsecret": true, "keyring": true}
+var plannedProtectors = map[string]bool{"secure-enclave": true, "libsecret": true, "keyring": true}
+
+// protectors are key protectors only test builds add (the file protector).
+var protectors = map[string]func(e *env, paths config.Paths) (plugin.KeyProtector, error){}
+
+// openTPM opens the TPM device; test builds may point it at a software TPM.
+var openTPM = func(device string) (transport.TPMCloser, error) { return linuxtpm.Open(device) }
+
+// efiVars is where the TPM protector reads whether Secure Boot is on; test
+// builds may point it elsewhere.
+var efiVars = func() string { return tpm.EFIVars }
 
 func keyProtector(e *env, paths config.Paths) (plugin.KeyProtector, error) {
+	if mk, ok := protectors[e.cfg.Plugins.KeyProtector]; ok {
+		return mk(e, paths)
+	}
 	switch name := e.cfg.Plugins.KeyProtector; name {
-	case "file":
-		// config.validate has already required insecure_file_protector.
-		return keyfile.New(paths.KeysDir()), nil
+	case "tpm":
+		device := e.cfg.TPM.Device
+		return tpm.New(func() (transport.TPMCloser, error) { return openTPM(device) }, e.cfg.TPM.PCRs, efiVars()), nil
 	case "keychain":
 		h, err := e.darwinHelper()
 		if err != nil {
@@ -158,6 +170,9 @@ func keyProtector(e *env, paths config.Paths) (plugin.KeyProtector, error) {
 		}
 		return helper.NewKeyProtector(h, "keychain"), nil
 	default:
+		if name == "file" {
+			return nil, fmt.Errorf("key_protector %q is only available in test builds (built with -tags foca_testing): it keeps the vault key in a plain file", name)
+		}
 		if plannedProtectors[name] {
 			return nil, fmt.Errorf("key_protector %q is not implemented yet", name)
 		}
