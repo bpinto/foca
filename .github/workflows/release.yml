@@ -1,0 +1,196 @@
+name: release
+
+# Publishes binaries once the test workflow has passed for a push:
+#
+# - main: the rolling "tip" pre-release, rebuilt for every commit and
+#   versioned <next patch>-tip.<commit date, UTC, YYYYMMDD>+<sha>;
+# - a v* tag: a stable release of that version.
+#
+# Pull requests never publish anything.
+#
+# macOS builds go through scripts/build-darwin.sh, which signs foca-darwin
+# and pins its sha256 into foca. With these secrets the helper is signed with
+# a Developer ID, so the Keychain doesn't ask again after an update; without
+# them it is signed ad hoc:
+#
+#   MACOS_CERT_P12           base64 of the Developer ID Application .p12
+#   MACOS_CERT_PASSWORD      its password
+#   MACOS_SIGN_IDENTITY      e.g. "Developer ID Application: Name (TEAMID)"
+
+on:
+  workflow_run:
+    workflows: [test]
+    types: [completed]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-latest
+    outputs:
+      kind: ${{ steps.plan.outputs.kind }}
+      version: ${{ steps.plan.outputs.version }}
+      tag: ${{ steps.plan.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+      - id: plan
+        env:
+          REF: ${{ github.event.workflow_run.head_branch }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -eu
+          if [ "$REF" = main ]; then
+            # The newest stable tag this commit contains; pre-release tags
+            # don't count.
+            last=$(git tag --merged "$SHA" --list 'v*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1 || true)
+            if [ -n "$last" ]; then
+              IFS=. read -r major minor patch <<< "${last#v}"
+              base="$major.$minor.$((patch + 1))"
+            else
+              base=0.1.0
+            fi
+            # The commit's date, not the build's, so a rebuild of the same
+            # commit gets the same version.
+            date=$(TZ=UTC git show -s --format=%cd --date=format-local:%Y%m%d "$SHA")
+            { echo kind=tip; echo tag=tip; echo "version=$base-tip.$date+${SHA:0:7}"; } >> "$GITHUB_OUTPUT"
+          elif [ "$(git rev-parse -q --verify "refs/tags/$REF^{commit}" || true)" = "$SHA" ] &&
+               echo "$REF" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            { echo kind=release; echo "tag=$REF"; echo "version=${REF#v}"; } >> "$GITHUB_OUTPUT"
+          else
+            echo "kind=skip" >> "$GITHUB_OUTPUT"
+            echo "$REF is neither main nor a version tag: nothing to publish"
+          fi
+
+  linux:
+    needs: plan
+    if: needs.plan.outputs.kind != 'skip'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: build
+        env:
+          FOCA_VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          scripts/build-linux.sh "${{ matrix.arch }}" "$RUNNER_TEMP/out"
+          cp LICENSE README.md "$RUNNER_TEMP/out/"
+          tar -czf "foca-linux-${{ matrix.arch }}.tar.gz" -C "$RUNNER_TEMP/out" foca LICENSE README.md
+      - if: matrix.arch == 'amd64'
+        run: '[ "$("$RUNNER_TEMP/out/foca" version)" = "foca ${{ needs.plan.outputs.version }}" ]'
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: foca-linux-${{ matrix.arch }}
+          path: foca-linux-${{ matrix.arch }}.tar.gz
+
+  macos:
+    needs: plan
+    if: needs.plan.outputs.kind != 'skip'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: signing identity
+        env:
+          CERT: ${{ secrets.MACOS_CERT_P12 }}
+          CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+        run: |
+          if [ -z "$CERT" ] || [ -z "$IDENTITY" ]; then
+            echo "::warning::no Developer ID secrets: foca-darwin is signed ad hoc, so the Keychain asks again after each update"
+            exit 0
+          fi
+          kc="$RUNNER_TEMP/sign.keychain-db"
+          security create-keychain -p ci "$kc"
+          security set-keychain-settings "$kc"
+          security unlock-keychain -p ci "$kc"
+          echo "$CERT" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$kc" -P "$CERT_PASSWORD" -T /usr/bin/codesign
+          rm "$RUNNER_TEMP/cert.p12"
+          security set-key-partition-list -S apple-tool:,apple: -s -k ci "$kc" > /dev/null
+          existing=()
+          while IFS= read -r k; do existing+=("$(echo "$k" | xargs)"); done < <(security list-keychains -d user)
+          security list-keychains -d user -s "$kc" "${existing[@]}"
+          echo "FOCA_SIGN_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+      - name: build
+        env:
+          FOCA_VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          scripts/build-darwin.sh "$RUNNER_TEMP/out"
+          [ "$("$RUNNER_TEMP/out/foca" version)" = "foca $FOCA_VERSION" ]
+          cp LICENSE README.md "$RUNNER_TEMP/out/"
+          tar -czf foca-darwin-arm64.tar.gz -C "$RUNNER_TEMP/out" foca foca-darwin LICENSE README.md
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: foca-darwin-arm64
+          path: foca-darwin-arm64.tar.gz
+
+  publish:
+    needs: [plan, linux, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      KIND: ${{ needs.plan.outputs.kind }}
+      TAG: ${{ needs.plan.outputs.tag }}
+      VERSION: ${{ needs.plan.outputs.version }}
+      SHA: ${{ github.event.workflow_run.head_sha }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+      - name: checksums
+        run: cd dist && sha256sum -- *.tar.gz > SHA256SUMS && cat SHA256SUMS
+      - name: tip
+        if: env.KIND == 'tip'
+        run: |
+          set -eu
+          # Test runs can finish out of order; never move tip back to an
+          # older commit.
+          head=$(gh api "repos/$GH_REPO/commits/main" --jq .sha)
+          if [ "$head" != "$SHA" ]; then
+            echo "main is now at $head; leaving tip to that commit's run"
+            exit 0
+          fi
+          if gh api "repos/$GH_REPO/git/refs/tags/tip" > /dev/null 2>&1; then
+            gh api -X PATCH "repos/$GH_REPO/git/refs/tags/tip" -f sha="$SHA" -F force=true > /dev/null
+          else
+            gh api "repos/$GH_REPO/git/refs" -f ref=refs/tags/tip -f sha="$SHA" > /dev/null
+          fi
+          notes="Built from $SHA on main. A pre-release: it changes with every commit to main.
+
+          Version: \`$VERSION\`"
+          if gh release view tip > /dev/null 2>&1; then
+            gh release upload tip dist/* --clobber
+            gh release edit tip --prerelease --title "tip $VERSION" --notes "$notes"
+          else
+            gh release create tip dist/* --prerelease --verify-tag --title "tip $VERSION" --notes "$notes"
+          fi
+      - name: release
+        if: env.KIND == 'release'
+        run: gh release create "$TAG" dist/* --verify-tag --title "$TAG" --generate-notes

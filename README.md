@@ -79,6 +79,8 @@ On macOS the archive holds `foca` and `foca-darwin`, the small signed helper for
 the Keychain and sleep events. Keep the two in the same directory: `foca` only runs the
 helper it was released with.
 
+Every release includes `SHA256SUMS` for checking the archives.
+
 <details>
 <summary><b>Nix</b></summary>
 

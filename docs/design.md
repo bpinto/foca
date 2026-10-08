@@ -1802,6 +1802,8 @@ internal/svcctl/          serve.pid and verified signalling for reload / stop
 internal/ids/             sortable ids
 internal/format/          output formatters: raw, json, env
 helpers/darwin/           Swift package: foca-darwin
+scripts/                  build-darwin.sh (signed helper, pinned into foca), build-linux.sh
+.github/workflows/        test (every push and pull request), release (tip from main, v* tags)
 flake.nix                 dev shell (go, gopls, socat, dbus for the logind tests; gcc only for `go test -race`)
 ```
 

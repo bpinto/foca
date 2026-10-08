@@ -8,6 +8,8 @@
 # FOCA_SIGN_IDENTITY: codesign identity for foca-darwin. Default "-", an
 # ad-hoc signature. A Developer ID identity gives the helper a code identity
 # that survives rebuilds, so the Keychain doesn't ask again after an update.
+# FOCA_VERSION: the version `foca version` reports. Default: the one in
+# cmd/foca.
 set -eu
 
 cd "$(dirname "$0")/.."
@@ -30,8 +32,11 @@ sum=$(shasum -a 256 "$out/foca-darwin" | cut -d ' ' -f 1)
 # GOFLAGS is cleared so a -tags=foca_testing left in the environment can't
 # turn this into a test build, which accepts the always-approving fake
 # authenticator. The check after the build makes sure.
-env GOFLAGS= CGO_ENABLED=0 go build -trimpath \
-	-ldflags "-X github.com/bpinto/foca/internal/server/wiring.builtinHelperSHA256=$sum" \
+ldflags="-X github.com/bpinto/foca/internal/server/wiring.builtinHelperSHA256=$sum"
+if [ -n "${FOCA_VERSION:-}" ]; then
+	ldflags="$ldflags -X main.version=$FOCA_VERSION"
+fi
+env GOFLAGS= CGO_ENABLED=0 go build -trimpath -ldflags "$ldflags" \
 	-o "$out/foca" ./cmd/foca
 if go version -m "$out/foca" | grep -q 'foca_testing'; then
 	echo "$out/foca was built with the foca_testing tag; refusing it" >&2

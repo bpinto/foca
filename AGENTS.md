@@ -201,6 +201,23 @@ On a Mac: `scripts/build-darwin.sh`, then `FOCA_HELPER=$PWD/bin/foca-darwin go t
 which need a person at the Mac. CI runs the Linux
 matrix and the macOS suite on every push (`.github/workflows/test.yml`).
 
+## Releases
+
+`.github/workflows/release.yml` runs after `test` passes for a push, and builds through
+`scripts/build-linux.sh` and `scripts/build-darwin.sh` (which pins the signed helper into
+`foca`):
+
+- every commit on `main` replaces the assets of the rolling `tip` pre-release, versioned
+  `<next patch>-tip.<commit date, UTC, YYYYMMDD>+<sha>`; an older commit never
+  replaces a newer one;
+- a `vX.Y.Z` tag publishes that release.
+
+Assets: `foca-darwin-arm64.tar.gz` (`foca` and `foca-darwin`), `foca-linux-amd64.tar.gz`,
+`foca-linux-arm64.tar.gz` and `SHA256SUMS`. Never ship a `foca` built any other way on
+macOS: without the build script it has no helper pin and runs no helper. The
+`MACOS_CERT_P12`, `MACOS_CERT_PASSWORD` and `MACOS_SIGN_IDENTITY` secrets sign the helper
+with a Developer ID; without them it is signed ad hoc.
+
 ## Conventions
 
 - Match the surrounding code: short comments that say *why*, plain words, no clever
