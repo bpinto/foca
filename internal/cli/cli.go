@@ -1,6 +1,6 @@
 // Package cli is the foca command line: the service (serve), host
-// management (init, add, edit, remove, reload, stop) and the socket client
-// (list, get, run, exec, actions, grants) that also runs inside realms.
+// management (init, add, edit, remove, reload, stop, events) and the socket
+// client (list, get, run, exec, actions, grants) that also runs inside realms.
 //
 // Interaction rules (design D21): prompts appear only when stdin and stderr
 // are terminals, and draw on stderr so stdout stays clean. Secret values are
@@ -87,7 +87,7 @@ type Globals struct {
 	DataDir    string `help:"Data directory (env FOCA_DATA_DIR)." placeholder:"DIR"`
 	RuntimeDir string `help:"Runtime directory for sockets (env FOCA_RUNTIME_DIR)." placeholder:"DIR"`
 	Socket     string `help:"Client socket to use (env FOCA_SOCK)." placeholder:"PATH"`
-	Instance   string `short:"i" help:"Instance whose socket to use on the host (env FOCA_INSTANCE)."`
+	Instance   string `short:"i" help:"Instance whose socket to use on the host (env FOCA_INSTANCE). With events, the instance to show."`
 
 	version string
 }
@@ -111,6 +111,7 @@ type CLI struct {
 	Lock         LockCmd         `cmd:"" help:"Drop every reuse grant now, so the next access asks again (host)."`
 	Stop         StopCmd         `cmd:"" help:"Stop the running service (host)."`
 	Policy       PolicyCmd       `cmd:"" help:"Explain the approval policy the config sets (host)."`
+	Events       EventsCmd       `cmd:"" help:"Query or follow the audit log (host)."`
 	Grants       GrantsCmd       `cmd:"" help:"List or drop your reuse grants."`
 	PolkitPolicy PolkitPolicyCmd `cmd:"" name:"polkit-policy" help:"Print the polkit action the polkit authenticator needs (host, Linux)."`
 	Version      VersionCmd      `cmd:"" help:"Print the version."`

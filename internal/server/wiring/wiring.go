@@ -222,7 +222,7 @@ func openAudit(cfg *config.Config, paths config.Paths) (plugin.AuditSink, error)
 		if err := fsutil.EnsurePrivateDir(paths.DataDir); err != nil {
 			return nil, fmt.Errorf("data dir: %w", err)
 		}
-		return audit.OpenJSONL(paths.AuditLog())
+		return audit.OpenJSONL(paths.AuditLog(), audit.Rotation{MaxSize: cfg.Audit.MaxFileSize, Keep: cfg.Audit.KeepFiles})
 	default:
 		return nil, fmt.Errorf("unknown audit_sink %q", cfg.Plugins.AuditSink)
 	}

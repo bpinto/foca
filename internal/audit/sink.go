@@ -2,6 +2,7 @@ package audit
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
@@ -21,13 +22,16 @@ type persister interface {
 	close() error
 }
 
-// sink implements Append/Query/Subscribe on top of a persister.
+// sink implements Append on top of a persister, and Query and Follow for a
+// sink whose events all pass through this process (Memory).
 type sink struct {
 	mu   sync.Mutex
 	seq  uint64
 	p    persister
 	subs map[*subscriber]struct{}
 	now  func() time.Time
+	// closed stops followers from subscribing again after Close.
+	closed bool
 }
 
 type subscriber struct {
@@ -36,6 +40,12 @@ type subscriber struct {
 }
 
 const subscriberBuffer = 256
+
+// FromNow, passed to Follow as afterSeq, skips every event already stored:
+// only events appended after Follow starts are delivered.
+const FromNow = ^uint64(0)
+
+var errClosed = errors.New("audit: sink closed")
 
 func newSink(p persister, lastSeq uint64) *sink {
 	return &sink{p: p, seq: lastSeq, subs: map[*subscriber]struct{}{}, now: time.Now}
@@ -82,8 +92,8 @@ func (s *sink) Append(ctx context.Context, e *Event) (uint64, error) {
 		select {
 		case sub.ch <- *e:
 		default:
-			// A subscriber that can't keep up is dropped; it can
-			// resubscribe from the last seq it saw without a gap.
+			// A subscriber that can't keep up is dropped; follow
+			// subscribes again from the last seq it delivered.
 			close(sub.ch)
 			delete(s.subs, sub)
 		}
@@ -91,81 +101,124 @@ func (s *sink) Append(ctx context.Context, e *Event) (uint64, error) {
 	return e.Seq, nil
 }
 
-// Query returns matching events with Seq > page.AfterSeq. next is the seq to
+// query returns matching events with Seq > page.AfterSeq. next is the seq to
 // pass as AfterSeq for the following page, or 0 when there are no more.
-func (s *sink) Query(ctx context.Context, f Filter, page Page) (events []Event, next uint64, err error) {
+func (s *sink) query(f Filter, page Page) (events []Event, next uint64, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	limit := page.limit()
-	more := false
-	err = s.p.scan(func(e Event) bool {
-		if e.Seq <= page.AfterSeq || !f.Match(e) {
-			return true
-		}
-		if len(events) == limit {
-			more = true
-			return false
-		}
-		events = append(events, e)
-		return true
-	})
-	if err != nil {
+	pq := newPageQuery(f, page)
+	if err := s.p.scan(pq.visit); err != nil {
 		return nil, 0, err
 	}
-	if more {
-		next = events[len(events)-1].Seq
-	}
+	events, next = pq.result()
 	return events, next, nil
 }
 
-// Subscribe streams matching events with Seq > fromSeq: stored ones first,
-// then live ones, with no gap between the two. The channel closes when ctx
-// ends or the subscriber falls too far behind.
-func (s *sink) Subscribe(ctx context.Context, f Filter, fromSeq uint64) (<-chan Event, error) {
+// pageQuery collects one page of matching events.
+type pageQuery struct {
+	f      Filter
+	after  uint64
+	limit  int
+	events []Event
+	more   bool
+}
+
+func newPageQuery(f Filter, page Page) *pageQuery {
+	return &pageQuery{f: f, after: page.AfterSeq, limit: page.limit()}
+}
+
+// visit takes one stored event; it returns false once the page is full and
+// another match proves there are more.
+func (q *pageQuery) visit(e Event) bool {
+	if e.Seq <= q.after || !q.f.Match(e) {
+		return true
+	}
+	if len(q.events) == q.limit {
+		q.more = true
+		return false
+	}
+	q.events = append(q.events, e)
+	return true
+}
+
+func (q *pageQuery) result() ([]Event, uint64) {
+	if q.more {
+		return q.events, q.events[len(q.events)-1].Seq
+	}
+	return q.events, 0
+}
+
+// follow calls fn with each matching event with Seq > afterSeq, stored ones
+// first, then live ones as they are appended, with no gap between the two.
+// It returns nil when ctx ends, or fn's error.
+func (s *sink) follow(ctx context.Context, f Filter, afterSeq uint64, fn func(Event) error) error {
+	for {
+		sub, backlog, after, err := s.subscribe(f, afterSeq)
+		if err != nil {
+			return err
+		}
+		afterSeq, err = feed(ctx, sub, backlog, after, fn)
+		s.unsubscribe(sub)
+		if err != nil || ctx.Err() != nil {
+			return err
+		}
+		// The subscriber fell behind and was dropped: pick up again from
+		// the last event delivered.
+	}
+}
+
+// subscribe registers a subscriber and returns the stored events it must
+// see first. Both happen under the lock, so no event falls between them.
+func (s *sink) subscribe(f Filter, afterSeq uint64) (*subscriber, []Event, uint64, error) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil, nil, 0, errClosed
+	}
+	if afterSeq == FromNow {
+		afterSeq = s.seq
+	}
 	var backlog []Event
 	err := s.p.scan(func(e Event) bool {
-		if e.Seq > fromSeq && f.Match(e) {
+		if e.Seq > afterSeq && f.Match(e) {
 			backlog = append(backlog, e)
 		}
 		return true
 	})
 	if err != nil {
-		s.mu.Unlock()
-		return nil, err
+		return nil, nil, 0, err
 	}
 	sub := &subscriber{f: f, ch: make(chan Event, subscriberBuffer)}
 	s.subs[sub] = struct{}{}
-	s.mu.Unlock()
+	return sub, backlog, afterSeq, nil
+}
 
-	out := make(chan Event)
-	go func() {
-		defer close(out)
-		defer s.unsubscribe(sub)
-		for _, e := range backlog {
-			select {
-			case out <- e:
-			case <-ctx.Done():
-				return
-			}
+// feed delivers the backlog, then live events until ctx ends or the
+// subscriber is dropped. It returns the seq of the last event delivered.
+func feed(ctx context.Context, sub *subscriber, backlog []Event, afterSeq uint64, fn func(Event) error) (uint64, error) {
+	for _, e := range backlog {
+		if ctx.Err() != nil {
+			return afterSeq, nil
 		}
-		for {
-			select {
-			case e, ok := <-sub.ch:
-				if !ok {
-					return
-				}
-				select {
-				case out <- e:
-				case <-ctx.Done():
-					return
-				}
-			case <-ctx.Done():
-				return
-			}
+		if err := fn(e); err != nil {
+			return afterSeq, err
 		}
-	}()
-	return out, nil
+		afterSeq = e.Seq
+	}
+	for {
+		select {
+		case e, ok := <-sub.ch:
+			if !ok {
+				return afterSeq, nil
+			}
+			if err := fn(e); err != nil {
+				return afterSeq, err
+			}
+			afterSeq = e.Seq
+		case <-ctx.Done():
+			return afterSeq, nil
+		}
+	}
 }
 
 func (s *sink) unsubscribe(sub *subscriber) {
@@ -180,6 +233,7 @@ func (s *sink) unsubscribe(sub *subscriber) {
 func (s *sink) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.closed = true
 	for sub := range s.subs {
 		close(sub.ch)
 		delete(s.subs, sub)

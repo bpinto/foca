@@ -180,8 +180,9 @@ internal/action/          action specs: param checks, argv templates, output for
 internal/plugin/          plugin interfaces; helper/ is the stdio helper adapter; authntest/ is the
                           authenticator conformance suite every authenticator runs
 internal/plugins/         authn/{fake,polkit}, store/{memory,vaultfile}, keyprot/{file,tpm},
-                          provider/{static,command}, peer (linux, darwin), events/logind
-internal/audit/           event types (v1), JSONL and memory sinks
+                          provider/{static,command}, peer (linux, darwin), events/logind,
+                          sysbus (the system D-Bus at its fixed path)
+internal/audit/           event types (v1), JSONL (rotating) and memory sinks, the log reader for events
 internal/identity/        verified, guest and reported identity types
 internal/fsutil/          trusted-file checks, private dirs, atomic writes, locks
 internal/svcctl/          serve.pid, the instance lock, and verified signalling (reload, lock, stop)

@@ -42,6 +42,9 @@ func TestMinimalDefaults(t *testing.T) {
 	if c.Limits.MaxConnections != DefaultMaxConnections || c.Limits.IdleTimeout != DefaultIdleTimeout {
 		t.Fatalf("limit defaults %+v", c.Limits)
 	}
+	if c.Audit.MaxFileSize != 16<<20 || c.Audit.KeepFiles != 16 {
+		t.Fatalf("audit defaults %+v", c.Audit)
+	}
 	if c.Plugins.AuditSink != "jsonl" {
 		t.Fatalf("plugin defaults %+v", c.Plugins)
 	}
@@ -81,6 +84,10 @@ secret_store = "memory"`, "at least one"},
 		"no connections":               {minimal + "\n[limits]\nmax_connections = 0\n", "max_connections"},
 		"too many connections":         {minimal + "\n[limits]\nmax_connections = 5000\n", "max_connections"},
 		"idle timeout too short":       {minimal + "\n[limits]\nidle_timeout = \"1s\"\n", "idle_timeout"},
+		"audit file size zero":         {minimal + "\n[audit]\nmax_file_size_mib = 0\n", "audit.max_file_size_mib 0 is outside 1..1024"},
+		"audit file size too big":      {minimal + "\n[audit]\nmax_file_size_mib = 2048\n", "audit.max_file_size_mib"},
+		"audit keeps no files":         {minimal + "\n[audit]\nkeep_files = 0\n", "audit.keep_files 0 is outside 1..1000"},
+		"audit unknown key":            {minimal + "\n[audit]\nrotate = true\n", "unknown keys: audit.rotate"},
 		"vault-file without protector": {strings.Replace(minimal, "secret_store = \"memory\"", "secret_store = \"vault-file\"", 1), "key_protector is required"},
 		"protector without vault-file": {strings.Replace(minimal, "[plugins]", "[plugins]\nkey_protector = \"file\"", 1), "only used with"},
 	}
@@ -503,5 +510,15 @@ func TestPolkitOnlyOnLinux(t *testing.T) {
 		if _, err := Parse([]byte(conf)); err == nil || !strings.Contains(err.Error(), "only works on Linux") {
 			t.Errorf("on %s: %v", os, err)
 		}
+	}
+}
+
+func TestAuditRotationSettings(t *testing.T) {
+	c, err := Parse([]byte(minimal + "\n[audit]\nmax_file_size_mib = 4\nkeep_files = 3\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Audit.MaxFileSize != 4<<20 || c.Audit.KeepFiles != 3 {
+		t.Fatalf("audit %+v", c.Audit)
 	}
 }

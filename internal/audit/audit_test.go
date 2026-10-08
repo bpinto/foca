@@ -4,8 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -16,7 +21,7 @@ import (
 type appender interface {
 	Append(context.Context, *Event) (uint64, error)
 	Query(context.Context, Filter, Page) ([]Event, uint64, error)
-	Subscribe(context.Context, Filter, uint64) (<-chan Event, error)
+	Follow(context.Context, Filter, uint64, func(Event) error) error
 	Close() error
 }
 
@@ -24,7 +29,7 @@ func sinks(t *testing.T) map[string]func() appender {
 	return map[string]func() appender{
 		"memory": func() appender { return NewMemory() },
 		"jsonl": func() appender {
-			s, err := OpenJSONL(filepath.Join(t.TempDir(), "audit.jsonl"))
+			s, err := OpenJSONL(filepath.Join(t.TempDir(), "audit.jsonl"), DefaultRotation)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -69,7 +74,7 @@ func TestAppendFillsEnvelopeAndQueries(t *testing.T) {
 	}
 }
 
-func TestSubscribeBackfillsThenStreamsWithoutGap(t *testing.T) {
+func TestFollowBackfillsThenStreamsWithoutGap(t *testing.T) {
 	for name, mk := range sinks(t) {
 		t.Run(name, func(t *testing.T) {
 			s := mk()
@@ -78,25 +83,48 @@ func TestSubscribeBackfillsThenStreamsWithoutGap(t *testing.T) {
 			defer cancel()
 			s.Append(ctx, &Event{Type: TypeSecretRead, Outcome: OutcomeOK})
 			s.Append(ctx, &Event{Type: TypeSecretRead, Outcome: OutcomeOK})
-			ch, err := s.Subscribe(ctx, Filter{}, 1)
-			if err != nil {
-				t.Fatal(err)
-			}
+			got := follow(t, ctx, s, Filter{}, 1)
 			s.Append(ctx, &Event{Type: TypeLock, Outcome: OutcomeOK})
-			var seqs []uint64
-			for len(seqs) < 2 {
-				select {
-				case e := <-ch:
-					seqs = append(seqs, e.Seq)
-				case <-time.After(2 * time.Second):
-					t.Fatalf("timed out; got %v", seqs)
-				}
-			}
-			if seqs[0] != 2 || seqs[1] != 3 {
+			if seqs := got.next(t, 2); seqs[0] != 2 || seqs[1] != 3 {
 				t.Fatalf("got %v, want [2 3]", seqs)
 			}
 		})
 	}
+}
+
+// followed collects what Follow delivers in the background.
+type followed struct {
+	ch   chan Event
+	done chan error
+}
+
+func follow(t *testing.T, ctx context.Context, r Reader, f Filter, afterSeq uint64) *followed {
+	t.Helper()
+	got := &followed{ch: make(chan Event, 1000), done: make(chan error, 1)}
+	go func() {
+		got.done <- r.Follow(ctx, f, afterSeq, func(e Event) error {
+			got.ch <- e
+			return nil
+		})
+	}()
+	return got
+}
+
+// next waits for n events and returns their seqs.
+func (f *followed) next(t *testing.T, n int) []uint64 {
+	t.Helper()
+	var seqs []uint64
+	for len(seqs) < n {
+		select {
+		case e := <-f.ch:
+			seqs = append(seqs, e.Seq)
+		case err := <-f.done:
+			t.Fatalf("follow ended after %v: %v", seqs, err)
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out; got %v", seqs)
+		}
+	}
+	return seqs
 }
 
 func TestMemoryFailureIsReported(t *testing.T) {
@@ -112,7 +140,7 @@ func TestMemoryFailureIsReported(t *testing.T) {
 
 func TestJSONLPersistsAcrossReopenAndRepairsPartialLine(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "audit.jsonl")
-	s, err := OpenJSONL(path)
+	s, err := OpenJSONL(path, DefaultRotation)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -123,7 +151,7 @@ func TestJSONLPersistsAcrossReopenAndRepairsPartialLine(t *testing.T) {
 	f.WriteString(`{"v":1,"seq":2,"ty`)
 	f.Close()
 
-	s, err = OpenJSONL(path)
+	s, err = OpenJSONL(path, DefaultRotation)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,14 +175,14 @@ func TestJSONLRefusesNonPrivateFileAndSymlink(t *testing.T) {
 	open := filepath.Join(dir, "open.jsonl")
 	os.WriteFile(open, nil, 0o644)
 	os.Chmod(open, 0o644)
-	if _, err := OpenJSONL(open); err == nil || !strings.Contains(err.Error(), "not private") {
+	if _, err := OpenJSONL(open, DefaultRotation); err == nil || !strings.Contains(err.Error(), "not private") {
 		t.Fatalf("expected refusal, got %v", err)
 	}
 	target := filepath.Join(dir, "target")
 	os.WriteFile(target, nil, 0o600)
 	link := filepath.Join(dir, "link.jsonl")
 	os.Symlink(target, link)
-	if _, err := OpenJSONL(link); err == nil {
+	if _, err := OpenJSONL(link, DefaultRotation); err == nil {
 		t.Fatal("followed a symlink")
 	}
 }
@@ -234,7 +262,7 @@ func (f *faultyFile) Sync() error {
 func openFaulty(t *testing.T) (*JSONL, *faultyFile, string) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "audit.jsonl")
-	s, err := OpenJSONL(path)
+	s, err := OpenJSONL(path, DefaultRotation)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -271,7 +299,7 @@ func TestJSONLTornWriteDoesNotSwallowNextEvent(t *testing.T) {
 	s.Close()
 
 	// After a restart the sequence continues past every event confirmed.
-	s2, err := OpenJSONL(path)
+	s2, err := OpenJSONL(path, DefaultRotation)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -296,62 +324,137 @@ func TestJSONLFailedSyncLatches(t *testing.T) {
 }
 
 // The service and the host CLI each open the log and append concurrently.
-// Every event must get its own seq, and seqs must rise in file order.
+// Every event must get its own seq, and seqs must rise in file order, also
+// when each of them rotates files the other is writing to.
 func TestJSONLSeqUniqueAcrossProcesses(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "audit.jsonl")
-	service, err := OpenJSONL(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer service.Close()
-	cli, err := OpenJSONL(path) // its own open file, as another process has
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer cli.Close()
+	for name, rot := range map[string]Rotation{
+		"one file": DefaultRotation,
+		"rotating": {MaxSize: 2000, Keep: 1000},
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "audit.jsonl")
+			service, err := OpenJSONL(path, rot)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer service.Close()
+			cli, err := OpenJSONL(path, rot) // its own open file, as another process has
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer cli.Close()
 
-	ctx := context.Background()
-	const n = 50
-	done := make(chan error, 2)
-	for _, s := range []*JSONL{service, cli} {
-		go func(s *JSONL) {
-			for range n {
-				if _, err := s.Append(ctx, &Event{Type: TypeSecretRead, Outcome: OutcomeOK}); err != nil {
-					done <- err
-					return
+			ctx := context.Background()
+			const n = 50
+			done := make(chan error, 2)
+			for _, s := range []*JSONL{service, cli} {
+				go func(s *JSONL) {
+					for range n {
+						if _, err := s.Append(ctx, &Event{Type: TypeSecretRead, Outcome: OutcomeOK}); err != nil {
+							done <- err
+							return
+						}
+					}
+					done <- nil
+				}(s)
+			}
+			for range 2 {
+				if err := <-done; err != nil {
+					t.Fatal(err)
 				}
 			}
-			done <- nil
-		}(s)
+			lines := logLines(t, path)
+			if len(lines) != 2*n {
+				t.Fatalf("%d lines, want %d", len(lines), 2*n)
+			}
+			var prev uint64
+			for i, l := range lines {
+				var e Event
+				if err := json.Unmarshal([]byte(l), &e); err != nil {
+					t.Fatalf("line %d: %v", i, err)
+				}
+				if e.Seq <= prev {
+					t.Fatalf("line %d: seq %d after %d", i, e.Seq, prev)
+				}
+				prev = e.Seq
+			}
+			// A CLI that opens after the service has written continues from it.
+			late, _ := OpenJSONL(path, rot)
+			defer late.Close()
+			if seq, _ := late.Append(ctx, &Event{Type: TypeSecretAdd, Outcome: OutcomeOK}); seq != prev+1 {
+				t.Fatalf("late seq %d, want %d", seq, prev+1)
+			}
+			if seq, _ := service.Append(ctx, &Event{Type: TypeSecretRead, Outcome: OutcomeOK}); seq != prev+2 {
+				t.Fatalf("service seq after CLI write %d, want %d", seq, prev+2)
+			}
+		})
 	}
-	for range 2 {
-		if err := <-done; err != nil {
+}
+
+// logLines returns the lines of every file of the log, oldest first.
+func logLines(t *testing.T, path string) []string {
+	t.Helper()
+	rotated, err := newLogFiles(path).list()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var lines []string
+	for _, r := range append(rotated, rotatedFile{path: path}) {
+		b, err := os.ReadFile(r.path)
+		if err != nil {
 			t.Fatal(err)
 		}
-	}
-	b, _ := os.ReadFile(path)
-	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
-	if len(lines) != 2*n {
-		t.Fatalf("%d lines, want %d", len(lines), 2*n)
-	}
-	var prev uint64
-	for i, l := range lines {
-		var e Event
-		if err := json.Unmarshal([]byte(l), &e); err != nil {
-			t.Fatalf("line %d: %v", i, err)
+		if s := strings.TrimSpace(string(b)); s != "" {
+			lines = append(lines, strings.Split(s, "\n")...)
 		}
-		if e.Seq <= prev {
-			t.Fatalf("line %d: seq %d after %d", i, e.Seq, prev)
+	}
+	return lines
+}
+
+func TestFollowFromNowSkipsStoredEvents(t *testing.T) {
+	for name, mk := range sinks(t) {
+		t.Run(name, func(t *testing.T) {
+			s := mk()
+			defer s.Close()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			s.Append(ctx, &Event{Type: TypeSecretRead, Outcome: OutcomeOK})
+			got := follow(t, ctx, s, Filter{}, FromNow)
+			// Follow may not have opened the log yet: append until it
+			// delivers something. The stored event must never come.
+			for {
+				s.Append(ctx, &Event{Type: TypeLock, Outcome: OutcomeOK})
+				select {
+				case e := <-got.ch:
+					if e.Seq == 1 {
+						t.Fatal("FromNow delivered a stored event")
+					}
+					return
+				case <-time.After(20 * time.Millisecond):
+				}
+			}
+		})
+	}
+}
+
+// foca events refuses a --type not in Types, so every type must be there.
+func TestTypesListsEveryEventType(t *testing.T) {
+	f, err := parser.ParseFile(token.NewFileSet(), "event.go", nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, obj := range f.Scope.Objects {
+		if obj.Kind != ast.Con || !strings.HasPrefix(obj.Name, "Type") {
+			continue
 		}
-		prev = e.Seq
+		n++
+		lit := obj.Decl.(*ast.ValueSpec).Values[0].(*ast.BasicLit)
+		if v, _ := strconv.Unquote(lit.Value); !slices.Contains(Types, v) {
+			t.Errorf("%s (%s) is missing from Types", obj.Name, v)
+		}
 	}
-	// A CLI that opens after the service has written continues from it.
-	late, _ := OpenJSONL(path)
-	defer late.Close()
-	if seq, _ := late.Append(ctx, &Event{Type: TypeSecretAdd, Outcome: OutcomeOK}); seq != prev+1 {
-		t.Fatalf("late seq %d, want %d", seq, prev+1)
-	}
-	if seq, _ := service.Append(ctx, &Event{Type: TypeSecretRead, Outcome: OutcomeOK}); seq != prev+2 {
-		t.Fatalf("service seq after CLI write %d, want %d", seq, prev+2)
+	if n != len(Types) {
+		t.Errorf("%d type constants, %d in Types", n, len(Types))
 	}
 }

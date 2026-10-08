@@ -32,6 +32,7 @@ type Config struct {
 	Plugins     Plugins
 	Approval    Approval
 	Limits      Limits
+	Audit       Audit
 	Vaults      []string
 	Instances   []Instance
 	// Policy levels other than the instance's own (design §9.2), by name.
@@ -91,6 +92,13 @@ type Limits struct {
 	IdleTimeout time.Duration
 }
 
+// Audit sizes the audit log: the current file is rotated once it holds
+// MaxFileSize bytes, and the KeepFiles newest rotated files are kept.
+type Audit struct {
+	MaxFileSize int64
+	KeepFiles   int
+}
+
 type Instance struct {
 	Name  string
 	Realm identity.Realm
@@ -146,6 +154,11 @@ const (
 	DefaultIdleTimeout    = 2 * time.Minute
 	MinIdleTimeout        = 5 * time.Second
 	MaxIdleTimeout        = time.Hour
+
+	DefaultAuditFileSizeMiB = 16
+	MaxAuditFileSizeMiB     = 1024
+	DefaultAuditKeepFiles   = 16
+	MaxAuditKeepFiles       = 1000
 )
 
 var (
@@ -186,6 +199,7 @@ type rawFile struct {
 	Plugins        rawPlugins                  `toml:"plugins"`
 	Approval       rawApproval                 `toml:"approval"`
 	Limits         rawLimits                   `toml:"limits"`
+	Audit          rawAudit                    `toml:"audit"`
 	Vaults         map[string]rawVault         `toml:"vaults"`
 	Instances      map[string]rawInstance      `toml:"instances"`
 	Secrets        map[string]rawPolicyTable   `toml:"secrets"`
@@ -246,6 +260,11 @@ type rawApproval struct {
 type rawLimits struct {
 	MaxConnections *int      `toml:"max_connections"`
 	IdleTimeout    *duration `toml:"idle_timeout"`
+}
+
+type rawAudit struct {
+	MaxFileSizeMiB *int `toml:"max_file_size_mib"`
+	KeepFiles      *int `toml:"keep_files"`
 }
 
 type rawVault struct {
@@ -491,6 +510,22 @@ func validate(raw *rawFile) (*Config, error) {
 		}
 	}
 	c.Limits = l
+
+	// audit
+	sizeMiB, keep := DefaultAuditFileSizeMiB, DefaultAuditKeepFiles
+	if raw.Audit.MaxFileSizeMiB != nil {
+		sizeMiB = *raw.Audit.MaxFileSizeMiB
+		if sizeMiB < 1 || sizeMiB > MaxAuditFileSizeMiB {
+			fail("audit.max_file_size_mib %d is outside 1..%d", sizeMiB, MaxAuditFileSizeMiB)
+		}
+	}
+	if raw.Audit.KeepFiles != nil {
+		keep = *raw.Audit.KeepFiles
+		if keep < 1 || keep > MaxAuditKeepFiles {
+			fail("audit.keep_files %d is outside 1..%d", keep, MaxAuditKeepFiles)
+		}
+	}
+	c.Audit = Audit{MaxFileSize: int64(sizeMiB) << 20, KeepFiles: keep}
 
 	c.OpaquePeers = raw.OpaquePeers
 	if c.OpaquePeers == nil {

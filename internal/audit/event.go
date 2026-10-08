@@ -162,3 +162,23 @@ type KeyPart struct {
 	Value string `json:"value"`
 	By    string `json:"by"` // "host": the host kernel
 }
+
+// Types lists every event type foca records, Outcomes and Modes every
+// outcome and approval mode; foca events accepts only these as filters.
+var (
+	Types = []string{
+		TypeServerStart, TypeServerStop, TypeConfigLoad, TypeConfigReload,
+		TypeApprovalGranted, TypeApprovalDenied, TypeApprovalReused, TypeApprovalTimeout,
+		TypeSecretList, TypeSecretRead, TypeActionList, TypeActionRun,
+		TypeSecretAdd, TypeSecretUpdate, TypeSecretRemove, TypeVaultInit, TypeVaultRecover, TypeVaultRekey,
+		TypeGrantsDrop, TypeLock, TypeRequestRejected,
+	}
+	Outcomes = []string{OutcomeOK, OutcomeDenied, OutcomeError, OutcomeNotFound, OutcomeRejected}
+	Modes    = []string{ModeFresh, ModeReused, ModeNone}
+)
+
+// Resource kinds.
+const (
+	KindSecret = "secret"
+	KindAction = "action"
+)

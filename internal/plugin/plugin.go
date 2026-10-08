@@ -316,7 +316,7 @@ type PeerIdentifier interface {
 type AuditSink interface {
 	// Append must make the event durable before returning.
 	Append(ctx context.Context, e *audit.Event) (seq uint64, err error)
-	Query(ctx context.Context, f audit.Filter, p audit.Page) (events []audit.Event, next uint64, err error)
-	Subscribe(ctx context.Context, f audit.Filter, fromSeq uint64) (<-chan audit.Event, error)
-	Close() error
+	// Query and Follow see every event in the log, including those other
+	// processes appended (design §8.5).
+	audit.Reader
 }

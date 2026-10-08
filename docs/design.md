@@ -637,15 +637,18 @@ type VerifiedPeer struct {
 ```go
 type AuditSink interface {
     Append(ctx, Event) (seq uint64, err error)   // must be durable before return
-    Query(ctx, Filter, Page) ([]Event, Cursor, error)
-    Subscribe(ctx, Filter, fromSeq uint64) (<-chan Event, error)
+    Query(ctx, Filter, Page) (events []Event, nextAfterSeq uint64, err error)
+    Follow(ctx, Filter, afterSeq uint64, fn func(Event) error) error
 }
 ```
 
 - `jsonl`, `memory` (tests), later `sqlite`. A pure-Go driver keeps the build
   cgo-free.
-- `Query` and `Subscribe` are part of the interface from the start, before anything uses
-  them. That way the sinks are built to support them.
+- `Query` and `Follow` are the reading half, `audit.Reader`, that `foca events` uses
+  (§8.5). They see every event in the log, whichever process appended it. `Follow` delivers
+  stored events, then live ones, and blocks until its context ends. It returns an error
+  instead of skipping events it can't read, which a channel that just closes couldn't
+  say.
 
 ---
 
@@ -848,8 +851,8 @@ the host, working directly on host files:
   `kill`), matches its start time, and checks that its executable is foca and that it runs
   as the same uid.
 - **Concurrent writers.** The CLI and the service both append to the audit log. Each append
-  takes an exclusive `flock` and reads the last `seq` under the lock, so sequence numbers stay
-  unique across processes.
+  takes an exclusive `flock` on `audit.lock` and reads the last `seq` under the lock, so
+  sequence numbers stay unique across processes, also across rotations (D10).
 - **Reads on the host still go through a client socket**, of an instance whose realm is
   `host`. Approval policy, grants, the prompt queue and wipes then live in one place. The CLI
   never serves secret values from the vault itself.
@@ -1037,6 +1040,10 @@ max_queue      = 4                 # pending prompts per service; more -> busy
 max_connections = 32
 idle_timeout    = "2m"
 
+[audit]                            # §8: rotate the audit log by size
+max_file_size_mib = 16             # 1-1024
+keep_files        = 16             # rotated files kept, 1-1000
+
 [vaults.common]                    # shared, so declared; private vaults need no table
 
 # ---- instances: one per realm ----
@@ -1094,15 +1101,24 @@ authenticator 1h, which gives reuse for 30m within `peer-session`. Reading
 
 ### D10: Versioned JSONL events, fail-closed, verified and reported identity strictly separate
 
-Each event is one JSON object per line in `<data-dir>/audit.jsonl`. The file is mode 0600,
-rotated by size, and keeps N files. Appending uses `O_APPEND` plus `fsync` before the request
-continues.
+Each event is one JSON object per line in `<data-dir>/audit.jsonl`. Every file is mode 0600.
+Appending uses `O_APPEND` plus `fsync` before the request continues.
 
 - A write that fails partway is cut back to the end of the last good event, so a torn line can
   never merge with the next event and hide it.
 - A failed `fsync` stops the sink until restart. After one, the kernel may have dropped the
   data and a later `fsync` can still report success. Every request is then refused, as D10
   intends.
+- **Rotation.** Once the current file holds `[audit] max_file_size_mib` (default 16), the
+  next append renames it after the seq of its first event (`audit.1042.jsonl`) and starts a
+  new one. The newest `keep_files` rotated files (default 16) are kept; older ones are
+  removed. Because the name gives the file's seq range, a query by seq skips older files
+  without opening them. A rotation that can't be done fails the append, so the request is
+  refused. A file that can't be removed just stays.
+- **One lock for every writer.** Writers hold an exclusive `flock` on `audit.lock`, since the
+  log files themselves get renamed. Under it each writer catches up on what others appended
+  (only the new bytes) and moves to the new current file if another process rotated it.
+  Readers take the lock shared, and only while they open files.
 
 ### 8.1 Event shape (`v: 1`)
 
@@ -1223,15 +1239,33 @@ package the sinks use:
 
 ```
 foca events query  [--since T] [--until T] [--type T]… [--instance I] [--resource kind:id]
-                   [--outcome O] [--mode fresh|reused|none] [--after-seq N] [--limit ≤500]
+                   [--outcome O] [--mode fresh|reused|none] [--after-seq N] [--limit 1-500]
                    → JSON lines, plus a trailing {"next_after_seq": N} when more remain
 foca events follow [same filters] [--from-seq N]
                    → backfill from N, then live, with no gaps (tails the file)
 ```
 
+- **Filters.** `T` is RFC 3339, or a duration back from now (`90m`); `--since` is inclusive
+  and `--until` exclusive. A type, outcome, mode, resource or instance that can't exist is a
+  usage error (exit 2), not a filter that silently matches nothing. `--instance` is the
+  global flag; `FOCA_INSTANCE` is ignored here, so a variable left set in a shell can't hide
+  events. `--limit` defaults to 100.
+- **Follow.** `--from-seq N` prints stored events with seq ≥ N, then new ones. Without it
+  only new ones are printed. It runs until SIGINT, SIGTERM or SIGHUP and then exits 0. It
+  reads the files directly, so it sees what the service and every host CLI append. It
+  tracks the current file across rotations, and reads a line only once its newline is
+  written. It stops with an error rather than leave a gap: when rotation removed files it
+  hadn't read yet (the error names the last seq it read), or when the file is rewritten
+  under it.
+- **Output.** The log keeps verified names exactly as the kernel gave them, and a process
+  can name itself with terminal controls or bidi overrides. Both commands print every rune
+  that isn't printable (C1 controls, format characters such as U+202E, line and paragraph
+  separators, unassigned code points) as a `\uXXXX` escape, so the JSON decodes to the
+  recorded event but can't act on the terminal that shows it.
+
 A later menu-bar app or TUI runs these commands, or links the `audit` package and reads the
 file directly. `--from-seq` lets a viewer backfill and then go live without gaps. The sink
-interface keeps `Query` and `Subscribe` (§4.7) so a later SQLite sink fits behind the same
+interface keeps `Query` and `Follow` (§4.7) so a later SQLite sink fits behind the same
 commands.
 
 ---
@@ -1973,8 +2007,9 @@ internal/action/          action specs: param checks, argument templates, output
 internal/plugins/…        authn/fake, authn/polkit (and its test harness, polkittest), store/memory,
                           store/vaultfile, keyprot/file (test builds only), keyprot/tpm (and its
                           test harness, tpmtest), provider/static, provider/command, peer (linux,
-                          darwin), events/logind; later keyprot/*
-internal/audit/           event types (v1) + sinks: memory, jsonl
+                          darwin), events/logind, sysbus (the system D-Bus, for polkit and
+                          logind); later keyprot/*
+internal/audit/           event types (v1), sinks (memory, rotating jsonl), the log reader for events
 internal/config/          TOML load and validation, paths
 internal/identity/        host-verified, guest-verified and reported identity, one distinct type each
 internal/fsutil/          trusted-file and private-directory checks, atomic writes, file locks
@@ -2063,9 +2098,9 @@ noted; packages are named as in `go test` output (`main` is `cmd/foca`, whose te
 | helper: strict answers, trust checks, the pin, sleep acked only after the wipe | `helper.TestApproveAnswers`, `helper.TestDecodeResponseIsStrict`, `helper.TestHelperTrustChecks`, `wiring.TestDarwinHelperNeedsABuiltInPin`, `main.TestBinaryHelperPin`, `helper.TestSleepAckedOnlyAfterTheCoreHandledIt`, `main.TestBinaryDarwinHelper` |
 | helper conformance and the macOS peer identifier (on a Mac, in CI) | `internal/plugin/helper/conformance_test.go` against the signed `foca-darwin`, `peer.TestDarwinIdentifiesRealPeer`, `peer.TestDarwinPeerThatExecsIsNamedAfterItsNewProgram`, `peer.TestSealedPath` |
 | **Events** | |
-| paging and filters | — |
-| backfill + live with no gaps, across writers and rotations | `audit.TestJSONLSeqUniqueAcrossProcesses` |
-| recorded names can't act on the terminal | — |
+| paging and filters | `audit.TestQueryPagesAcrossRotatedFiles`, `cli.TestEventsQueryPages`, `cli.TestEventsQueryFilters`, `cli.TestEventsFilterFlagsAreChecked` |
+| backfill + live with no gaps, across writers and rotations | `audit.TestFollowBackfillsThenStreamsWithoutGap`, `audit.TestLogFollowSeesEveryWriterAcrossRotations`, `audit.TestLogFollowRefusesAGapLeftByRemovedFiles`, `audit.TestJSONLSeqUniqueAcrossProcesses` |
+| recorded names can't act on the terminal | `cli.TestEventsPrintNonPrintingRunesEscaped` |
 | **Guest relay** | |
 | bad or missing `relay.hello` refused | — |
 | forged `guest_verified` rejected on both sides | — |
@@ -2083,13 +2118,15 @@ without them they skip (the dev shell and CI set both).
 
 **Not built**
 
-- Audit log rotation, and `foca events query` and `follow`.
 - Nix packaging, and `serve --only` for one process per instance or group.
 - The guest relay, guest-verified identity and the `guest-*` scopes, which are a config
   error until then.
 - `foca reset` and its `vault.reset` event; `[approval] list_requires_approval` (D16); a
   custom `--format`; the `secure-enclave`, `libsecret` and `keyring` key protectors.
 - macOS container runtimes' proxies in the default `opaque_peers` (§2.1).
+- A hash chain over the audit log; retention is by file count only. `foca events follow`
+  polls every 200 ms, and only `--after-seq` skips rotated files, so a query by time reads
+  every kept file.
 - User presence for the vault key on Linux: the TPM binds it to the machine and its boot
   state, not to a touch (a FIDO2 key's `hmac-secret` would add that, §12.4). The first seal
   takes the TPM's storage key on trust; an endorsement-key certificate chain would anchor it.

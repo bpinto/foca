@@ -169,6 +169,27 @@ Several secrets in one `get` or `run` take one approval. `get` won't write a sec
 terminal. `-f env` writes `NAME=value` lines for `docker run --env-file`, values taken raw;
 never `source` it in a shell or use it as a systemd `EnvironmentFile`. On the host, `-i <instance>` picks a socket when there are several.
 
+## Audit log
+
+Every request, approved or not, is one JSON line in `audit.jsonl` in the data directory.
+`foca events` reads it as JSON lines:
+
+```sh
+foca events query --type secret.read --since 24h          # up to 100; --limit up to 500
+foca events query -i dev --outcome denied --after-seq 1042  # the next page
+foca events follow --resource secret:common:github-pat    # new events, live, until ^C
+foca events follow --from-seq 1                           # everything stored, then live
+```
+
+When more events match than `--limit`, `query` ends with `{"next_after_seq": N}`. The log
+rotates by size, and rotated files are kept up to a limit:
+
+```toml
+[audit]
+max_file_size_mib = 16            # 1-1024
+keep_files        = 16            # rotated files kept, 1-1000
+```
+
 ## Actions
 
 Actions are host commands declared in full in config. A realm can only run the actions

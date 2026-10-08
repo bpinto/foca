@@ -1,6 +1,9 @@
 package audit
 
-import "sync/atomic"
+import (
+	"context"
+	"sync/atomic"
+)
 
 // Memory is an in-memory sink for tests. SetFailure makes every later Append
 // fail, to exercise fail-closed paths.
@@ -17,6 +20,14 @@ type memPersister struct {
 func NewMemory() *Memory {
 	p := &memPersister{}
 	return &Memory{sink: newSink(p, 0), mem: p}
+}
+
+func (m *Memory) Query(_ context.Context, f Filter, page Page) ([]Event, uint64, error) {
+	return m.query(f, page)
+}
+
+func (m *Memory) Follow(ctx context.Context, f Filter, afterSeq uint64, fn func(Event) error) error {
+	return m.follow(ctx, f, afterSeq, fn)
 }
 
 // SetFailure makes later appends fail with err; nil restores normal behaviour.

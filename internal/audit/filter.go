@@ -1,6 +1,9 @@
 package audit
 
-import "time"
+import (
+	"context"
+	"time"
+)
 
 // Filter selects events. Zero fields match everything.
 type Filter struct {
@@ -74,4 +77,17 @@ func (p Page) limit() int {
 		return MaxPageLimit
 	}
 	return p.Limit
+}
+
+// Reader is what foca events reads a log through (design §8.5).
+type Reader interface {
+	// Query returns matching events with Seq > page.AfterSeq. next is the
+	// seq to pass as AfterSeq for the following page, or 0 when there are
+	// no more.
+	Query(ctx context.Context, f Filter, page Page) (events []Event, next uint64, err error)
+	// Follow calls fn with each matching event with Seq > afterSeq
+	// (FromNow: only new ones): stored ones, then live ones, with no gap.
+	// It returns nil when ctx ends, or fn's error.
+	Follow(ctx context.Context, f Filter, afterSeq uint64, fn func(Event) error) error
+	Close() error
 }
