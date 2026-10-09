@@ -5,5 +5,5 @@
 # release is pinned yet.
 {
   version = "0.1.0";
-  hash = null;
+  hash = "sha256-E2kVI8LL9Y/r//1wthXttp5CERjGmT4P+Gw/JauyMBo=";
 }
