@@ -20,8 +20,11 @@ processes, microVMs and containers that need them. **Nothing is handed out silen
 each access asks for your approval, the prompt says exactly who is asking for what, and
 every attempt lands in an audit log.
 
-> **foca** is trying to let **gh** use **GitHub PAT** in **VM dev**, via **claude**.
-> Approving allows reuse for 15m by anything in VM dev.
+> **foca** is trying to share:<br>
+> 🔑 **GitHub PAT**<br>
+> 🖥️ **VM dev**<br>
+> 👤 **gh** via **claude**<br>
+> ⏱️ 15m, anything in this VM
 
 ## Why foca
 
@@ -294,12 +297,31 @@ vaults can hold the same name.
 </details>
 
 <details>
+<summary><b>Reading the approval prompt</b></summary>
+
+Each line of a prompt holds one thing, behind an emoji. A name a caller sends is cut down to
+ASCII letters, digits and `._+-`, so the emoji on a prompt can only come from foca.
+
+| | Meaning |
+|---|---|
+| 🔑 | the secrets the program gets |
+| ⚙️ | the action that runs on the host, its params, and any secrets it uses there |
+| 🖥️ 🚢 🌐 | the VM, container or remote host asking; no line for a program on the host |
+| 👤 | the program and the agent behind it, as a kernel reports them |
+| ❔ | the program and agent as the caller describes itself: not verified |
+| ⚠ | after a name: the process is real, but its name could have been chosen by anyone |
+| ⏱️ | approving also covers later requests, for this long and for whom |
+| 🚫 🔕 | you recently denied this, or prompts from this realm went unanswered |
+
+</details>
+
+<details>
 <summary><b>Verified identity inside a VM</b></summary>
 
 Over a forwarded socket the host only sees `ssh`, so the program inside the VM is shown as
-a claim (`VM claims: gh via claude`). Run the optional guest relay inside the VM and the
-prompt names the process the VM's kernel reports (`let gh ⚠ use GitHub PAT in VM dev, via
-claude ⚠.`: the process is verified, its name is one it chose). It also enables reuse scoped to
+a claim (`❔ gh via claude (unverified)`). Run the optional guest relay inside the VM and the
+prompt names the process the VM's kernel reports (`👤 gh ⚠ via claude ⚠`: the process is
+verified, its name is one it chose). It also enables reuse scoped to
 one terminal session in the VM (`scope = "guest-session"`) rather than the whole VM. That
 separates terminals only if what runs in one can't type into another: an agent running as your
 own user can drive your other tmux windows, so give it a user of its own.

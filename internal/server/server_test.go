@@ -200,7 +200,7 @@ func TestRunTargetIsAClaimRecordedAndShown(t *testing.T) {
 		t.Fatalf("read event %+v", read)
 	}
 	// No skip list here, so the CLI itself is named as via.
-	if granted == nil || !strings.HasSuffix(granted.Approval.PromptText, "VM claims: npm via foca.") {
+	if granted == nil || !strings.HasSuffix(granted.Approval.PromptText, "\n❔ npm via foca (unverified)") {
 		t.Fatalf("approval %q", granted.Approval.PromptText)
 	}
 	b, _ := json.Marshal(read)
@@ -783,7 +783,7 @@ func TestGrantsOverTheSocket(t *testing.T) {
 	if n := len(e.auth.Requests()); n != 1 {
 		t.Fatalf("%d prompts, want 1", n)
 	}
-	if p := e.auth.Requests()[0].Prompt; !strings.HasSuffix(p, "Approving allows reuse for 1h by anything in the same session.") {
+	if p := e.auth.Requests()[0].Prompt; !strings.HasSuffix(p, "1h, this session") {
 		t.Fatalf("prompt %q", p)
 	}
 

@@ -25,9 +25,9 @@ func TestApprovalSettingsReachThePrompt(t *testing.T) {
 	for _, c := range []struct {
 		name, approval, want string
 	}{
-		{"defaults", "", "let wrapperx use dev:tok, via gh."},
-		{"skip_ancestors", "skip_ancestors = [\"wrapperx\"]\n", "let gh use dev:tok."},
-		{"prompt_show_client = false", "prompt_show_client = false\n", "let a program use dev:tok."},
+		{"defaults", "", "share:\n🔑 dev:tok\n👤 wrapperx via gh"},
+		{"skip_ancestors", "skip_ancestors = [\"wrapperx\"]\n", "share:\n🔑 dev:tok\n👤 gh"},
+		{"prompt_show_client = false", "prompt_show_client = false\n", "share:\n🔑 dev:tok"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			cfg, err := config.Parse([]byte("version = 1\n[plugins]\nauthenticator = \"fake\"\nsecret_store = \"memory\"\nplatform_events = \"none\"\n" +

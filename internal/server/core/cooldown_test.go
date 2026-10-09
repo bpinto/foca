@@ -89,7 +89,7 @@ func TestUnansweredPromptsCountAndShow(t *testing.T) {
 
 	r.clk.advance(3 * time.Second)
 	r.read(t, c, "github-pat") // denied: the third strike
-	if p := r.auth.Requests()[2].Prompt; !strings.HasSuffix(p, " (2 unanswered)") {
+	if p := r.auth.Requests()[2].Prompt; !strings.HasSuffix(p, "\n🔕 2 prompts unanswered") {
 		t.Fatalf("prompt %q", p)
 	}
 	if err := r.read(t, c, "npm-token"); !cooledDown(t, r, err) {

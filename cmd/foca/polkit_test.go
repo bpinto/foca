@@ -50,7 +50,7 @@ func TestBinaryPolkit(t *testing.T) {
 		}
 	}
 	if len(reasons) != 3 || !strings.HasPrefix(reasons[0], "create vault dev") ||
-		!strings.HasPrefix(reasons[1], "add github-pat") || !strings.Contains(reasons[2], "use dev:github-pat") {
+		!strings.HasPrefix(reasons[1], "add github-pat") || !strings.Contains(reasons[2], "\n🔑 dev:github-pat") {
 		t.Fatalf("prompts %q", reasons)
 	}
 	if !strings.Contains(p.auditTypes(), `"authenticator":"polkit","method":"polkit-auth_self"`) {
@@ -85,7 +85,7 @@ func TestBinaryPolkit(t *testing.T) {
 		}
 		b := agent.Begun()
 		if len(b) != 1 || b[0].ActionID != polkit.ActionID ||
-			!strings.HasPrefix(b[0].Message, "foca is trying to let ") || !strings.Contains(b[0].Message, " use dev:github-pat") {
+			!strings.HasPrefix(b[0].Message, "foca is trying to share:\n") || !strings.Contains(b[0].Message, "\n🔑 dev:github-pat") {
 			t.Fatalf("agent shown %+v", b)
 		}
 		p.ok("", "stop")

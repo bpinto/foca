@@ -40,7 +40,7 @@ import (
 const (
 	// ActionID is the polkit action every approval checks.
 	ActionID = "io.github.bpinto.foca.approve"
-	// Message frames the core's verb phrase, as macOS frames it with
+	// Message frames the core's prompt text, as macOS frames it with
 	// "<app> is trying to". polkit fills $(reason) from the request's
 	// details in a single pass, so a "$(" in the reason is shown as it is.
 	Message = "foca is trying to $(reason)"

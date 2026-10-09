@@ -1,7 +1,7 @@
 // The authenticator kind: Touch ID through LocalAuthentication.
 //
 // The reason text comes from the foca core, built from trusted templates.
-// macOS shows it after "<name> is trying to", so it is a verb phrase.
+// macOS shows it after "<name> is trying to", so it starts with a verb.
 
 import Foundation
 import LocalAuthentication

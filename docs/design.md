@@ -204,10 +204,10 @@ type ApprovalResult struct {
   `foca [dev]: read common:github-pat (via ssh forward)`. Callers can't supply a reason string,
   because a caller-chosen reason could put a reassuring lie on the prompt.
 - **The requesting process is shown on the prompt, placed by trust level.** A name the host
-  kernel or the optional guest relay (§14) verified is stated as fact; `<Realm> claims:` (e.g.
-  `VM claims:`) introduces the client's own, unverified claim. Untrusted names are cut down
-  to a short basename of ASCII letters, digits and `._+-`, so they can't add words to the
-  sentence. When the text is too long, they are
+  kernel or the optional guest relay (§14) verified is stated as fact, on a `👤` line; the
+  client's own, unverified claim goes on a `❔` line that says `(unverified)`. Untrusted
+  names are cut down to a short basename of ASCII letters, digits and `._+-`, so they can't
+  add words or lines to the prompt. When the text is too long, they are
   dropped before any trusted field. `[approval] prompt_show_client = false`
   hides them. Exact wording: §4.1.1.
 - Implementations: `touchid` (helper), `polkit` (Linux, §4.1.2) and `fake` (test builds only,
@@ -215,12 +215,16 @@ type ApprovalResult struct {
 
 #### 4.1.1 Prompt format
 
-A good prompt answers three questions in one sentence: **which program**, **which
+A good prompt answers three questions at a glance: **which program**, **which
 credential**, and **on whose behalf**. macOS adds `"<process name>" is trying to` in front of
-the reason text itself, so the reason is a verb phrase. The helper must therefore show up as
+the reason text itself, so the reason's first line is a single verb (`share:`, `run:`), and
+each line after it holds one slot behind an emoji that says what it is. Untrusted names are
+ASCII only, so every emoji on a prompt is foca's. The helper must show up as
 `foca`, not `foca-darwin`. It carries an embedded `Info.plist` (`CFBundleName = foca`) for
-that; whether the dialog uses it or the executable name is still to be confirmed on a Mac.
-macOS also ends the text with its own full stop, so the helper drops the reason's last one.
+that; whether the dialog uses it or the executable name is still to be confirmed on a Mac,
+and so is how the Touch ID dialog lays out line breaks and emoji. polkit agents show them as
+written. macOS also ends the text with its own full stop, so the helper drops the reason's
+last one.
 
 **Slots and where they come from**
 
@@ -228,7 +232,7 @@ macOS also ends the text with its own full stop, so the helper drops the reason'
 |---|---|---|---|
 | `{instance}` | which VM | host config | trusted |
 | `{credentials}` | display names of the secrets, or the action's description | host (vault metadata / config) | trusted |
-| `{reach}` | reuse sentence, if approving creates a grant (§9.1, safeguard 6) | host policy | trusted |
+| `{reach}` | how long and for whom approving allows reuse, if it creates a grant (§9.1, safeguard 6) | host policy | trusted |
 | `{program}` | who will receive or use the value | `credential_process`/`get`: the CLI's parent; `run`: the command being run, when the identity is claimed | guest-verified via relay, else client-reported |
 | `{via}` | the agent or harness behind it | nearest ancestor in the parent chain that isn't a shell or foca. Skipped names are configurable: `[approval] skip_ancestors`, default `sh bash zsh fish nu dash ksh tmux screen sshd sshd-session login su sudo env nix direnv foca` | same as `{program}` |
 
@@ -267,7 +271,7 @@ shows as `git-credential-…` (a name exactly 15 bytes long gets it too). A Nix 
 suffix was cut is still unwrapped: `.terraform-wrap` shows as `terraform`. A guest chain also
 ends at the leader of the caller's terminal session, the shell that owns the terminal: what
 runs the terminal (a tmux server, sshd, systemd) is never named. If every process left is
-skipped, as when you type `foca get` in a shell, that shell is named: `let zsh ⚠ use …` says
+skipped, as when you type `foca get` in a shell, that shell is named: `👤 zsh ⚠` says
 the request came straight from a terminal. A leader is matched by pid and start time; if it
 isn't in the chain, the chain is kept whole and nothing is named in its place.
 
@@ -313,26 +317,41 @@ only, at most 32 characters each, and only ASCII letters, digits and `._+-`. Any
 dropped, so an exe called `gh use GitHub PAT. Then let aws` shows as
 `ghuseGitHubPAT.Thenletaws`, and a look-alike letter can't pass for a real one.
 
-| Case | Reason text (after "foca is trying to") |
-|---|---|
-| read, identity guest-verified (names are always unsealed) | `let gh ⚠ use GitHub PAT in VM dev, via claude ⚠.` |
-| read, guest-verified, typed in a shell | `let zsh ⚠ use GitHub PAT in VM dev.` |
-| read, identity only claimed | `let a program use GitHub PAT in VM dev. VM claims: gh via claude.` |
-| `run`, identity only claimed | `let a program use npm token in VM dev. VM claims: npm via claude.` |
-| read, no identity at all | `let a program use GitHub PAT in VM dev.` |
-| action, guest-verified | `run "AWS credentials" with profile=dev-admin for aws ⚠ in VM dev, via claude ⚠.` |
-| action using a secret, claimed | `run "List PRs" with repo=foca/foca (uses GitHub PAT) in VM dev. VM claims: gh via claude.` |
-| host-local client (host-verified) | `let gh use GitHub PAT, via claude.` |
-| host-verified, exe not sealed | `let gh ⚠ use GitHub PAT in container web, via conmon.` |
-| any case that creates a grant | the reason above, then `{reach}`, e.g. ` Approving allows reuse for 15m by anything in VM dev.` |
+A read from a VM without the relay, whose caller claims to be `gh` run by `claude`, with a
+reuse policy:
+
+```
+foca is trying to share:
+🔑 GitHub PAT
+🖥️ VM dev
+❔ gh via claude (unverified)
+⏱️ 15m, anything in this VM
+```
+
+The first line is `share:` for a read and `run:` for an action. Each line after it is left
+out when it has nothing to say, in this order:
+
+| Line | Holds | Example |
+|---|---|---|
+| `🔑` (read) | `{credentials}` | `🔑 GitHub PAT and npm token` |
+| `⚙️` (action) | the action, its params, and the secrets it reads on the host | `⚙️ "List PRs" with repo=foca/foca (uses GitHub PAT)` |
+| `🖥️` / `🚢` / `🌐` | `{instance}`: a VM, a container or a remote host; none for a host-local client | `🖥️ VM dev`, `🚢 container web` |
+| `👤` | verified `{program}` and `{via}` (host- or guest-verified) | `👤 gh ⚠ via claude ⚠` (guest-verified, never sealed), `👤 gh via claude` (host, sealed), `👤 zsh ⚠` (typed in a shell) |
+| `❔` | claimed `{program}` and `{via}` | `❔ npm via claude (unverified)` |
+| `⏱️` | `{reach}`, if approving creates a grant | `⏱️ 15m, anything in this VM` |
+| `🚫` | recent denials (§9.6) | `🚫 denied 2 times` |
+| `🔕` | the instance's unanswered prompts (§9.6) | `🔕 1 prompt unanswered` |
+
+Host operations (`add`, `init`, …) are typed by the user on the host and keep one sentence,
+e.g. `add GitHub PAT to vault common, visible in VM dev.`. They never create grants, so
+they have no `⏱️` line.
 
 **Rules**
 
-1. Claimed identity is **never** put in the sentence position. In the sentence, `let gh use`
-   reads as fact. Only host-verified or guest-verified identity may go there. A claim always goes
-   in a separate trailing `VM claims:` clause, so a VM process can't put "let gh use…" on
-   screen when it's really `curl`. Verified names whose file isn't sealed are worded
-   followed by `⚠`, for the same reason.
+1. Claimed identity is **never** put on the `👤` line, which reads as fact. Only
+   host-verified or guest-verified identity may go there. A claim always goes on its own `❔`
+   line, marked `(unverified)`, so a VM process can't put `👤 gh` on screen when it's really
+   `curl`. Verified names whose file isn't sealed are followed by `⚠`, for the same reason.
 2. Trusted slots always come first. If the text is too long, untrusted slots are dropped
    first. `{credentials}` and `{reach}` are never dropped or shortened: every name in a batch
    is shown. If they still don't fit, the request is refused before any prompt
@@ -379,8 +398,8 @@ could start is not used. Test builds take a private bus from `FOCA_SYSTEM_BUS`.
 
 - **The message carries the prompt.** foca passes its reason text as the `reason` detail,
   and polkit puts it in place of `$(reason)`. That happens in a single pass, so a `$(` in the
-  reason is shown as it is. The dialog reads `foca is trying to let gh use GitHub PAT in VM
-  dev, via claude.`, the same sentence Touch ID shows (§4.1.1). Some agents read the message
+  reason is shown as it is. The dialog reads `foca is trying to share:` and then the same lines
+  Touch ID shows (§4.1.1). Some agents read the message
   as Pango markup or Qt rich text, where a `<` in a param value could open a tag that hides
   the text after it, so `<`, `>` and `&` go to polkit as `\u003c`, `\u003e` and `\u0026`,
   which every agent shows alike, as text. (`&lt;` would read as `<` in one agent and as
@@ -1276,8 +1295,8 @@ method-name characters, at most 64 bytes. Bursts are coalesced (§9.6).
 | Field group | Who fills it | Trusted for policy? | Shown in prompt |
 |---|---|---|---|
 | `peer.verified` | kernel (via peer identifier) | yes (uid check, session scope key) | yes |
-| `client.guest_verified` | guest relay, from the VM kernel (§14) | only for `guest-*` scope keys, on an instance with `guest_relay` | yes, in the sentence as a verified name |
-| `client.reported` | requesting client | **never** | yes, labelled "<Realm> claims:", sanitised |
+| `client.guest_verified` | guest relay, from the VM kernel (§14) | only for `guest-*` scope keys, on an instance with `guest_relay` | yes, on the `👤` line as a verified name |
+| `client.reported` | requesting client | **never** | yes, on the `❔` line marked `(unverified)`, sanitised |
 | `resource`, `params`, `instance` | host (resolved / validated) | yes | yes |
 
 ### 8.4 Versioning
@@ -1381,12 +1400,12 @@ session) from blurring:
 5. **Callers can't choose a scope.** Scope comes only from host config, folded with "stricter
    wins". `grants.drop` is the only thing a caller can do to its grants.
 6. **The prompt states how far the approval reaches.** If approving creates a grant, the
-   prompt says so in plain words, for example:
-   `Approve read common:github-pat? Also allows silent reads for 15m by: anything in VM dev`, or
-   `… by: aws (guest-verified) in the same VM session`.
-7. **`foca policy explain` shows the same wording.** It runs on the host CLI, reading config only
-   and prints the effective policy for every secret and action in that plain-language form,
-   so you can check what the config means before anything is approved.
+   prompt's `⏱️` line says for how long and for whom, after the line naming the realm:
+   `⏱️ 15m, anything in this VM`, `⏱️ 1h, this session` or `⏱️ 45s, this connection`.
+7. **`foca policy explain` states the same reach.** It runs on the host CLI, reading config only
+   and prints the effective policy for every secret and action in plain words, naming the
+   realm (`one approval allows reuse for 15m by anything in VM dev`), so you can check what
+   the config means before anything is approved.
 8. **The audit log shows scope and key.** Each grant and reuse event carries `scope` and the
    key components with their trust level, so a later UI can show "1 touch → 7 reads, all from
    VM session 780".
@@ -1500,7 +1519,7 @@ misbehaving VM from flooding the screen with prompts.
 same caller (its pinned peer session, else its connection) back off: 2 s, then 8 s, then 30 s
 before the next prompt. A request inside that time is refused with `denied` and audited as a
 coalesced `request.rejected` (`reason: denial_backoff`); it doesn't wait. The next prompt
-shows "(denied once)" or "(denied N times)". An approval resets the count, a denial is
+shows `🚫 denied once` or `🚫 denied N times`. An approval resets the count, a denial is
 forgotten after 10 minutes, and a wipe resets everything. The prompt slot is held until a
 decision is recorded, so a request queued behind a denial meets the backoff, and one queued
 behind an approval finds the new grant.
@@ -1513,8 +1532,8 @@ whole, which a realm can't change by forking or reconnecting. After three strike
 instance opens no prompt until 30 s after the last one; a fourth makes that 2 min, and every
 later one 5 min. A request in that time is refused with `denied` and audited as a coalesced
 `request.rejected` (`reason: prompt_cooldown`); it doesn't wait. The next prompt shows
-"(N unanswered)" for the timeouts and cancels among the strikes. An approval or a wipe clears
-them, and a strike is forgotten after 10 minutes.
+`🔕 N prompts unanswered` for the timeouts and cancels among the strikes. An approval or a
+wipe clears them, and a strike is forgotten after 10 minutes.
 
 **Nothing takes a closing prompt's place.** After a prompt times out or is cancelled, its slot
 stays held for 1.5 s before the next queued prompt may open. A realm can't cancel one prompt
@@ -2084,9 +2103,9 @@ prompt and docs say so.
 | `client.reported` | the client itself | nothing; it is informative only |
 
 Root in the VM can impersonate the relay, so `guest_verified` is **not** a boundary against a
-compromised guest. The prompt puts a guest-verified name in the sentence with the unsealed
-mark, `let gh ⚠ use …`: the VM kernel vouches for the process, but the process chose the
-name. A claim only gets a trailing `VM claims: gh` (§4.1.1). The audit log keeps the two in
+compromised guest. The prompt puts a guest-verified name on the `👤` line with the unsealed
+mark, `👤 gh ⚠`: the VM kernel vouches for the process, but the process chose the
+name. A claim only gets a `❔ gh (unverified)` line (§4.1.1). The audit log keeps the two in
 `client.guest_verified` and `client.reported`.
 
 **Reuse scopes.** The relay makes `guest-session` available (§9.1): one terminal session in
@@ -2190,7 +2209,7 @@ noted; packages are named as in `go test` output (`main` is `cmd/foca`, whose te
 | management methods refused and audited; only `client.sock` exists, 0600 in 0700 | `server.TestManagementMethodsRefusedAndAudited`, `server.TestSocketAndDirectoryModes` |
 | uid mismatch, wrong kind of peer, and every other refusal audited | `server.TestUIDMismatchIsRefusedAndAudited`, `server.TestNonProxyPeerRefusedOnOpaqueRealm`, `server.TestProxyPeerRefusedOnDirectRealm`, `server.TestEveryRefusedRequestIsAudited` |
 | verified, guest-verified and reported identity kept apart | `audit.TestVerifiedAndReportedStaySeparateOnTheWire`, `core.TestIdentityLevelsHaveDistinctTypes` |
-| prompts: claims never stated as fact, unsealed names marked (never dropped as a repeat), no name elided | `core.TestPromptWording`, `core.TestPromptNeverElidesCredentials`, `core.TestOversizedBatchRefusedBeforePrompting`, `peer.TestMountsCantLendASealedName`, `peer.TestLoadedCodeMustBeSealedToo` |
+| prompts: claims never stated as fact, unsealed names marked (never dropped as a repeat), no name elided, no name adds a line or an emoji | `core.TestPromptWording`, `core.TestClaimedIdentityNeverTakesTheVerifiedSlot`, `core.TestHostileClientStringsAreSanitised`, `core.TestPromptNeverElidesCredentials`, `core.TestOversizedBatchRefusedBeforePrompting`, `peer.TestMountsCantLendASealedName`, `peer.TestLoadedCodeMustBeSealedToo` |
 | a realm can't exhaust the service or flood the log | `server.TestConnectionCapPerInstance`, `core.TestReadsAndListsAreRateLimited`, `core.TestUnapprovedEventsAreCoalesced`, `core.TestTooManyRunningIsBusy` |
 | config rejections and file trust | `config.TestRejections`, `config.TestPolicyRejections`, `config.TestLoadChecksFileTrust` |
 | test-only plugins unreachable in a production build | `wiring.TestFakeAuthenticatorRefusedInProductionBuild`, `wiring.TestFileProtectorRefusedInProductionBuild`, `cli.TestProductionBuildLinksNoTestCode`, `cli.TestServiceDoesNotImportCLIUI` |

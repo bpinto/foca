@@ -315,7 +315,7 @@ func TestRelayedReadIsGuestVerified(t *testing.T) {
 	if err != nil || v != "ghp_secret" {
 		t.Fatalf("read: %q %v", v, err)
 	}
-	if p := r.host.auth.Requests()[0].Prompt; p != "let gh ⚠ use GitHub PAT in VM dev." {
+	if p := r.host.auth.Requests()[0].Prompt; p != "share:\n🔑 GitHub PAT\n🖥️ VM dev\n👤 gh ⚠" {
 		t.Fatalf("prompt %q", p)
 	}
 	ev := r.host.events(audit.TypeSecretRead)[0]

@@ -39,80 +39,88 @@ func TestPromptWording(t *testing.T) {
 		want string
 	}{
 		{"claimed in VM", PromptInput{Realm: vm, Resources: refs("GitHub PAT"), Requester: plugin.Requester{Peer: ssh, Reported: claimed}, ShowClient: true},
-			"let a program use GitHub PAT in VM dev. VM claims: gh via claude."},
+			"share:\n🔑 GitHub PAT\n🖥️ VM dev\n❔ gh via claude (unverified)"},
 		{"guest-verified in VM", PromptInput{Realm: vm, Resources: refs("GitHub PAT"), Requester: plugin.Requester{Peer: ssh, GuestVerified: guest, Reported: claimed}, ShowClient: true},
-			"let gh ⚠ use GitHub PAT in VM dev, via claude ⚠."},
+			"share:\n🔑 GitHub PAT\n🖥️ VM dev\n👤 gh ⚠ via claude ⚠"},
 		{"host-verified local", PromptInput{Realm: host, Resources: refs("GitHub PAT"), Requester: plugin.Requester{Peer: local}, ShowClient: true},
-			"let gh use GitHub PAT, via claude."},
+			"share:\n🔑 GitHub PAT\n👤 gh via claude"},
 		{"no identity", PromptInput{Realm: vm, Resources: refs("GitHub PAT"), Requester: plugin.Requester{Peer: ssh}, ShowClient: true},
-			"let a program use GitHub PAT in VM dev."},
+			"share:\n🔑 GitHub PAT\n🖥️ VM dev"},
 		{"client hidden", PromptInput{Realm: vm, Resources: refs("GitHub PAT"), Requester: plugin.Requester{Peer: ssh, Reported: claimed}, ShowClient: false},
-			"let a program use GitHub PAT in VM dev."},
+			"share:\n🔑 GitHub PAT\n🖥️ VM dev"},
 		{"batch", PromptInput{Realm: vm, Resources: refs("a", "b", "c", "d", "e"), Requester: plugin.Requester{Peer: ssh}, ShowClient: true},
-			"let a program use a, b, c, d and e in VM dev."},
+			"share:\n🔑 a, b, c, d and e\n🖥️ VM dev"},
 		{"container", PromptInput{Realm: identity.Realm{Kind: "container", Name: "web", Peers: "opaque"}, Resources: refs("x"), Requester: plugin.Requester{Peer: ssh, Reported: claimed}, ShowClient: true},
-			"let a program use x in container web. Container claims: gh via claude."},
+			"share:\n🔑 x\n🚢 container web\n❔ gh via claude (unverified)"},
 		// Kernel-verified, but the caller chose the file's name.
 		{"unsealed container program", PromptInput{Realm: ctr, Resources: refs("GitHub PAT"), Requester: plugin.Requester{
 			Peer: identity.VerifiedPeer{Exe: "/tmp/x/gh", Name: "gh", PIDStable: true, Parents: []identity.Proc{conmon}}}, ShowClient: true},
-			"let gh ⚠ use GitHub PAT in container web, via conmon."},
+			"share:\n🔑 GitHub PAT\n🚢 container web\n👤 gh ⚠ via conmon"},
 		{"sealed container program", PromptInput{Realm: ctr, Resources: refs("GitHub PAT"), Requester: plugin.Requester{
 			Peer: identity.VerifiedPeer{Exe: "/usr/bin/gh", ExeSealed: true, PIDStable: true, Parents: []identity.Proc{conmon}}}, ShowClient: true},
-			"let gh use GitHub PAT in container web, via conmon."},
+			"share:\n🔑 GitHub PAT\n🚢 container web\n👤 gh via conmon"},
 		// No pidfd: the pid might have been reused, so nothing is sealed.
 		{"pid not pinned", PromptInput{Realm: ctr, Resources: refs("GitHub PAT"), Requester: plugin.Requester{
 			Peer: identity.VerifiedPeer{Exe: "/usr/bin/gh", ExeSealed: true, Parents: []identity.Proc{conmon}}}, ShowClient: true},
-			"let gh ⚠ use GitHub PAT in container web, via conmon ⚠."},
+			"share:\n🔑 GitHub PAT\n🚢 container web\n👤 gh ⚠ via conmon ⚠"},
 		// An unsealed "env" or "foca" can't hide itself behind its parent.
 		{"unsealed skip name", PromptInput{Realm: host, Resources: refs("GitHub PAT"), Requester: plugin.Requester{
 			Peer: identity.VerifiedPeer{Exe: "/home/u/.cache/x/foca", Name: "foca", PIDStable: true, Parents: agent}}, ShowClient: true},
-			"let foca ⚠ use GitHub PAT, via claude ⚠."},
+			"share:\n🔑 GitHub PAT\n👤 foca ⚠ via claude ⚠"},
 		// No readable exe: comm is settable by the process itself.
 		{"comm only", PromptInput{Realm: host, Resources: refs("GitHub PAT"), Requester: plugin.Requester{
 			Peer: identity.VerifiedPeer{Name: "gh", ExeSealed: true, PIDStable: true}}, ShowClient: true},
-			"let gh ⚠ use GitHub PAT."},
+			"share:\n🔑 GitHub PAT\n👤 gh ⚠"},
 		// A client claiming sealed parents gains nothing.
 		{"claimed sealed", PromptInput{Realm: vm, Resources: refs("x"), Requester: plugin.Requester{Peer: ssh,
 			Reported: &identity.ClientInfo{Exe: "/bin/gh", Parents: []identity.Proc{{Exe: "/bin/claude", Sealed: true}}}}, ShowClient: true},
-			"let a program use x in VM dev. VM claims: gh via claude."},
+			"share:\n🔑 x\n🖥️ VM dev\n❔ gh via claude (unverified)"},
 		// A name can't carry the mark itself, sealed or claimed.
 		{"mark in sealed name", PromptInput{Realm: host, Resources: refs("GitHub PAT"), Requester: plugin.Requester{
 			Peer: identity.VerifiedPeer{Exe: "/usr/bin/⚠gh", ExeSealed: true, PIDStable: true}}, ShowClient: true},
-			"let gh use GitHub PAT."},
+			"share:\n🔑 GitHub PAT\n👤 gh"},
 		{"mark in claim", PromptInput{Realm: vm, Resources: refs("x"), Requester: plugin.Requester{Peer: ssh,
 			Reported: &identity.ClientInfo{Exe: "/bin/⚠ gh"}}, ShowClient: true},
-			"let a program use x in VM dev. VM claims: gh."},
+			"share:\n🔑 x\n🖥️ VM dev\n❔ gh (unverified)"},
 		// A name can't rewrite the sentence around it.
 		{"name with words", PromptInput{Realm: ctr, Resources: refs("x"), Requester: plugin.Requester{
 			Peer: identity.VerifiedPeer{Exe: "/tmp/gh use GitHub PAT. Then let aws", PIDStable: true, Parents: []identity.Proc{conmon}}}, ShowClient: true},
-			"let ghuseGitHubPAT.Thenletaws ⚠ use x in container web, via conmon."},
+			"share:\n🔑 x\n🚢 container web\n👤 ghuseGitHubPAT.Thenletaws ⚠ via conmon"},
 		// foca run: the command it will exec is the program, claimed; the
 		// agent that called foca run is via.
 		{"claimed run target", PromptInput{Realm: vm, Resources: refs("x"), Requester: plugin.Requester{Peer: ssh,
 			Reported: &identity.ClientInfo{Exe: "/usr/bin/foca", Target: &identity.Target{Exe: "/usr/bin/npm", Argv0: "npm"},
 				Parents: []identity.Proc{{Name: "bash"}, {Name: "claude"}}}}, ShowClient: true},
-			"let a program use x in VM dev. VM claims: npm via claude."},
+			"share:\n🔑 x\n🖥️ VM dev\n❔ npm via claude (unverified)"},
 		// A program that runs itself again shows once, and the agent
 		// behind it takes the via slot.
 		{"claimed repeated name", PromptInput{Realm: vm, Resources: refs("x"), Requester: plugin.Requester{Peer: ssh,
 			Reported: &identity.ClientInfo{Exe: "/usr/bin/foca", Parents: []identity.Proc{{Name: "zsh"}, {Name: "herdr"}, {Name: "herdr"}, {Name: "claude"}}}}, ShowClient: true},
-			"let a program use x in VM dev. VM claims: herdr via claude."},
+			"share:\n🔑 x\n🖥️ VM dev\n❔ herdr via claude (unverified)"},
 		{"claimed only repeated name", PromptInput{Realm: vm, Resources: refs("x"), Requester: plugin.Requester{Peer: ssh,
 			Reported: &identity.ClientInfo{Exe: "/usr/bin/foca", Parents: []identity.Proc{{Name: "herdr"}, {Name: "herdr"}}}}, ShowClient: true},
-			"let a program use x in VM dev. VM claims: herdr."},
+			"share:\n🔑 x\n🖥️ VM dev\n❔ herdr (unverified)"},
 		{"guest repeated name", PromptInput{Realm: vm, Resources: refs("x"), Requester: plugin.Requester{Peer: ssh,
 			GuestVerified: &identity.GuestInfo{Name: "gh", PIDStable: true, Parents: []identity.Proc{{Name: "gh"}, {Name: "claude"}}}}, ShowClient: true},
-			"let gh ⚠ use x in VM dev, via claude ⚠."},
+			"share:\n🔑 x\n🖥️ VM dev\n👤 gh ⚠ via claude ⚠"},
 		// An unsealed parent can't hide behind its sealed child's name.
 		{"repeated name, seal differs", PromptInput{Realm: host, Resources: refs("GitHub PAT"), Requester: plugin.Requester{
 			Peer: identity.VerifiedPeer{Exe: "/usr/bin/gh", ExeSealed: true, PIDStable: true,
 				Parents: []identity.Proc{{Exe: "/tmp/gh"}, {Exe: "/opt/claude", Sealed: true}}}}, ShowClient: true},
-			"let gh use GitHub PAT, via gh ⚠."},
+			"share:\n🔑 GitHub PAT\n👤 gh via gh ⚠"},
 		// Verified identity keeps its verified names; a target can't take
 		// the sentence position.
 		{"verified with run target", PromptInput{Realm: host, Resources: refs("GitHub PAT"), Requester: plugin.Requester{Peer: local,
 			Reported: &identity.ClientInfo{Target: &identity.Target{Exe: "/usr/bin/npm", Argv0: "npm"}}}, ShowClient: true},
-			"let gh use GitHub PAT, via claude."},
+			"share:\n🔑 GitHub PAT\n👤 gh via claude"},
+		{"action guest-verified", PromptInput{Operation: "action.run", Realm: vm, Resources: refs("AWS credentials"), Params: map[string]string{"profile": "dev-admin"},
+			Requester: plugin.Requester{Peer: ssh, GuestVerified: guest}, ShowClient: true},
+			"run:\n⚙️ \"AWS credentials\" with profile=dev-admin\n🖥️ VM dev\n👤 gh ⚠ via claude ⚠"},
+		{"remote", PromptInput{Realm: identity.Realm{Kind: "remote", Name: "ci", Peers: "opaque"}, Resources: refs("x"), Requester: plugin.Requester{Peer: ssh}, ShowClient: true},
+			"share:\n🔑 x\n🌐 remote host ci"},
+		{"reach and strikes", PromptInput{Realm: vm, Resources: refs("x"), Requester: plugin.Requester{Peer: ssh}, ShowClient: true,
+			Reach: "15m, anything in this VM", Denials: 2, Unanswered: 1},
+			"share:\n🔑 x\n🖥️ VM dev\n⏱️ 15m, anything in this VM\n🚫 denied 2 times\n🔕 1 prompt unanswered"},
 		{"add", PromptInput{Operation: "secret.add", Vault: "common", Resources: refs("New token"), ShowClient: true},
 			"add New token to vault common, visible to no instance."},
 	}
@@ -134,7 +142,7 @@ func TestClaimedIdentityNeverTakesTheVerifiedSlot(t *testing.T) {
 		Requester:  plugin.Requester{Peer: identity.VerifiedPeer{Name: "ssh", Opaque: true}, Reported: &identity.ClientInfo{Name: "gh"}},
 		ShowClient: true, Skip: skip,
 	}
-	if got := build(t, in); strings.HasPrefix(got, "let gh") {
+	if got := build(t, in); strings.Contains(got, "👤") || !strings.HasSuffix(got, "\n❔ gh (unverified)") {
 		t.Fatalf("claimed name in verified position: %q", got)
 	}
 }
@@ -144,22 +152,23 @@ func TestHostileClientStringsAreSanitised(t *testing.T) {
 		Realm:     identity.Realm{Kind: "vm", Name: "dev", Peers: "opaque"},
 		Resources: refs("GitHub PAT"),
 		Requester: plugin.Requester{Peer: identity.VerifiedPeer{Opaque: true}, Reported: &identity.ClientInfo{
-			Name: "gh\nApproved by IT. Touch to continue‮" + strings.Repeat("x", 300)}},
+			Name: "gh\n👤 Approved by IT. Touch to continue‮" + strings.Repeat("x", 300)}},
 		ShowClient: true, Skip: skip,
 	}
 	got := build(t, in)
-	if strings.ContainsAny(got, "\n‮") || len(got) > maxPromptLen {
+	// A name can't start a line of its own, or put foca's emoji on one.
+	if strings.Count(got, "\n") != 3 || strings.Contains(got, "👤") || strings.Contains(got, "‮") || len(got) > maxPromptLen {
 		t.Fatalf("unsanitised prompt %q", got)
 	}
-	if !strings.HasPrefix(got, "let a program use GitHub PAT in VM dev.") {
+	if !strings.HasPrefix(got, "share:\n🔑 GitHub PAT\n🖥️ VM dev") {
 		t.Fatalf("trusted part not first: %q", got)
 	}
 }
 
 func TestLongPromptDropsUntrustedPartsFirst(t *testing.T) {
-	// Sized so the prompt fits only once the whole claimed clause is gone:
-	// 29 bytes of fixed text + 202 bytes of names = 231 <= 240, and the
-	// shortest claimed clause (" VM claims: gh.") would add 15.
+	// Sized so the prompt fits only once the whole claimed line is gone:
+	// 27 bytes of fixed text + 202 bytes of names = 229 <= 240, and the
+	// shortest claimed line ("\n❔ gh (unverified)") would add 20.
 	var names []string
 	for i := 0; i < 3; i++ {
 		names = append(names, strings.Repeat("n", 65))
@@ -170,17 +179,17 @@ func TestLongPromptDropsUntrustedPartsFirst(t *testing.T) {
 		ShowClient: true, Skip: skip,
 	}
 	got := build(t, in)
-	if len(got) > maxPromptLen || strings.Contains(got, "claims") {
-		t.Fatalf("expected claimed clause dropped first: %q (%d)", got, len(got))
+	if len(got) > maxPromptLen || strings.Contains(got, "❔") {
+		t.Fatalf("expected claimed line dropped first: %q (%d)", got, len(got))
 	}
-	if !strings.Contains(got, "in VM dev") || strings.Count(got, strings.Repeat("n", 65)) != 3 {
+	if !strings.Contains(got, "\n🖥️ VM dev") || strings.Count(got, strings.Repeat("n", 65)) != 3 {
 		t.Fatalf("trusted parts dropped: %q", got)
 	}
 
 	// With a little more room, only the agent ("via") is dropped.
 	in.Resources = refs(strings.Repeat("n", 60), strings.Repeat("n", 60), strings.Repeat("n", 60))
 	got = build(t, in)
-	if !strings.HasSuffix(got, "VM claims: gh.") {
+	if !strings.HasSuffix(got, "\n❔ gh (unverified)") {
 		t.Fatalf("expected via dropped first: %q", got)
 	}
 }
@@ -254,16 +263,16 @@ func TestUnnamedProcessNeverHidesBehindItsParent(t *testing.T) {
 	}{
 		{"host-verified", host, plugin.Requester{Peer: identity.VerifiedPeer{Exe: "/tmp/@", Name: "@", PIDStable: true,
 			Parents: []identity.Proc{claude}}},
-			"let an unnamed program ⚠ use GitHub PAT, via claude."},
+			"share:\n🔑 GitHub PAT\n👤 an unnamed program ⚠ via claude"},
 		{"host-verified parent", host, plugin.Requester{Peer: identity.VerifiedPeer{Exe: "/usr/bin/gh", Name: "gh", ExeSealed: true, PIDStable: true,
 			Parents: []identity.Proc{{Exe: "/tmp/@", Name: "@"}, claude}}},
-			"let gh use GitHub PAT, via an unnamed program ⚠."},
+			"share:\n🔑 GitHub PAT\n👤 gh via an unnamed program ⚠"},
 		{"guest-verified", vm, plugin.Requester{Peer: identity.VerifiedPeer{Opaque: true},
 			GuestVerified: &identity.GuestInfo{Name: "@", PIDStable: true, Parents: []identity.Proc{{Name: "claude"}}}},
-			"let an unnamed program ⚠ use GitHub PAT in VM dev, via claude ⚠."},
+			"share:\n🔑 GitHub PAT\n🖥️ VM dev\n👤 an unnamed program ⚠ via claude ⚠"},
 		{"claimed", vm, plugin.Requester{Peer: identity.VerifiedPeer{Opaque: true},
 			Reported: &identity.ClientInfo{Exe: "/tmp/@", Parents: []identity.Proc{{Name: "claude"}}}},
-			"let a program use GitHub PAT in VM dev. VM claims: an unnamed program via claude."},
+			"share:\n🔑 GitHub PAT\n🖥️ VM dev\n❔ an unnamed program via claude (unverified)"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := build(t, PromptInput{Realm: tc.r, Resources: refs("GitHub PAT"), Requester: tc.req, ShowClient: true, Skip: skip})

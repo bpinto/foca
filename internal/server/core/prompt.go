@@ -10,8 +10,8 @@ import (
 	"github.com/bpinto/foca/internal/plugin"
 )
 
-// Prompt text is a verb phrase; the authenticator frames it (macOS shows
-// "<app> is trying to <phrase>"). Every part is either trusted host data or
+// Prompt text starts with a verb; the authenticator frames it (macOS shows
+// "<app> is trying to <text>"). Every part is either trusted host data or
 // a sanitised name placed according to how it was verified (design §4.1.1).
 
 const (
@@ -85,7 +85,6 @@ func BuildPrompt(in PromptInput) (prompt string, ok bool) {
 }
 
 func render(in PromptInput, a actor) string {
-	realm := realmPhrase(in.Realm)
 	switch in.Operation {
 	case "secret.add":
 		names := listNames(in.Resources)
@@ -113,31 +112,38 @@ func render(in PromptInput, a actor) string {
 		}
 		return fmt.Sprintf("encrypt vault %s again under a new key, sealed with %s%s.", in.Vault, in.Params["protector"], users)
 	case "action.run":
-		what := runPhrase(in)
-		switch a.trust {
-		case trustVerified:
-			return fmt.Sprintf("run %s for %s%s%s.", what, named(a.program, a.programSealed), realm, viaPhrase(named(a.via, a.viaSealed)))
-		case trustClaimed:
-			return fmt.Sprintf("run %s%s. %s claims: %s%s.", what, realm, claimant(in.Realm), a.program, plainVia(a.via))
-		default:
-			return fmt.Sprintf("run %s%s.", what, realm)
-		}
+		return "run:" + line("⚙️", runPhrase(in)) + line(realmIcon(in.Realm), realmName(in.Realm)) + actorLine(a)
 	default: // secret.read
-		creds := listNames(in.Resources)
-		switch a.trust {
-		case trustVerified:
-			return fmt.Sprintf("let %s use %s%s%s.", named(a.program, a.programSealed), creds, realm, viaPhrase(named(a.via, a.viaSealed)))
-		case trustClaimed:
-			return fmt.Sprintf("let a program use %s%s. %s claims: %s%s.",
-				creds, realm, claimant(in.Realm), a.program, plainVia(a.via))
-		default:
-			return fmt.Sprintf("let a program use %s%s.", creds, realm)
-		}
+		return "share:" + line("🔑", listNames(in.Resources)) + line(realmIcon(in.Realm), realmName(in.Realm)) + actorLine(a)
 	}
 }
 
+// line is one more line of a prompt, or nothing if text is empty. The
+// first line is a verb, after the authenticator's "foca is trying to"; each
+// line after it starts with an emoji, which only foca can write:
+// DisplayName keeps every untrusted name to ASCII.
+func line(icon, text string) string {
+	if text == "" {
+		return ""
+	}
+	return "\n" + icon + " " + text
+}
+
+// actorLine names the program and the agent behind it. Verified names take
+// 👤; a claim takes ❔ and says it is unverified, so it never reads like the
+// verified line (design §4.1.1, rule 1).
+func actorLine(a actor) string {
+	switch a.trust {
+	case trustVerified:
+		return line("👤", named(a.program, a.programSealed)+plainVia(named(a.via, a.viaSealed)))
+	case trustClaimed:
+		return line("❔", a.program+plainVia(a.via)+" (unverified)")
+	}
+	return ""
+}
+
 // resolveActor picks the identity source by trust level. Claimed data never
-// reaches the "let X use" position; that slot is only for kernel-verified
+// reaches the 👤 line; that line is only for kernel-verified
 // identity (host kernel for direct realms, guest kernel via the relay).
 func resolveActor(in PromptInput) actor {
 	if !in.ShowClient {
@@ -395,26 +401,24 @@ func realmList(rs []identity.Realm) string {
 	return strings.Join(labels[:len(labels)-1], ", ") + " and " + labels[len(labels)-1]
 }
 
-func realmPhrase(r identity.Realm) string {
+// realmName is where a request comes from, "VM dev"; a host-local request
+// has none.
+func realmName(r identity.Realm) string {
 	if n := r.Noun(); n != "" {
-		return fmt.Sprintf(" in %s %s", n, r.Name)
+		return n + " " + r.Name
 	}
 	return ""
 }
 
-func claimant(r identity.Realm) string {
-	n := r.Noun()
-	if n == "" {
-		return "Client"
+func realmIcon(r identity.Realm) string {
+	switch r.Kind {
+	case identity.RealmContainer:
+		return "🚢"
+	case identity.RealmRemote:
+		return "🌐"
+	default:
+		return "🖥️"
 	}
-	return strings.ToUpper(n[:1]) + n[1:]
-}
-
-func viaPhrase(v string) string {
-	if v == "" {
-		return ""
-	}
-	return ", via " + v
 }
 
 func plainVia(v string) string {
@@ -424,22 +428,22 @@ func plainVia(v string) string {
 	return " via " + v
 }
 
-// suffix is the trusted text after the sentence: how far approving reaches,
-// how often this was denied lately, and how many of the instance's prompts
-// went unanswered.
+// suffix is the trusted lines after the request: how far approving
+// reaches, how often this was denied lately, and how many of the
+// instance's prompts went unanswered.
 func suffix(in PromptInput) string {
-	s := ""
-	if in.Reach != "" {
-		s += " " + in.Reach
-	}
+	s := line("⏱️", in.Reach)
 	switch {
 	case in.Denials == 1:
-		s += " (denied once)"
+		s += line("🚫", "denied once")
 	case in.Denials > 1:
-		s += fmt.Sprintf(" (denied %d times)", in.Denials)
+		s += line("🚫", fmt.Sprintf("denied %d times", in.Denials))
 	}
-	if in.Unanswered > 0 {
-		s += fmt.Sprintf(" (%d unanswered)", in.Unanswered)
+	switch {
+	case in.Unanswered == 1:
+		s += line("🔕", "1 prompt unanswered")
+	case in.Unanswered > 1:
+		s += line("🔕", fmt.Sprintf("%d prompts unanswered", in.Unanswered))
 	}
 	return s
 }

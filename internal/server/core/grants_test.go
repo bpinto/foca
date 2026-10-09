@@ -172,7 +172,7 @@ func TestReuseWithinWindowThenExpiry(t *testing.T) {
 	if err := r.read(t, c, "github-pat"); err != nil {
 		t.Fatal(err)
 	}
-	if got := r.auth.Requests()[0].Prompt; !strings.HasSuffix(got, " Approving allows reuse for 15m by anything in VM dev.") {
+	if got := r.auth.Requests()[0].Prompt; !strings.HasSuffix(got, "\n⏱️ 15m, anything in this VM") {
 		t.Fatalf("prompt doesn't state the reach: %q", got)
 	}
 	// Another connection in the same peer session: reused, no prompt.
@@ -311,7 +311,7 @@ func TestBatchRunsUnderTheStricterPolicy(t *testing.T) {
 	if err := r.read(t, c, "github-pat", "npm-token"); err != nil {
 		t.Fatal(err)
 	}
-	if p := r.auth.Requests()[0].Prompt; !strings.HasSuffix(p, " Approving allows reuse for 15m on the same connection.") {
+	if p := r.auth.Requests()[0].Prompt; !strings.HasSuffix(p, "\n⏱️ 15m, this connection") {
 		t.Fatalf("prompt %q", p)
 	}
 	// Both grants are connection-scoped: another connection is prompted.
@@ -757,7 +757,7 @@ func TestDenialBackoff(t *testing.T) {
 	if err := r.read(t, c, "github-pat"); err != nil {
 		t.Fatal(err)
 	}
-	if p := r.auth.Requests()[2].Prompt; !strings.HasSuffix(p, "(denied once)") {
+	if p := r.auth.Requests()[2].Prompt; !strings.HasSuffix(p, "\n🚫 denied once") {
 		t.Fatalf("prompt %q", p)
 	}
 	// Approval resets the count.
@@ -767,7 +767,7 @@ func TestDenialBackoff(t *testing.T) {
 }
 
 // A denial counts for 10 minutes. After that the prompt no longer says
-// "(denied …)", and the backoff starts again from 2 s.
+// "🚫 denied …", and the backoff starts again from 2 s.
 func TestDenialIsForgottenAfterTenMinutes(t *testing.T) {
 	r := newRig(t, every, fake.Deny, fake.Deny, fake.Deny)
 	c := r.from("c1", "sid:10:100")
@@ -805,7 +805,7 @@ func TestDenialBackoffGrowsAndWipeResetsIt(t *testing.T) {
 		r.clk.advance(time.Second)
 	}
 	r.read(t, c, "github-pat")
-	if p := r.auth.Requests()[2].Prompt; !strings.HasSuffix(p, "(denied 2 times)") {
+	if p := r.auth.Requests()[2].Prompt; !strings.HasSuffix(p, "\n🚫 denied 2 times") {
 		t.Fatalf("prompt %q", p)
 	}
 	r.clk.advance(29 * time.Second)

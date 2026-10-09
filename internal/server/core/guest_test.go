@@ -89,7 +89,7 @@ func TestGuestSessionGrantRecordsItsKey(t *testing.T) {
 	if err := r.read(t, r.relayed("c1", "sid:780:1"), "github-pat"); err != nil {
 		t.Fatal(err)
 	}
-	if p := r.auth.Requests()[0].Prompt; !strings.Contains(p, "Approving allows reuse for 15m by anything in the same session in VM dev.") {
+	if p := r.auth.Requests()[0].Prompt; !strings.Contains(p, "15m, this session") {
 		t.Fatalf("prompt %q", p)
 	}
 	ev := r.events(audit.TypeApprovalGranted)[0]
@@ -108,7 +108,7 @@ func TestGuestSessionGrantRecordsItsKey(t *testing.T) {
 func TestGuestNamesAreMarkedAndSkippedByName(t *testing.T) {
 	r := guestRig(t, policy.Policy{Kind: policy.EveryTime}, fake.Approve)
 	r.read(t, r.relayed("c1", "sid:780:1"), "github-pat")
-	if p := r.auth.Requests()[0].Prompt; p != "let gh "+UnsealedMark+" use GitHub PAT in VM dev, via claude "+UnsealedMark+"." {
+	if p := r.auth.Requests()[0].Prompt; p != "share:\n🔑 GitHub PAT\n🖥️ VM dev\n👤 gh "+UnsealedMark+" via claude "+UnsealedMark {
 		t.Fatalf("prompt %q", p)
 	}
 }
@@ -144,9 +144,9 @@ func TestGuestChainEndsAtTheTerminal(t *testing.T) {
 		g    identity.GuestInfo
 		want string
 	}{
-		{guestFrom(3, "foca", "bash", "claude", "zsh", "tmux: server", "systemd"), "let claude ⚠ use GitHub PAT in VM dev."},
-		{guestFrom(1, "foca", "zsh", "tmux: server", "systemd"), "let zsh ⚠ use GitHub PAT in VM dev."},
-		{guestFrom(0, "foca", "systemd"), "let foca ⚠ use GitHub PAT in VM dev."},
+		{guestFrom(3, "foca", "bash", "claude", "zsh", "tmux: server", "systemd"), "share:\n🔑 GitHub PAT\n🖥️ VM dev\n👤 claude ⚠"},
+		{guestFrom(1, "foca", "zsh", "tmux: server", "systemd"), "share:\n🔑 GitHub PAT\n🖥️ VM dev\n👤 zsh ⚠"},
+		{guestFrom(0, "foca", "systemd"), "share:\n🔑 GitHub PAT\n🖥️ VM dev\n👤 foca ⚠"},
 	}
 	for _, tc := range cases {
 		if got := guestPrompt(t, tc.g); got != tc.want {
@@ -157,7 +157,7 @@ func TestGuestChainEndsAtTheTerminal(t *testing.T) {
 	// no shell named in place of a program.
 	g := guestFrom(1, "foca", "zsh", "tmux: server", "systemd")
 	g.Session = "sid:11:2"
-	if got := guestPrompt(t, g); got != "let tmuxserver ⚠ use GitHub PAT in VM dev, via systemd ⚠." {
+	if got := guestPrompt(t, g); got != "share:\n🔑 GitHub PAT\n🖥️ VM dev\n👤 tmuxserver ⚠ via systemd ⚠" {
 		t.Errorf("leader with another start time: %q", got)
 	}
 }
@@ -179,7 +179,7 @@ func TestCommNamesMarkWhatTheKernelCut(t *testing.T) {
 		}
 	}
 	g := guestFrom(2, "foca", "git-credential-", "zsh")
-	if got := guestPrompt(t, g); got != "let git-credential-… ⚠ use GitHub PAT in VM dev." {
+	if got := guestPrompt(t, g); got != "share:\n🔑 GitHub PAT\n🖥️ VM dev\n👤 git-credential-… ⚠" {
 		t.Errorf("prompt %q", got)
 	}
 }

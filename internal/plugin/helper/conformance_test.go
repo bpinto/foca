@@ -234,12 +234,12 @@ func TestConformanceInteractiveApprove(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 	t.Log("touch the sensor to APPROVE")
-	r, err := a.Approve(ctx, plugin.ApprovalRequest{Prompt: "let conformance use a test (touch to approve).", Timeout: time.Minute})
+	r, err := a.Approve(ctx, plugin.ApprovalRequest{Prompt: "share:\n🔑 a test (touch to approve)\n🖥️ VM conformance\n👤 gh ⚠ via claude ⚠\n⏱️ 15m, anything in this VM", Timeout: time.Minute})
 	if err != nil || !r.Approved || r.Method != "biometry" {
 		t.Fatalf("got %+v %v", r, err)
 	}
 	t.Log("press CANCEL")
-	r, err = a.Approve(ctx, plugin.ApprovalRequest{Prompt: "let conformance use a test (press Cancel).", Timeout: time.Minute})
+	r, err = a.Approve(ctx, plugin.ApprovalRequest{Prompt: "run:\n⚙️ \"a test\" with step=press-cancel\n🚢 container conformance\n❔ gh via claude (unverified)", Timeout: time.Minute})
 	if err != nil || r.Approved {
 		t.Fatalf("cancel: got %+v %v, want a denial", r, err)
 	}

@@ -533,7 +533,7 @@ func TestBinaryGuestRelay(t *testing.T) {
 		t.Fatalf("no guest-verified read in:\n%s", log)
 	}
 	// The foca CLI is skipped by name; the program it names is marked.
-	if !hasLine(log, `"type":"approval.granted"`, "⚠ use dev:github-pat in VM dev") || strings.Contains(log, "VM claims") {
+	if !hasLine(log, `"type":"approval.granted"`, `🔑 dev:github-pat\n🖥️ VM dev\n👤 `) || strings.Contains(log, "❔") {
 		t.Fatalf("prompt not guest-verified:\n%s", log)
 	}
 

@@ -187,14 +187,41 @@ func FormatWindow(d time.Duration) string {
 	return s
 }
 
-// Reach says in plain words who an approval under p also covers, or "" if
-// approving creates no grant. The prompt (design §4.1.1) and
-// `foca policy explain` both use it, so they always agree.
+// Reach says how long and for whom an approval under p is reused, or "" if
+// approving creates no grant: "15m, anything in this VM". It is the
+// prompt's ⏱️ line (design §4.1.1), which comes after the line naming the
+// realm, so it says "this VM" rather than naming the realm again.
 func Reach(p Policy, realm identity.Realm) string {
 	if p.Kind != Reuse {
 		return ""
 	}
-	return fmt.Sprintf("Approving allows reuse for %s %s.", FormatWindow(p.Window), who(p.Scope, realm))
+	return FormatWindow(p.Window) + ", " + whoHere(p.Scope, realm)
+}
+
+// whoHere is who, for a prompt that has already named the realm.
+func whoHere(s Scope, realm identity.Realm) string {
+	anything := "anything on this host"
+	switch n := realm.Noun(); n {
+	case "":
+	case "remote host":
+		anything = "anything on this remote host"
+	default:
+		anything = "anything in this " + n
+	}
+	switch s {
+	case ScopeConnection:
+		return "this connection"
+	case ScopeGuestSession:
+		return "this session"
+	case ScopePeerSession:
+		if realm.Peers == identity.PeersOpaque {
+			// The host sees only the proxy, so the session is the whole realm.
+			return anything
+		}
+		return "this session"
+	default:
+		return anything
+	}
 }
 
 // Describe is the whole policy in plain words, for `foca policy explain`.

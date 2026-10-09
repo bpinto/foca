@@ -248,7 +248,7 @@ func TestReportedFieldsCantOverwriteGuestVerified(t *testing.T) {
 	if err := readAs(t, c, guestGh, claim); err != nil {
 		t.Fatal(err)
 	}
-	if p := e.auth.Requests()[0].Prompt; p != "let gh ⚠ use GitHub PAT in VM dev." {
+	if p := e.auth.Requests()[0].Prompt; p != "share:\n🔑 GitHub PAT\n🖥️ VM dev\n👤 gh ⚠" {
 		t.Fatalf("prompt %q", p)
 	}
 	var read *audit.Event

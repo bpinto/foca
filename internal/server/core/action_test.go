@@ -78,7 +78,7 @@ func TestRunActionIsApprovedRunAndAudited(t *testing.T) {
 	if g.Resources[0] != (audit.Resource{Kind: "action", ID: "aws"}) || g.Params["profile"] != "dev-admin" {
 		t.Fatalf("approval %+v", g)
 	}
-	want := `run "AWS credentials" with profile=dev-admin in VM dev. VM claims: aws via claude.`
+	want := "run:\n⚙️ \"AWS credentials\" with profile=dev-admin\n🖥️ VM dev\n❔ aws via claude (unverified)"
 	if g.Approval.PromptText != want {
 		t.Fatalf("prompt\n got %q\nwant %q", g.Approval.PromptText, want)
 	}
@@ -103,7 +103,7 @@ func TestActionUsingASecretNamesItAndMasksIt(t *testing.T) {
 	}
 	evs := h.sink.Events()
 	g, r := evs[0], evs[1]
-	if !strings.Contains(g.Approval.PromptText, `run "List PRs" (uses GitHub PAT) in VM dev.`) {
+	if !strings.Contains(g.Approval.PromptText, "⚙️ \"List PRs\" (uses GitHub PAT)\n🖥️ VM dev\n") {
 		t.Fatalf("prompt %q", g.Approval.PromptText)
 	}
 	for _, e := range []audit.Event{g, r} {
@@ -230,7 +230,7 @@ func TestActionGrantCoversOnlyItsParams(t *testing.T) {
 	if len(reused) != 1 || reused[0].Params["profile"] != "dev-admin" || reused[0].Resource.ID != "aws" {
 		t.Fatalf("reused %+v", reused)
 	}
-	if !strings.Contains(r.auth.Requests()[0].Prompt, "Approving allows reuse for 15m by anything in VM dev.") {
+	if !strings.Contains(r.auth.Requests()[0].Prompt, "15m, anything in this VM") {
 		t.Fatalf("prompt %q", r.auth.Requests()[0].Prompt)
 	}
 	// Other values ask again.
