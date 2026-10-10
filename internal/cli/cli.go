@@ -24,6 +24,7 @@ import (
 	"github.com/charmbracelet/huh"
 	"golang.org/x/term"
 
+	"github.com/bpinto/foca/internal/client"
 	"github.com/bpinto/foca/internal/config"
 )
 
@@ -90,6 +91,10 @@ type Globals struct {
 	Instance   string `short:"i" help:"Instance whose socket to use on the host (env FOCA_INSTANCE). With events, the instance to show."`
 
 	version string
+	// dialed is the socket the command connected to, and dialedOwn whether
+	// it came from the runtime directory, for explaining a refusal.
+	dialed    string
+	dialedOwn bool
 }
 
 type CLI struct {
@@ -171,6 +176,9 @@ func Main(args []string, e *Env, version string) (code int) {
 	if err := kctx.Run(&cli.Globals, e); err != nil {
 		if code, ok := asExit(err); ok {
 			return code
+		}
+		if errors.Is(err, client.ErrHungUp) {
+			err = cli.Globals.hungUp(e)
 		}
 		// Errors can carry the service's own message.
 		fmt.Fprintln(e.Stderr, "foca:", cleanLines(err.Error()))

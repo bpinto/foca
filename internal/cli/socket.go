@@ -89,6 +89,7 @@ func (g *Globals) dial(e *Env) (*client.Client, error) {
 	if derived {
 		dial = client.DialOwn
 	}
+	g.dialed, g.dialedOwn = path, derived
 	c, err := dial(background(), path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) || strings.Contains(err.Error(), "connection refused") {
@@ -97,6 +98,27 @@ func (g *Globals) dial(e *Env) (*client.Client, error) {
 		return nil, err
 	}
 	return c, nil
+}
+
+// hungUp explains a connection the service closed without answering: it
+// refused this caller, and says why only in its audit log. An instance whose
+// realm is opaque answers only the realm's proxy, so on the host a command
+// with --instance always gets this from a VM's socket.
+func (g *Globals) hungUp(e *Env) error {
+	msg := fmt.Sprintf("%s: the service closed the connection without answering: it refused this caller", g.dialed)
+	if g.dialedOwn {
+		if cfg, _, err := g.load(e); err == nil {
+			name := g.instanceName(e)
+			if name == "" && len(cfg.Instances) == 1 {
+				name = cfg.Instances[0].Name
+			}
+			if inst, ok := cfg.Instance(name); ok && inst.Realm.Peers == identity.PeersOpaque {
+				return fmt.Errorf("%s. Instance %s serves its %s through a proxy (opaque_peers), not host commands: run foca inside the %s",
+					msg, name, inst.Realm.Noun(), inst.Realm.Noun())
+			}
+		}
+	}
+	return fmt.Errorf("%s. On the host, `foca events query --type request.rejected` shows why", msg)
 }
 
 // reported is what the CLI says about itself. The service never trusts it;

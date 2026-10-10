@@ -52,9 +52,13 @@ func setup(t *testing.T) *proc {
 	}
 	cfg := filepath.Join(base, "config.toml")
 	os.WriteFile(cfg, []byte(config), 0o600)
+	// A HOME of its own: a real ~/.foca.sock (in a realm) comes before the
+	// config's only instance, and would take the tests' requests.
+	home := filepath.Join(base, "home")
+	os.Mkdir(home, 0o700)
 	return &proc{t: t, bin: bin, base: base, env: append(os.Environ(),
 		"FOCA_CONFIG="+cfg, "FOCA_DATA_DIR="+filepath.Join(base, "d"), "FOCA_RUNTIME_DIR="+filepath.Join(base, "r"),
-		"FOCA_SOCK=", "FOCA_INSTANCE=")}
+		"FOCA_SOCK=", "FOCA_INSTANCE=", "HOME="+home)}
 }
 
 func (p *proc) cmd(stdin string, args ...string) *exec.Cmd {

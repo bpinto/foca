@@ -6,11 +6,14 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"strconv"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/bpinto/foca/internal/protocol"
@@ -57,6 +60,11 @@ func DialOwn(ctx context.Context, path string) (*Client, error) {
 
 func (c *Client) Close() error { return c.conn.Close() }
 
+// ErrHungUp is a connection closed before its answer. The service closes a
+// connection it refuses without saying why (design §6.2); the reason is in
+// its audit log.
+var ErrHungUp = errors.New("the service closed the connection without answering")
+
 // Call sends one request and waits for its response. A JSON-RPC error is
 // returned as *protocol.Error.
 func (c *Client) Call(ctx context.Context, method string, params, result any) error {
@@ -83,12 +91,19 @@ func (c *Client) Call(ctx context.Context, method string, params, result any) er
 	defer stop()
 
 	if err := protocol.WriteMessage(c.conn, protocol.Request{JSONRPC: "2.0", ID: id, Method: method, Params: raw}); err != nil {
+		// A refused connection may be closed before the request is sent.
+		if errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET) {
+			return ErrHungUp
+		}
 		return err
 	}
 	line, err := protocol.ReadMessage(c.r)
 	if err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+		if errors.Is(err, io.EOF) || errors.Is(err, syscall.ECONNRESET) {
+			return ErrHungUp
 		}
 		return err
 	}

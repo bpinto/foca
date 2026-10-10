@@ -405,3 +405,27 @@ func TestKeyHoldingCommandsArePrivate(t *testing.T) {
 		}
 	}
 }
+
+// A VM's socket answers only its proxy, so the host CLI is refused without an
+// answer. The CLI names the socket and says why, rather than a bare EOF.
+func TestHostCommandOnAVMSocketIsExplained(t *testing.T) {
+	w := newWorldWith(t, func(string) string {
+		return strings.Replace(e2eConfig, `[instances.work]
+realm = { kind = "host" }`, `[instances.work]
+realm = { kind = "vm", peers = "opaque" }`, 1)
+	})
+	defer w.serve()()
+	_, errs, code := w.run("", "list", "-i", "work")
+	if code != 1 || !strings.Contains(errs, w.paths.ClientSocket("work")) ||
+		!strings.Contains(errs, "closed the connection without answering") ||
+		!strings.Contains(errs, "run foca inside the VM") || strings.Contains(errs, "EOF") {
+		t.Fatalf("%d %q", code, errs)
+	}
+	var rejected bool
+	for _, e := range w.events() {
+		rejected = rejected || e.Type == audit.TypeRequestRejected && e.Reason == "direct_peer_on_opaque_realm"
+	}
+	if !rejected {
+		t.Fatal("the refused connection wasn't audited")
+	}
+}
