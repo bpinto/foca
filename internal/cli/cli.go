@@ -94,6 +94,7 @@ type Globals struct {
 
 type CLI struct {
 	Globals
+	ShowVersion kong.VersionFlag `name:"version" help:"Print the version."`
 
 	Serve        ServeCmd        `cmd:"" help:"Run the service for every instance in the config."`
 	Init         InitCmd         `cmd:"" help:"Create an encrypted vault (host)."`
@@ -117,6 +118,7 @@ type CLI struct {
 	PolkitPolicy PolkitPolicyCmd `cmd:"" name:"polkit-policy" help:"Print the polkit action the polkit authenticator needs (host, Linux)."`
 	Relay        RelayCmd        `cmd:"" help:"The guest relay, run inside a realm: verified identity for its callers."`
 	Version      VersionCmd      `cmd:"" help:"Print the version."`
+	Help         HelpCmd         `cmd:"" help:"Show help for foca or a command."`
 }
 
 type exitCode int
@@ -124,6 +126,7 @@ type exitCode int
 // Parser builds the command-line parser. Tests use it to inspect the model.
 func Parser(cli *CLI, e *Env) (*kong.Kong, error) {
 	return kong.New(cli,
+		kong.Vars{"version": "foca " + cli.version},
 		kong.Name("foca"),
 		kong.Description("Approval-gated credentials for processes, VMs and containers."),
 		kong.Writers(e.Stdout, e.Stderr),
@@ -149,6 +152,9 @@ func Main(args []string, e *Env, version string) (code int) {
 	if err != nil {
 		fmt.Fprintln(e.Stderr, "foca:", err)
 		return 2
+	}
+	if len(args) == 0 {
+		args = []string{"--help"}
 	}
 	kctx, err := k.Parse(args)
 	if err != nil {
@@ -195,6 +201,24 @@ type VersionCmd struct{}
 func (VersionCmd) Run(g *Globals, e *Env) error {
 	fmt.Fprintln(e.Stdout, "foca", g.version)
 	return nil
+}
+
+// HelpCmd prints a command's help, as its --help would.
+type HelpCmd struct {
+	Command []string `arg:"" optional:"" help:"Command to show help for."`
+}
+
+func (h HelpCmd) Run(kctx *kong.Context) error {
+	ctx, err := kong.Trace(kctx.Kong, h.Command)
+	if err != nil {
+		return err
+	}
+	if ctx.Error != nil {
+		// A usage error, like the one the command itself would give.
+		kctx.Errorf("%s", ctx.Error)
+		return exitStatus(2)
+	}
+	return ctx.PrintUsage(false)
 }
 
 // errAborted is returned when the user leaves an interactive form.

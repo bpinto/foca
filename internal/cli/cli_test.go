@@ -355,8 +355,31 @@ func TestVersion(t *testing.T) {
 		t.Fatalf("%q", out.String())
 	}
 	env, out, _ = testEnv(t, nil)
-	if code := Main([]string{"--help"}, env, "x"); code != 0 || !strings.Contains(out.String(), "Usage: foca") {
-		t.Fatalf("help: %d %q", code, out.String())
+	if Main([]string{"--version"}, env, "1.2.3") != 0 || out.String() != "foca 1.2.3\n" {
+		t.Fatalf("--version: %q", out.String())
+	}
+}
+
+// foca, foca --help and foca help all print the top-level help; help with a
+// command prints that command's, as its --help does.
+func TestHelp(t *testing.T) {
+	for _, args := range [][]string{nil, {"--help"}, {"-h"}, {"help"}} {
+		env, out, _ := testEnv(t, nil)
+		if code := Main(args, env, "x"); code != 0 || !strings.Contains(out.String(), "Usage: foca <command>") {
+			t.Errorf("%q: %d %q", args, code, out.String())
+		}
+	}
+	for _, cmd := range [][]string{{"get"}, {"events", "follow"}} {
+		env, viaFlag, _ := testEnv(t, nil)
+		Main(append(append([]string{}, cmd...), "--help"), env, "x")
+		env, viaCmd, _ := testEnv(t, nil)
+		if code := Main(append([]string{"help"}, cmd...), env, "x"); code != 0 || viaCmd.String() != viaFlag.String() {
+			t.Errorf("help %q: %d %q, want %q", cmd, code, viaCmd.String(), viaFlag.String())
+		}
+	}
+	env, out, errb := testEnv(t, nil)
+	if code := Main([]string{"help", "nope"}, env, "x"); code != 2 || out.Len() != 0 || !strings.Contains(errb.String(), "nope") {
+		t.Errorf("help nope: %d %q %q", code, out.String(), errb.String())
 	}
 }
 
