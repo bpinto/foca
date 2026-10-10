@@ -32,7 +32,8 @@ Goals
 5. **Every access recorded** as versioned structured events, ready for a later UI
    (`foca events query` / `follow`, §8.5).
 
-Non-goals for now: the UI itself, syncing between machines, sharing between users, Windows.
+Non-goals for now: approving in a UI (the macOS menu-bar app only shows, §8.7), syncing
+between machines, sharing between users, Windows.
 
 ---
 
@@ -889,6 +890,7 @@ the host, working directly on host files:
 | `stop` | sends `SIGTERM`, or uses launchctl / systemctl | no |
 | `config check` | parses a config file as `serve` would, without trusting or using it (Nix checks generated configs with it) | no |
 | `events` | reads the audit log (§8.5) | no |
+| `grants --host` | reads each service's grants snapshot, trusting it only while a verified service holds the instance's pid file (§8.6) | no |
 
 - **The service is read-only on vaults.** It re-reads a vault when the file's identity, size
   or mtime changes, so the CLI's edits apply to the next request. A bug in the service can't
@@ -1322,6 +1324,80 @@ A later menu-bar app or TUI runs these commands, or links the `audit` package an
 file directly. `--from-seq` lets a viewer backfill and then go live without gaps. The sink
 interface keeps `Query` and `Follow` (§4.7) so a later SQLite sink fits behind the same
 commands.
+
+### 8.6 Grants on the host
+
+Grants live only in the memory of the `serve` process (§9.5), and the host CLI reaches that
+process only through signals (§6.2). `grants.status` shows a caller its own grants; to show
+the host every live grant, each service writes a snapshot.
+
+- **The file.** `<runtime>/<instance>/grants.json`, 0600 in the 0700 instance dir, next to
+  `serve.pid`. It is replaced atomically whenever that instance's grants change (one is made,
+  dropped, wiped or expires) and when reuse turns on or off with platform-event health
+  (D13). A service writes it, empty, when it starts serving an instance, and removes it when
+  it stops. Like the pid file it only has to outlive the process, so it isn't `fsync`ed.
+- **What it holds.**
+  `{"v": 1, "instance", "written_at", "reuse", "grants": [{kind, name, params?, scope,
+  scope_key, approval_id, granted_at, expires_at}]}`: names and the fields of an event's
+  `approval` block (§8.1), never values. `reuse` is false while no grant can be made or
+  reused. `approval_id` finds the `approval.granted` event, which names who was approved.
+- **`foca grants --host`** reads the snapshot of every instance in the runtime directory, or
+  of `--instance`. It trusts a file only while a verified service holds that instance's pid
+  file (§6.2): a file a crash left behind names grants that no longer exist, so the instance
+  is reported as not running. Grants past `expires_at` that the service hasn't swept yet are
+  left out. `-f json` prints one object per instance, for programs such as the menu-bar app
+  (§8.7). It needs no approval and isn't audited (like `grants.status`, it changes nothing and
+  reads no secret), and it never talks to a socket.
+- **A view, not an authority.** The service never reads the file back, and nothing decides on
+  it. A failed write is logged and the old file removed, so a viewer says it can't tell rather
+  than show grants that are gone. Requests aren't refused over it: the audit log, not the
+  snapshot, is the record (D10).
+
+### 8.7 The menu-bar app (macOS)
+
+`Foca.app` is a menu-bar app, with no Dock icon. It shows what foca is doing, and it tells
+the user when a grant is reused, since a reuse shows no Touch ID prompt. It is a viewer: it
+holds no keys, reads no secrets, and does nothing a host CLI user couldn't. It runs host
+commands as child processes and reads their JSON:
+
+| It shows | From |
+|---|---|
+| live grants per instance, with time left, and whether reuse is on | `foca grants --host -f json`, after each event and every 15 s |
+| recent activity | `foca events query --since 24h`, then `foca events follow` |
+| a notification for each reuse | `approval.reused` events from the same `follow` |
+| a "Lock now" item | `foca lock` (§6.2) |
+
+- **It runs the CLI and never parses the files.** Rotation, the no-gap rule and escaping
+  (§8.5), and the pid-file check (§8.6), come from `foca`. `audit.jsonl` and `grants.json`
+  keep one reader each.
+- **Finding foca.** `FOCA_BIN` in the app's environment (the home-manager agent sets it),
+  else the `foca` next to `Foca.app` (the release archive), else `bin/foca` next to the
+  `Applications` directory that holds it (the Nix package). The menu names the binary it
+  runs. foca's paths are its defaults (§7), as for the home-manager `serve` agent; a service
+  started with other paths needs the same `FOCA_*` variables in the app's environment.
+- **A notification comes after the fact.** `approval.reused` is recorded before the value is
+  served (D10), so the notification arrives as the value is used, or after. It is for
+  awareness and protects nothing: the controls are the grant window and the wipes (§9.5), and
+  nothing may depend on the user seeing it.
+- **Trusted text only.** A notification names the resource (an action with its params), the
+  instance, and the verified peer (`peer.verified.name`, its realm), as the prompt does
+  (§4.1.1). `client.reported` is never shown in one: a notification can't carry the
+  `(unverified)` marking the prompt gives it. Names are decoded from JSON, where foca escaped
+  non-printing runes (§8.5), so the app drops those runes again and shortens long names.
+- **Bursts.** Reuses are grouped by `approval.id`. The first notifies at once; later ones in
+  the next 60 s replace it with a count ("`aws-creds` reused 14× by ssh (vm dev) in the last
+  minute") rather than adding more.
+- **Restarts and gaps.** The app keeps the last seq it has shown. On start it follows from
+  the next one, and folds the reuses it missed into one summary ("6 reuses while Foca wasn't
+  running"). When `follow` stops with an error (rotation removed files it hadn't read, §8.5),
+  when foca can't be found, or when notifications are turned off for Foca, the menu-bar icon
+  shows a warning and the menu says why. After an error it follows again from the newest
+  event.
+- **Building and signing.** A SwiftPM package in `apps/macos`. `scripts/build-darwin.sh`
+  assembles it into `Foca.app` (bundle id `io.github.bpinto.foca`, `LSUIElement`) and signs it
+  with the helper's identity and the hardened runtime. Local notifications need only a bundle
+  id, so an ad-hoc signature is enough. `foca-darwin` stays a separate binary; once it
+  becomes the bundle's executable (§5), the pin covers that file.
 
 ---
 
@@ -1930,6 +2006,7 @@ Format: context → decision → consequences. Short on purpose.
 | D18 | No ported third-party code | Clean implementation, no notices to carry | Everything is written and tested here |
 | D20 | Instances, vaults and actions are separate objects; separate-per-realm by default, sharing explicit | Users choose anything from strict separation to "everything everywhere" without weakening the default | Exposure rules and their config errors must be tested |
 | D21 | CLI: `kong` for commands, `charmbracelet/huh` for interactive prompts; secret values read with `golang.org/x/term` | The owner prefers a polished interactive UX. Secret values stay in zeroable `[]byte`, which a `huh` field (a Go string) can't give | Larger dependency tree, also present in the VM copy of the binary; prompts only on a TTY, so agents and scripts never see one |
+| D22 | The menu-bar app runs host commands; `serve` writes a grants snapshot for the host to read | No admin socket (D4), one reader per file format, and a viewer that can't do more than the host CLI | The host's grants view is as fresh as the last snapshot, and is trusted only while the service holds its pid file (§8.6) |
 
 ### D18: No third-party code is ported
 
@@ -1969,7 +2046,9 @@ internal/svcctl/          serve.pid, the instance lock, and verified signalling 
 internal/ids/             sortable ids
 internal/format/          output formatters: raw, json, env
 helpers/darwin/           Swift package: foca-darwin
-scripts/                  build-darwin.sh (signed helper, pinned into foca), build-linux.sh
+apps/macos/               Swift package: Foca.app, the menu-bar app (§8.7)
+scripts/                  build-darwin.sh (signed helper, pinned into foca, and Foca.app), build-linux.sh,
+                          package.sh (release archives), release-version.sh (tip and pr-<N> versions)
 .github/workflows/        test (every push and pull request), release (tip from main, v* tags, labelled
                           pull requests' pr-<N>, then the macOS Nix pin on main), pr-release-cleanup
 nix/                      the Linux package, the macOS package (the release archive, installed unchanged),
@@ -2059,6 +2138,7 @@ noted; packages are named as in `go test` output (`main` is `cmd/foca`, whose te
 | paging and filters | `audit.TestQueryPagesAcrossRotatedFiles`, `cli.TestEventsQueryPages`, `cli.TestEventsQueryFilters`, `cli.TestEventsFilterFlagsAreChecked` |
 | backfill + live with no gaps, across writers and rotations | `audit.TestFollowBackfillsThenStreamsWithoutGap`, `audit.TestLogFollowSeesEveryWriterAcrossRotations`, `audit.TestLogFollowRefusesAGapLeftByRemovedFiles`, `audit.TestJSONLSeqUniqueAcrossProcesses` |
 | recorded names can't act on the terminal | `cli.TestEventsPrintNonPrintingRunesEscaped` |
+| the host's grants view follows every change; a file without a live service isn't trusted | `core.TestGrantsChangeIsSignalledOnEveryChange`, `server.TestGrantsSnapshotFollowsEveryChange`, `cli.TestHostGrantsTrustsOnlyALiveService` |
 
 The real-polkitd tests need `FOCA_POLKITD` and bubblewrap, and the TPM tests `FOCA_SWTPM`;
 without them they skip (the dev shell and CI set both). The Nix modules are checked by
@@ -2079,9 +2159,14 @@ without them they skip (the dev shell and CI set both). The Nix modules are chec
 - User presence for the vault key on Linux: the TPM binds it to the machine and its boot
   state, not to a touch (a FIDO2 key's `hmac-secret` would add that, §12.4). The first seal
   takes the TPM's storage key on trust; an endorsement-key certificate chain would anchor it.
+- In the menu-bar app (§8.7): approving, dropping another realm's grant (no host operation
+  can, and one needs a design of its own), and settings for foca's paths.
 
 **Not verified on real hardware or desktops**
 
+- `Foca.app` has not run on a Mac yet; CI only builds and signs it. Still to see: its
+  notifications under an ad-hoc signature, whether macOS keeps their permission across
+  rebuilds, and the menu under the home-manager agent.
 - On a Mac: the interactive helper tests (a real Touch ID approve and deny, a screen lock;
   `FOCA_HELPER_INTERACTIVE=1`), whether the dialog says "foca" (§4.1.1), and NSWorkspace
   session notifications under a launchd agent. CI's macOS runner has no Touch ID, so its
