@@ -42,6 +42,7 @@ jobs:
       kind: ${{ steps.plan.outputs.kind }}
       version: ${{ steps.plan.outputs.version }}
       tag: ${{ steps.plan.outputs.tag }}
+      previous: ${{ steps.plan.outputs.previous }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -69,7 +70,11 @@ jobs:
             { echo kind=tip; echo tag=tip; echo "version=$base-tip.$date+${SHA:0:7}"; } >> "$GITHUB_OUTPUT"
           elif [ "$(git rev-parse -q --verify "refs/tags/$REF^{commit}" || true)" = "$SHA" ] &&
                echo "$REF" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
-            { echo kind=release; echo "tag=$REF"; echo "version=${REF#v}"; } >> "$GITHUB_OUTPUT"
+            # The release notes start from the newest stable tag before this
+            # one. Left to itself, GitHub starts from the newest release,
+            # which is usually tip.
+            previous=$(git tag --merged "$SHA" --list 'v*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | grep -vx "$REF" | head -n 1 || true)
+            { echo kind=release; echo "tag=$REF"; echo "version=${REF#v}"; echo "previous=$previous"; } >> "$GITHUB_OUTPUT"
           else
             echo "kind=skip" >> "$GITHUB_OUTPUT"
             echo "$REF is neither main nor a version tag: nothing to publish"
@@ -203,7 +208,15 @@ jobs:
           fi
       - name: release
         if: env.KIND == 'release'
-        run: gh release create "$TAG" dist/* --verify-tag --title "$TAG" --generate-notes
+        env:
+          PREVIOUS: ${{ needs.plan.outputs.previous }}
+        run: |
+          set -eu
+          if [ -n "$PREVIOUS" ]; then
+            gh release create "$TAG" dist/* --verify-tag --title "$TAG" --generate-notes --notes-start-tag "$PREVIOUS"
+          else
+            gh release create "$TAG" dist/* --verify-tag --title "$TAG" --notes "The first release."
+          fi
 
   # After a stable release, pins its macOS archive in nix/darwin-release.nix
   # on main, so the flake's macOS package installs it. tip is never pinned:
