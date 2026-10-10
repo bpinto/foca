@@ -34,9 +34,11 @@ let
       package = darwinPkgs.writeShellScriptBin "foca" "";
       settings = settings // { plugins = { authenticator = "touchid"; key_protector = "keychain"; }; };
       processes = { foca-vms = [ "dev" "work" ]; };
+      menuBar.enable = true;
     };
   };
   macAgent = mac.launchd.agents.foca-vms;
+  menuBarAgent = mac.launchd.agents.foca-menu-bar;
 
   settings = {
     plugins = { authenticator = "polkit"; key_protector = "tpm"; };
@@ -100,4 +102,15 @@ in
     assert macAgent.config.Umask == 63;
     assert !(mac.systemd.user.services ? foca-vms) && !(alice.launchd.agents ? foca-vms);
     pkgs.runCommand "foca-check-home-manager-darwin" { } "touch $out";
+
+  # The menu-bar app, opted into: an agent in the GUI session that runs the
+  # package's Foca.app with the package's foca. Off unless asked for.
+  home-manager-darwin-menu-bar =
+    let pkg = mac.services.foca.package; in
+    assert menuBarAgent.enable && menuBarAgent.domain == "gui";
+    assert menuBarAgent.config.ProgramArguments == [ "${pkg}/Applications/Foca.app/Contents/MacOS/Foca" ];
+    assert menuBarAgent.config.EnvironmentVariables.FOCA_BIN == lib.getExe pkg;
+    assert menuBarAgent.config.KeepAlive.SuccessfulExit == false;
+    assert !(alice.launchd.agents ? foca-menu-bar);
+    pkgs.runCommand "foca-check-home-manager-darwin-menu-bar" { } "touch $out";
 }

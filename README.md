@@ -78,9 +78,10 @@ curl -fsSL https://github.com/bpinto/foca/releases/latest/download/foca-darwin-a
   | tar -xz -C ~/.local/bin
 ```
 
-On macOS the archive holds `foca` and `foca-darwin`, the small signed helper for Touch ID,
-the Keychain and sleep events. Keep the two in the same directory: `foca` only runs the
-helper it was released with.
+On macOS the archive holds `foca`, `foca-darwin`, the small signed helper for Touch ID, the
+Keychain and sleep events, and `Foca.app`, the menu-bar app. Keep them in the same
+directory: `foca` only runs the helper it was released with, and `Foca.app` runs the `foca`
+next to it.
 
 Every release includes `SHA256SUMS` for checking the archives.
 
@@ -112,7 +113,7 @@ services.foca = {
 In a VM, install the package (`foca.packages.${system}.foca`) like any other.
 On macOS (Apple silicon) the package is the release archive, installed as it is: its helper
 is signed and pinned into `foca`, so Nix must not strip or sign it again. Use `touchid` and
-`keychain` there.
+`keychain` there. `services.foca.menuBar.enable = true` also runs the menu-bar app.
 
 </details>
 
@@ -218,6 +219,16 @@ max_file_size_mib = 16            # 1-1024
 keep_files        = 16            # rotated files kept, 1-1000
 ```
 
+## Menu-bar app (macOS)
+
+`Foca.app` shows each running service's live grants, how long they have left and how often
+they were used, the last day's activity with repeats folded together, and a
+**notification whenever a grant is reused**: a reuse shows no Touch ID prompt, so this is how
+you see it. `notify = false` in a reuse policy silences a grant from the config; the bell on
+a grant flips that until it ends, muting it or turning a quiet one on. The ✕ on a grant revokes it
+(`foca grants --host --drop`), and "Revoke all grants" drops every one (`foca lock`). It is a
+viewer: it runs `foca grants --host`, `foca events` and `foca lock`, and holds no keys.
+
 ## Actions
 
 Actions are host commands declared in full in config. A realm can only run the actions
@@ -264,14 +275,14 @@ window   = "30m"
 
 [secrets."common:prod-db".policy]
 approval = "every-time"      # always asks, whatever the other levels say
-```
-
-Run `foca policy explain` to check what a config means before approving anything.
 
 [actions.aws-creds.policy]
 approval = "reuse"
 window   = "15m"
 notify   = false             # no notification for each reuse; notify = true anywhere wins
+```
+
+Run `foca policy explain` to check what a config means before approving anything.
 
 </details>
 

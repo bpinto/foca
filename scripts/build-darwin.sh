@@ -1,7 +1,7 @@
 #!/bin/sh
-# Builds foca and foca-darwin for macOS, with the helper's sha256 pinned
-# into foca. foca runs no helper without the pin (design §5), so this is how
-# a Mac build is made.
+# Builds foca, foca-darwin and Foca.app for macOS, with the helper's sha256
+# pinned into foca. foca runs no helper without the pin (design §5), so this
+# is how a Mac build is made.
 #
 #   scripts/build-darwin.sh [out-dir]          (default: bin)
 #
@@ -44,4 +44,25 @@ if go version -m "$out/foca" | grep -q 'foca_testing'; then
 	exit 1
 fi
 
-echo "built $out/foca and $out/foca-darwin (sha256 $sum, signed by $identity)"
+# Foca.app, the menu-bar app (design §8.7): the Foca executable in a bundle,
+# so macOS knows it by its bundle id, as notifications need. foca never runs
+# it, so it needs no pin.
+(cd apps/macos && swift build -c release --product Foca)
+app="$out/Foca.app"
+rm -rf "$app"
+mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+cp apps/macos/.build/release/Foca "$app/Contents/MacOS/Foca"
+cp apps/macos/Info.plist "$app/Contents/Info.plist"
+# The pixel-art icons (scripts/pixelart): the app icon, and the menu-bar
+# templates.
+iconutil -c icns apps/macos/Resources/Foca.iconset -o "$app/Contents/Resources/Foca.icns"
+cp apps/macos/Resources/MenuBarIcon*.png "$app/Contents/Resources/"
+if [ -n "${FOCA_VERSION:-}" ]; then
+	# CFBundleShortVersionString takes numbers only: the X.Y.Z of the version.
+	short=$(echo "$FOCA_VERSION" | sed -E 's/^([0-9]+\.[0-9]+\.[0-9]+).*/\1/')
+	plutil -replace CFBundleShortVersionString -string "$short" "$app/Contents/Info.plist"
+fi
+codesign --force --sign "$identity" --options runtime "$app"
+codesign --verify --strict "$app"
+
+echo "built $out/foca, $out/foca-darwin (sha256 $sum) and $out/Foca.app, signed by $identity"

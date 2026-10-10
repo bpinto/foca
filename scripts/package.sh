@@ -8,7 +8,7 @@ platform=$1
 out=$2
 case $platform in
 linux-amd64 | linux-arm64) files=foca ;;
-darwin-arm64) files="foca foca-darwin" ;;
+darwin-arm64) files="foca foca-darwin Foca.app" ;;
 *)
 	echo "unknown platform $platform" >&2
 	exit 2
