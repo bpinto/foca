@@ -141,8 +141,7 @@ type Peer struct {
 // Client holds identity that did not come from the host kernel. Each level is
 // kept in its own field and never merged into Peer.
 type Client struct {
-	GuestVerified *identity.GuestInfo  `json:"guest_verified,omitempty"`
-	Reported      *identity.ClientInfo `json:"reported,omitempty"`
+	Reported *identity.ClientInfo `json:"reported,omitempty"`
 }
 
 type ErrorInfo struct {
@@ -153,15 +152,14 @@ type ErrorInfo struct {
 // ScopeKey is the exact key a grant was made for. Each component records who
 // vouched for it, so a UI can show what a reuse was matched on.
 type ScopeKey struct {
-	Instance     string   `json:"instance"`
-	Connection   *KeyPart `json:"connection,omitempty"`
-	PeerSession  *KeyPart `json:"peer_session,omitempty"`
-	GuestSession *KeyPart `json:"guest_session,omitempty"`
+	Instance    string   `json:"instance"`
+	Connection  *KeyPart `json:"connection,omitempty"`
+	PeerSession *KeyPart `json:"peer_session,omitempty"`
 }
 
 type KeyPart struct {
 	Value string `json:"value"`
-	By    string `json:"by"` // "host": the host kernel; "guest": the guest relay
+	By    string `json:"by"` // "host": the host kernel
 }
 
 // Types lists every event type foca records, Outcomes and Modes every

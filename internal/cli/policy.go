@@ -48,7 +48,7 @@ type PolicyExplainCmd struct {
 }
 
 // Run reads only the config, so a policy can be checked before anything is
-// approved (design §9.1, safeguard 7). The wording is the same as the
+// approved (design §9.1, safeguard 6). The wording is the same as the
 // prompt's.
 func (c *PolicyExplainCmd) Run(g *Globals, e *Env) error {
 	cfg, _, err := g.load(e)

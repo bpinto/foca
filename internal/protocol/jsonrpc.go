@@ -1,7 +1,7 @@
 // Package protocol is the wire contract shared by the service and its
 // clients: newline-delimited JSON-RPC 2.0 over a Unix stream socket.
 //
-// Clients (the CLI, the relay) import only this package and internal/client,
+// Clients (the CLI) import only this package and internal/client,
 // never anything from the service side.
 package protocol
 
@@ -56,8 +56,7 @@ type Notification struct {
 var requestType = reflect.TypeOf(Request{})
 
 // DecodeRequest decodes one request envelope strictly: exact-case keys and no
-// duplicates, so a relay and the host can't read the method or id
-// differently. Params are checked against their own type by DecodeParams.
+// duplicates, so no other parser can read the method or id differently. Params are checked against their own type by DecodeParams.
 // A request without an id is a notification.
 func DecodeRequest(line []byte) (Request, error) {
 	var req Request

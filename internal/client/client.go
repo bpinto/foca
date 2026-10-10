@@ -1,5 +1,5 @@
-// Package client talks to a foca socket. It is used by the CLI, by tests
-// and later by the relay, and must never import service-side packages.
+// Package client talks to a foca socket. It is used by the CLI and by tests,
+// and must never import service-side packages.
 package client
 
 import (
@@ -21,7 +21,7 @@ import (
 
 type Client struct {
 	// wmu orders writes and rmu reads, so one goroutine may wait for
-	// answers while another sends (the guest relay). Call takes both.
+	// answers while another sends. Call takes both.
 	wmu, rmu sync.Mutex
 	conn     net.Conn
 	r        *bufio.Reader

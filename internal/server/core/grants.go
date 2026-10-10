@@ -11,17 +11,13 @@ import (
 )
 
 // ScopeKey is what a grant is matched on. Every component comes from the
-// host kernel, the guest relay's reading of the realm's kernel, or the
-// service itself, never from the client (design §9.1). A key is only built
+// host kernel or the service itself, never from the client (design §9.1). A key is only built
 // when every component its scope needs is present, so a missing component
 // can never match another missing one.
 type ScopeKey struct {
 	Instance    string
 	Connection  string // one socket connection
 	PeerSession string // durable session of a pinned peer
-	// GuestSession is the caller's durable session inside the realm, as the
-	// guest relay read it.
-	GuestSession string
 }
 
 // keyFor builds the caller's key for scope. ok=false means no grant can be
@@ -46,16 +42,6 @@ func keyFor(scope policy.Scope, c Call) (ScopeKey, bool) {
 			return ScopeKey{}, false
 		}
 		k.PeerSession = c.Peer.Session
-	case policy.ScopeGuestSession:
-		// Only a relay the instance names can vouch for the guest side,
-		// and only for a process the realm's kernel pinned. The host side
-		// stays in the key: a guest session never outlives the forwarded
-		// connection it was seen on.
-		g := c.Guest
-		if c.Instance.GuestRelay == nil || g == nil || !g.PIDStable || g.Session == "" || !peerSession {
-			return ScopeKey{}, false
-		}
-		k.PeerSession, k.GuestSession = c.Peer.Session, g.Session
 	default:
 		// request never reuses; instance is capped at peer-session by the
 		// floor.
@@ -74,7 +60,6 @@ func (k ScopeKey) audit() *audit.ScopeKey {
 	}
 	out.Connection = part(k.Connection, "host")
 	out.PeerSession = part(k.PeerSession, "host")
-	out.GuestSession = part(k.GuestSession, "guest")
 	return out
 }
 

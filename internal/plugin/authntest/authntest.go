@@ -1,4 +1,4 @@
-// Package authntest is the authenticator conformance suite (design §16).
+// Package authntest is the authenticator conformance suite (design §15).
 // The core reads an authenticator's answers in one way whatever shows the
 // prompt, so every implementation runs the same tests: polkit (against the
 // fake authority and the real polkitd), the darwin helper adapter (against

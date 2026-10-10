@@ -12,8 +12,7 @@ import (
 // CheckStrict rejects JSON that would only decode into a value of type t
 // because encoding/json is lenient. That decoder matches keys without regard
 // to case and keeps the last of duplicate keys, so two parsers could read the
-// same bytes differently: a relay that looks for "guest_verified" would miss
-// "Guest_Verified", which the host would accept. Here every object key must
+// same bytes differently. Here every object key must
 // equal a field's JSON name exactly and appear once; keys of objects with no
 // known shape (json.RawMessage, maps) must also be unique.
 func CheckStrict(data []byte, t reflect.Type) error {

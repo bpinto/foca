@@ -20,7 +20,6 @@ const (
 	CodeParamRejected       = -32008
 	CodeForbiddenOnSocket   = -32010
 	CodeProtocolUnsupported = -32011
-	CodeRelayRequired       = -32012
 )
 
 var codeNames = map[int]string{
@@ -39,7 +38,6 @@ var codeNames = map[int]string{
 	CodeParamRejected:       "param_rejected",
 	CodeForbiddenOnSocket:   "forbidden_on_socket",
 	CodeProtocolUnsupported: "protocol_unsupported",
-	CodeRelayRequired:       "relay_required",
 }
 
 // CodeName returns the stable snake_case name for a code.

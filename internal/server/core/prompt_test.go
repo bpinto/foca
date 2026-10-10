@@ -25,7 +25,6 @@ func TestPromptWording(t *testing.T) {
 	vm := identity.Realm{Kind: "vm", Name: "dev", Peers: "opaque"}
 	host := identity.Realm{Kind: "host", Name: "host", Peers: "direct"}
 	claimed := &identity.ClientInfo{Exe: "/bin/gh", Parents: []identity.Proc{{Name: "bash"}, {Name: "claude"}}}
-	guest := &identity.GuestInfo{Name: "gh", PIDStable: true, Parents: []identity.Proc{{Name: "bash"}, {Name: "claude"}}}
 	ssh := identity.VerifiedPeer{Exe: "/usr/bin/ssh", Name: "ssh", Opaque: true}
 	local := identity.VerifiedPeer{Exe: "/run/bin/foca", Name: "foca", ExeSealed: true, PIDStable: true,
 		Parents: []identity.Proc{{Exe: "/bin/gh", Name: "gh", Sealed: true}, {Exe: "/bin/zsh", Name: "zsh", Sealed: true}, {Exe: "/opt/claude", Name: "claude", Sealed: true}}}
@@ -40,8 +39,6 @@ func TestPromptWording(t *testing.T) {
 	}{
 		{"claimed in VM", PromptInput{Realm: vm, Resources: refs("GitHub PAT"), Requester: plugin.Requester{Peer: ssh, Reported: claimed}, ShowClient: true},
 			"share:\n🔑 GitHub PAT\n🖥️ VM dev\n❔ gh via claude (unverified)"},
-		{"guest-verified in VM", PromptInput{Realm: vm, Resources: refs("GitHub PAT"), Requester: plugin.Requester{Peer: ssh, GuestVerified: guest, Reported: claimed}, ShowClient: true},
-			"share:\n🔑 GitHub PAT\n🖥️ VM dev\n👤 gh ⚠ via claude ⚠"},
 		{"host-verified local", PromptInput{Realm: host, Resources: refs("GitHub PAT"), Requester: plugin.Requester{Peer: local}, ShowClient: true},
 			"share:\n🔑 GitHub PAT\n👤 gh via claude"},
 		{"no identity", PromptInput{Realm: vm, Resources: refs("GitHub PAT"), Requester: plugin.Requester{Peer: ssh}, ShowClient: true},
@@ -100,9 +97,6 @@ func TestPromptWording(t *testing.T) {
 		{"claimed only repeated name", PromptInput{Realm: vm, Resources: refs("x"), Requester: plugin.Requester{Peer: ssh,
 			Reported: &identity.ClientInfo{Exe: "/usr/bin/foca", Parents: []identity.Proc{{Name: "herdr"}, {Name: "herdr"}}}}, ShowClient: true},
 			"share:\n🔑 x\n🖥️ VM dev\n❔ herdr (unverified)"},
-		{"guest repeated name", PromptInput{Realm: vm, Resources: refs("x"), Requester: plugin.Requester{Peer: ssh,
-			GuestVerified: &identity.GuestInfo{Name: "gh", PIDStable: true, Parents: []identity.Proc{{Name: "gh"}, {Name: "claude"}}}}, ShowClient: true},
-			"share:\n🔑 x\n🖥️ VM dev\n👤 gh ⚠ via claude ⚠"},
 		// An unsealed parent can't hide behind its sealed child's name.
 		{"repeated name, seal differs", PromptInput{Realm: host, Resources: refs("GitHub PAT"), Requester: plugin.Requester{
 			Peer: identity.VerifiedPeer{Exe: "/usr/bin/gh", ExeSealed: true, PIDStable: true,
@@ -113,9 +107,9 @@ func TestPromptWording(t *testing.T) {
 		{"verified with run target", PromptInput{Realm: host, Resources: refs("GitHub PAT"), Requester: plugin.Requester{Peer: local,
 			Reported: &identity.ClientInfo{Target: &identity.Target{Exe: "/usr/bin/npm", Argv0: "npm"}}}, ShowClient: true},
 			"share:\n🔑 GitHub PAT\n👤 gh via claude"},
-		{"action guest-verified", PromptInput{Operation: "action.run", Realm: vm, Resources: refs("AWS credentials"), Params: map[string]string{"profile": "dev-admin"},
-			Requester: plugin.Requester{Peer: ssh, GuestVerified: guest}, ShowClient: true},
-			"run:\n⚙️ \"AWS credentials\" with profile=dev-admin\n🖥️ VM dev\n👤 gh ⚠ via claude ⚠"},
+		{"action claimed", PromptInput{Operation: "action.run", Realm: vm, Resources: refs("AWS credentials"), Params: map[string]string{"profile": "dev-admin"},
+			Requester: plugin.Requester{Peer: ssh, Reported: claimed}, ShowClient: true},
+			"run:\n⚙️ \"AWS credentials\" with profile=dev-admin\n🖥️ VM dev\n❔ gh via claude (unverified)"},
 		{"remote", PromptInput{Realm: identity.Realm{Kind: "remote", Name: "ci", Peers: "opaque"}, Resources: refs("x"), Requester: plugin.Requester{Peer: ssh}, ShowClient: true},
 			"share:\n🔑 x\n🌐 remote host ci"},
 		{"reach and strikes", PromptInput{Realm: vm, Resources: refs("x"), Requester: plugin.Requester{Peer: ssh}, ShowClient: true,
@@ -135,7 +129,7 @@ func TestPromptWording(t *testing.T) {
 }
 
 func TestClaimedIdentityNeverTakesTheVerifiedSlot(t *testing.T) {
-	// A VM process claiming to be gh, with an opaque peer and no relay.
+	// A VM process claiming to be gh, with an opaque peer.
 	in := PromptInput{
 		Realm:      identity.Realm{Kind: "vm", Name: "dev", Peers: "opaque"},
 		Resources:  refs("GitHub PAT"),
@@ -205,14 +199,12 @@ func TestIdentityLevelsHaveDistinctTypes(t *testing.T) {
 			levels[rt.Name()+"."+f.Name] = f.Type
 		}
 	}
-	if levels["Requester.GuestVerified"] == levels["Requester.Reported"] {
-		t.Fatal("Requester: guest-verified and reported identity share a type")
+	verified := reflect.TypeOf(identity.VerifiedPeer{})
+	if levels["Requester.Peer"] != verified {
+		t.Fatalf("Requester.Peer is %v, not the host-verified type", levels["Requester.Peer"])
 	}
-	if levels["Client.GuestVerified"] == levels["Client.Reported"] {
-		t.Fatal("audit.Client: guest-verified and reported identity share a type")
-	}
-	if levels["Requester.GuestVerified"] == reflect.TypeOf(&identity.VerifiedPeer{}) {
-		t.Fatal("guest-verified identity shares the host-verified type")
+	if levels["Requester.Reported"].Elem() == verified || levels["Client.Reported"].Elem() == verified {
+		t.Fatal("reported identity shares the host-verified type")
 	}
 }
 
@@ -267,9 +259,6 @@ func TestUnnamedProcessNeverHidesBehindItsParent(t *testing.T) {
 		{"host-verified parent", host, plugin.Requester{Peer: identity.VerifiedPeer{Exe: "/usr/bin/gh", Name: "gh", ExeSealed: true, PIDStable: true,
 			Parents: []identity.Proc{{Exe: "/tmp/@", Name: "@"}, claude}}},
 			"share:\n🔑 GitHub PAT\n👤 gh via an unnamed program ⚠"},
-		{"guest-verified", vm, plugin.Requester{Peer: identity.VerifiedPeer{Opaque: true},
-			GuestVerified: &identity.GuestInfo{Name: "@", PIDStable: true, Parents: []identity.Proc{{Name: "claude"}}}},
-			"share:\n🔑 GitHub PAT\n🖥️ VM dev\n👤 an unnamed program ⚠ via claude ⚠"},
 		{"claimed", vm, plugin.Requester{Peer: identity.VerifiedPeer{Opaque: true},
 			Reported: &identity.ClientInfo{Exe: "/tmp/@", Parents: []identity.Proc{{Name: "claude"}}}},
 			"share:\n🔑 GitHub PAT\n🖥️ VM dev\n❔ an unnamed program via claude (unverified)"},

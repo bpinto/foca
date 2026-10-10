@@ -334,7 +334,7 @@ func TestSocketDiscoveryOrder(t *testing.T) {
 }
 
 // huh and its terminal UI stack are for the CLI only; the service never
-// links them (design §15).
+// links them (design §14).
 func TestServiceDoesNotImportCLIUI(t *testing.T) {
 	out, err := exec.Command("go", "list", "-deps", "github.com/bpinto/foca/internal/server/...").Output()
 	if err != nil {
@@ -513,7 +513,7 @@ func TestHelpListsEverythingGroupedEverywhere(t *testing.T) {
 	var first string
 	for name, vars := range map[string]map[string]string{
 		"realm by ~/.foca.sock": {"HOME": realmHome, "FOCA_CONFIG": missing},
-		"realm by FOCA_SOCK":    {"HOME": dir, "FOCA_SOCK": "/run/foca/relay.sock", "FOCA_CONFIG": missing},
+		"realm by FOCA_SOCK":    {"HOME": dir, "FOCA_SOCK": "/run/foca/foca.sock", "FOCA_CONFIG": missing},
 		"host":                  {"HOME": dir, "FOCA_CONFIG": cfg},
 		"both":                  {"HOME": realmHome, "FOCA_CONFIG": cfg},
 		"neither":               {"HOME": dir, "FOCA_CONFIG": missing},
@@ -523,7 +523,7 @@ func TestHelpListsEverythingGroupedEverywhere(t *testing.T) {
 			t.Fatalf("%s: exit %d", name, code)
 		}
 		help := out.String()
-		for _, s := range []string{"Commands:", "  get ", "--socket", "Host commands:", "  init ", "Host flags:", "--config", "Realm commands:", "relay serve"} {
+		for _, s := range []string{"Commands:", "  get ", "--socket", "Host commands:", "  init ", "Host flags:", "--config"} {
 			if !strings.Contains(help, s) {
 				t.Errorf("%s: no %q in\n%s", name, s, help)
 			}

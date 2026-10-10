@@ -3,7 +3,6 @@ package config
 import (
 	"errors"
 	"fmt"
-	"slices"
 	"sort"
 	"strings"
 
@@ -50,58 +49,6 @@ func parsePolicy(r *rawPolicy) (policy.Policy, error) {
 	default:
 		return policy.Policy{}, fmt.Errorf(`approval must be "every-time" or "reuse", got %q`, r.Approval)
 	}
-}
-
-// checkGuestScopes refuses guest-* scopes on instances without the guest
-// relay. Such a scope is never widened to peer-session in its place (design
-// §9.1, safeguard 2). A level that applies to several instances needs the
-// relay on every one of them.
-func (c *Config) checkGuestScopes() []error {
-	var errs []error
-	check := func(where string, p policy.Policy, applies []Instance) {
-		if p.Kind != policy.Reuse || !p.Scope.NeedsRelay() {
-			return
-		}
-		var names []string
-		for _, inst := range applies {
-			if inst.GuestRelay == nil {
-				names = append(names, inst.Name)
-			}
-		}
-		if len(names) == 0 {
-			return
-		}
-		errs = append(errs, fmt.Errorf("%s: scope %q needs the guest relay (design §14), which %s doesn't have; it is never replaced by a wider scope",
-			where, p.Scope, strings.Join(names, ", ")))
-	}
-	for _, inst := range c.Instances {
-		check("instances."+inst.Name+".policy", inst.Policy, []Instance{inst})
-	}
-	for _, v := range sortedKeys(c.VaultPolicies) {
-		var users []Instance
-		for _, inst := range c.Instances {
-			if _, ok := inst.Expose[v]; ok {
-				users = append(users, inst)
-			}
-		}
-		check("vaults."+v+".policy", c.VaultPolicies[v], users)
-	}
-	for _, id := range sortedKeys(c.SecretPolicies) {
-		check("secrets."+id+".policy", c.SecretPolicies[id], c.Instances)
-	}
-	for _, id := range sortedKeys(c.ActionPolicies) {
-		var users []Instance
-		for _, inst := range c.Instances {
-			if slices.Contains(inst.Actions, id) {
-				users = append(users, inst)
-			}
-		}
-		check("actions."+id+".policy", c.ActionPolicies[id], users)
-	}
-	if p, ok := c.AuthenticatorPolicies[c.Plugins.Authenticator]; ok {
-		check("authenticators."+c.Plugins.Authenticator+".policy", p, c.Instances)
-	}
-	return errs
 }
 
 // SecretPolicy folds every level that applies when inst reads the secret

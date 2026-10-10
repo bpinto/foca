@@ -44,11 +44,10 @@ type ResourceRef struct {
 	Vault string
 }
 
-// Requester carries the three identity levels side by side, never merged.
+// Requester carries the two identity levels side by side, never merged.
 type Requester struct {
-	Peer          identity.VerifiedPeer
-	GuestVerified *identity.GuestInfo  // set only by a verified relay
-	Reported      *identity.ClientInfo // the client's own claim
+	Peer     identity.VerifiedPeer
+	Reported *identity.ClientInfo // the client's own claim
 }
 
 type ApprovalRequest struct {

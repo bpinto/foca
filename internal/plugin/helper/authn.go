@@ -15,7 +15,7 @@ type Authenticator struct {
 	h    *Helper
 	name string
 	// fallback allows the device password when biometry fails or is
-	// unavailable. Off by default (design §18).
+	// unavailable. Off by default (design §17).
 	fallback bool
 }
 

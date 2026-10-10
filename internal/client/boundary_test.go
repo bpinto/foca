@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-// Code that runs inside a realm (the client, later the CLI and relay) must
+// Code that runs inside a realm (the client, later the CLI) must
 // never link service-side code: no vault, keys, plugins or server.
 func TestClientSideDoesNotImportServiceSide(t *testing.T) {
 	out, err := exec.Command("go", "list", "-deps", "github.com/bpinto/foca/internal/client").Output()

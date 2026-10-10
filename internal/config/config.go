@@ -5,7 +5,6 @@
 package config
 
 import (
-	"crypto/ed25519"
 	"errors"
 	"fmt"
 	"os"
@@ -23,7 +22,6 @@ import (
 	"github.com/bpinto/foca/internal/fsutil"
 	"github.com/bpinto/foca/internal/identity"
 	"github.com/bpinto/foca/internal/policy"
-	"github.com/bpinto/foca/internal/protocol"
 	"github.com/bpinto/foca/internal/secretname"
 )
 
@@ -62,7 +60,7 @@ type Plugins struct {
 }
 
 // TouchID options. The password fallback is off unless config opts in
-// (design §18).
+// (design §17).
 type TouchID struct {
 	AllowPasswordFallback bool
 }
@@ -112,10 +110,6 @@ type Instance struct {
 	Actions []string
 	// Policy is the instance level ([instances.<name>.policy]).
 	Policy policy.Policy
-	// GuestRelay is the public key of the realm's guest relay (design §14),
-	// or nil. With one, the instance answers only that relay, and guest-*
-	// scopes are allowed.
-	GuestRelay ed25519.PublicKey
 }
 
 // Expose is what an instance may read in one vault: all of it, or the
@@ -297,16 +291,10 @@ type rawPolicy struct {
 }
 
 type rawInstance struct {
-	Realm      *rawRealm      `toml:"realm"`
-	Expose     *rawExpose     `toml:"expose"`
-	Actions    *rawActions    `toml:"actions"`
-	Policy     *rawPolicy     `toml:"policy"`
-	GuestRelay *rawGuestRelay `toml:"guest_relay"`
-}
-
-// rawGuestRelay is guest_relay = { public_key = "ed25519:…" } (design §14).
-type rawGuestRelay struct {
-	PublicKey string `toml:"public_key"`
+	Realm   *rawRealm   `toml:"realm"`
+	Expose  *rawExpose  `toml:"expose"`
+	Actions *rawActions `toml:"actions"`
+	Policy  *rawPolicy  `toml:"policy"`
 }
 
 // rawActions accepts either the string "*" or a list of action ids.
@@ -601,17 +589,6 @@ func validate(raw *rawFile) (*Config, error) {
 			fail("instances.%s.realm: %v", name, err)
 		}
 		inst.Realm = realm
-		if ri.GuestRelay != nil {
-			switch key, err := protocol.ParseRelayKey(ri.GuestRelay.PublicKey); {
-			case err != nil:
-				fail("instances.%s.guest_relay: %v", name, err)
-			case realm.Peers != identity.PeersOpaque:
-				// The host kernel already sees a direct realm's callers.
-				fail("instances.%s.guest_relay: only an opaque realm needs a guest relay; the host already sees the processes of a %s realm", name, realm.Peers)
-			default:
-				inst.GuestRelay = key
-			}
-		}
 
 		if ri.Expose != nil {
 			inst.Expose = ri.Expose.m
@@ -740,7 +717,6 @@ func validate(raw *rawFile) (*Config, error) {
 			}
 		}
 	}
-	errs = append(errs, c.checkGuestScopes()...)
 
 	vaultSet := map[string]bool{}
 	for v := range declared {

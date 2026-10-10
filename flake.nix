@@ -30,8 +30,6 @@
 
       # The host: the package, foca's polkit action and the TPM for its users.
       nixosModules.default = import ./nix/nixos.nix self;
-      # A VM that uses a forwarded socket: the client and process hardening.
-      nixosModules.guest = import ./nix/guest.nix self;
       # A user's config and services: systemd on Linux, launchd on macOS.
       homeManagerModules.default = import ./nix/home.nix self;
 

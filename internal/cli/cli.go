@@ -127,13 +127,10 @@ type CLI struct {
 	Config       ConfigCmd       `cmd:"" group:"host" help:"Check a config file."`
 	Events       EventsCmd       `cmd:"" group:"host" help:"Query or follow the audit log."`
 	PolkitPolicy PolkitPolicyCmd `cmd:"" group:"host" name:"polkit-policy" help:"Print the polkit action the polkit authenticator needs (Linux)."`
-
-	Relay RelayCmd `cmd:"" group:"realm" help:"The guest relay: verified identity for the realm's callers."`
 }
 
 var groups = []kong.Group{
 	{Key: "host", Title: "Host commands:", Description: "Run where the service and vaults are."},
-	{Key: "realm", Title: "Realm commands:", Description: "Run inside a VM or container."},
 	{Key: "host-flags", Title: "Host flags:"},
 }
 

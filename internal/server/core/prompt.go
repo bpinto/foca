@@ -144,7 +144,7 @@ func actorLine(a actor) string {
 
 // resolveActor picks the identity source by trust level. Claimed data never
 // reaches the 👤 line; that line is only for kernel-verified
-// identity (host kernel for direct realms, guest kernel via the relay).
+// identity (the host kernel, for direct realms).
 func resolveActor(in PromptInput) actor {
 	if !in.ShowClient {
 		return actor{}
@@ -164,41 +164,10 @@ func resolveActor(in PromptInput) actor {
 			}
 		}
 		return pick(chain, skip, trustVerified, how{})
-	case r.GuestVerified != nil:
-		// The realm's kernel vouches for each process, but every name is
-		// one the process gave itself (comm), so none is sealed and each
-		// carries the mark. The skip list applies by name: a process that
-		// calls itself bash to hide could as well call itself gh.
-		chain, leader := guestChain(*r.GuestVerified)
-		return pick(chain, skip, trustVerified, how{byName: true, comm: true, leader: leader})
 	case r.Reported != nil:
 		return pick(clientChain(*r.Reported), skip, trustClaimed, how{byName: true})
 	}
 	return actor{}
-}
-
-// guestChain is the caller and its parents as the relay read them: names
-// only, never sealed. It ends at the leader of the caller's terminal
-// session, the shell that owns the terminal: what is above it (a tmux
-// server, sshd, systemd) runs the terminal, not the request. leader says
-// whether the leader is in the chain; if not, the whole chain is kept.
-func guestChain(g identity.GuestInfo) (chain []identity.Proc, leader bool) {
-	chain = append([]identity.Proc{{PID: g.PID, StartTime: g.StartTime, Name: g.Name}}, g.Parents...)
-	for i := range chain {
-		chain[i].Exe, chain[i].Sealed = "", false
-	}
-	var sid int
-	var start uint64
-	if _, err := fmt.Sscanf(g.Session, "sid:%d:%d", &sid, &start); err != nil {
-		return chain, false
-	}
-	for i, p := range chain {
-		// The start time too: a pid alone could be a later process.
-		if p.PID == sid && p.StartTime == start {
-			return chain[:i+1], true
-		}
-	}
-	return chain, false
 }
 
 // clientChain is the claimed caller and its parents, after the command it
@@ -221,12 +190,6 @@ type how struct {
 	// byName applies the skip list to names whatever the seal, for chains
 	// where every name was chosen by the process itself.
 	byName bool
-	// comm: names are comm, which the kernel cuts to 15 bytes (commName).
-	comm bool
-	// leader: the chain ends at its terminal's session leader, which is
-	// named if every process in it is skipped. "zsh" then says the request
-	// was typed in a shell, not made through a program.
-	leader bool
 }
 
 // pick returns the first two processes in the chain that aren't shells,
@@ -242,16 +205,12 @@ func pick(chain []identity.Proc, skip map[string]bool, t trust, h how) actor {
 		sealed bool
 	}
 	var got []entry
-	last := entry{}
 	for _, p := range chain {
 		n, bare := identity.DisplayName(p.Name, maxNameLen), ""
 		if e := identity.DisplayName(p.Exe, maxNameLen); e != "" {
 			n = e
 		}
 		bare = n
-		if h.comm {
-			n, bare = commName(p.Name)
-		}
 		if bare == "" {
 			// A name that cleans to nothing is never skipped: it is on no
 			// skip list, and skipping it would put the next process in its
@@ -259,7 +218,6 @@ func pick(chain []identity.Proc, skip map[string]bool, t trust, h how) actor {
 			n = unnamed
 		}
 		e := entry{n, p.Sealed && p.Exe != ""}
-		last = e
 		if skip[bare] && (p.Sealed || h.byName) {
 			continue
 		}
@@ -274,9 +232,6 @@ func pick(chain []identity.Proc, skip map[string]bool, t trust, h how) actor {
 			break
 		}
 	}
-	if len(got) == 0 && h.leader && last.name != "" {
-		got = append(got, last)
-	}
 	switch len(got) {
 	case 0:
 		return actor{}
@@ -290,40 +245,6 @@ func pick(chain []identity.Proc, skip map[string]bool, t trust, h how) actor {
 // unnamed stands for a process whose name cleans to nothing. It has spaces,
 // which no sanitised name has, so no process can pass for it.
 const unnamed = "an unnamed program"
-
-// commLen is how much of a name the kernel keeps in comm.
-const commLen = 15
-
-// CutMark follows a name the kernel may have cut short. Like UnsealedMark it
-// is added after sanitising, so no process can put it in its own name.
-const CutMark = "…"
-
-// commName is the label for a name read from comm, and the bare name the
-// skip list is matched on. A name of the full 15 bytes may have been cut, so
-// its label gets CutMark (a name exactly that long gets it too). A Nix
-// wrapper whose "-wrapped" suffix was cut is still unwrapped: the cut fell
-// in the suffix, so the name before it is whole.
-func commName(comm string) (label, bare string) {
-	s, cut := comm, len(comm) >= commLen
-	if cut && strings.HasPrefix(s, ".") {
-		const suffix = "-wrapped"
-		if strings.HasSuffix(s, suffix) {
-			cut = false // whole; DisplayName unwraps it
-		} else {
-			for k := len(suffix) - 1; k >= 2; k-- {
-				if strings.HasSuffix(s, suffix[:k]) {
-					s, cut = s[1:len(s)-k], false
-					break
-				}
-			}
-		}
-	}
-	bare = identity.DisplayName(s, maxNameLen)
-	if cut && bare != "" {
-		return bare + CutMark, bare
-	}
-	return bare, bare
-}
 
 // UnsealedMark follows a verified name whose file isn't sealed: the
 // kernel vouches for the process, but the caller could have chosen the name.

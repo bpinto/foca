@@ -30,21 +30,19 @@ const (
 	ScopeUnset Scope = iota
 	ScopeRequest
 	ScopeConnection
-	ScopeGuestSession
 	ScopePeerSession
 	ScopeInstance
 )
 
 var scopeNames = map[Scope]string{
-	ScopeRequest:      "request",
-	ScopeConnection:   "connection",
-	ScopeGuestSession: "guest-session",
-	ScopePeerSession:  "peer-session",
-	ScopeInstance:     "instance",
+	ScopeRequest:     "request",
+	ScopeConnection:  "connection",
+	ScopePeerSession: "peer-session",
+	ScopeInstance:    "instance",
 }
 
 // Scopes lists every named scope, narrowest first.
-var Scopes = []Scope{ScopeRequest, ScopeConnection, ScopeGuestSession, ScopePeerSession, ScopeInstance}
+var Scopes = []Scope{ScopeRequest, ScopeConnection, ScopePeerSession, ScopeInstance}
 
 func (s Scope) String() string {
 	if n, ok := scopeNames[s]; ok {
@@ -70,9 +68,6 @@ func scopeList() []string {
 	}
 	return out
 }
-
-// NeedsRelay reports whether the scope's key comes from the guest relay.
-func (s Scope) NeedsRelay() bool { return s == ScopeGuestSession }
 
 // width orders scopes for folding: unset counts as the widest.
 func (s Scope) width() Scope {
@@ -211,8 +206,6 @@ func whoHere(s Scope, realm identity.Realm) string {
 	switch s {
 	case ScopeConnection:
 		return "this connection"
-	case ScopeGuestSession:
-		return "this session"
 	case ScopePeerSession:
 		if realm.Peers == identity.PeersOpaque {
 			// The host sees only the proxy, so the session is the whole realm.
@@ -240,8 +233,6 @@ func who(s Scope, realm identity.Realm) string {
 	switch s {
 	case ScopeConnection:
 		return "on the same connection"
-	case ScopeGuestSession:
-		return "by anything in the same session" + in
 	case ScopePeerSession:
 		if realm.Peers == identity.PeersOpaque {
 			// The host sees only the proxy, so the session is the whole realm.

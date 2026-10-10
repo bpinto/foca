@@ -131,7 +131,7 @@ func (l *Linux) identify(conn *net.UnixConn) (identity.VerifiedPeer, int, error)
 
 // exited reports whether the process behind pidfd has exited: a pidfd
 // polls readable once it has. Unlike a signal, this needs no permission over
-// the process, so the guest relay can watch other users' callers.
+// the process.
 func exited(pidfd int) bool {
 	fds := []unix.PollFd{{Fd: int32(pidfd), Events: unix.POLLIN}}
 	n, err := unix.Poll(fds, 0)

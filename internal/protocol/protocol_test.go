@@ -158,7 +158,6 @@ func TestParamsRejectCaseMismatchAndDuplicates(t *testing.T) {
 		"nested duplicate":       `{"names":["a"],"client":{"pid":1,"pid":2}}`,
 		"duplicate in parents":   `{"names":["a"],"client":{"parents":[{"exe":"/a","exe":"/b"}]}}`,
 		"case in embedded field": `{"names":["a"],"Min_Protocol":1}`,
-		"guest field smuggled":   `{"names":["a"],"Guest_Verified":{}}`,
 	}
 	for name, raw := range bad {
 		var p SecretReadParams

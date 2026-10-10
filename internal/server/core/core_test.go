@@ -129,9 +129,6 @@ func TestApproveReadAudit(t *testing.T) {
 	if read.Peer.Verified.Exe != "/usr/bin/ssh" || read.Client.Reported.Exe != "/nix/store/x/bin/aws" {
 		t.Fatalf("identity blocks %+v %+v", read.Peer.Verified, read.Client.Reported)
 	}
-	if read.Client.GuestVerified != nil {
-		t.Fatal("guest_verified must stay empty without a relay")
-	}
 	if evs[0].Approval.PromptText == "" {
 		t.Fatal("prompt text not recorded")
 	}
