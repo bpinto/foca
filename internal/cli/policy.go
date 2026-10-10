@@ -1,8 +1,10 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"os/user"
+	"path/filepath"
 	"slices"
 	"sort"
 	"strings"
@@ -11,11 +13,13 @@ import (
 	"time"
 
 	"github.com/bpinto/foca/internal/action"
+	"github.com/bpinto/foca/internal/audit"
 	"github.com/bpinto/foca/internal/config"
 	"github.com/bpinto/foca/internal/plugins/authn/polkit"
 	"github.com/bpinto/foca/internal/policy"
 	"github.com/bpinto/foca/internal/protocol"
 	"github.com/bpinto/foca/internal/secretname"
+	"github.com/bpinto/foca/internal/svcctl"
 )
 
 // ---- lock ----
@@ -151,13 +155,27 @@ func realmLabel(inst config.Instance) string {
 // ---- grants ----
 
 type GrantsCmd struct {
-	Drop  bool     `help:"Drop grants instead of listing them: the named ones, or all of yours."`
-	Names []string `arg:"" optional:"" help:"Secrets or actions whose grants to drop (with --drop)."`
+	Drop   bool     `help:"Drop grants instead of listing them: the named ones, or all of yours. With --host, any grant, by APPROVAL_ID or APPROVAL_ID/NAME."`
+	Host   bool     `help:"On the host: list every live grant of every running service, whoever it belongs to."`
+	Format string   `short:"f" enum:"table,json" default:"table" help:"With --host: table, or json (one object per instance)."`
+	Names  []string `arg:"" optional:"" help:"Secrets or actions whose grants to drop (with --drop); with --host, approval ids."`
 }
 
 // Run lists or drops the caller's own reuse grants. Dropping is tightening,
-// so it never needs approval.
+// so it never needs approval. --host reads the services' snapshots instead.
 func (c *GrantsCmd) Run(g *Globals, e *Env) error {
+	if c.Host {
+		if c.Drop {
+			return c.hostDrop(g, e)
+		}
+		if len(c.Names) > 0 {
+			return fmt.Errorf("names only apply with --drop")
+		}
+		return c.host(g, e)
+	}
+	if c.Format != "table" {
+		return fmt.Errorf("--format only applies with --host")
+	}
 	if len(c.Names) > 0 && !c.Drop {
 		return fmt.Errorf("names only apply with --drop")
 	}
@@ -220,4 +238,257 @@ func (c *PolkitPolicyCmd) Run(g *Globals, e *Env) error {
 	}
 	_, err = e.Stdout.Write(b)
 	return err
+}
+
+// hostGrants is one instance in `foca grants --host -f json`.
+type hostGrants struct {
+	Instance string `json:"instance"`
+	// Running is false when no verified service holds the instance's pid
+	// file; its snapshot, if any, isn't trusted then (design §8.6).
+	Running   bool           `json:"running"`
+	Reuse     bool           `json:"reuse"`
+	WrittenAt *time.Time     `json:"written_at,omitempty"`
+	Grants    []svcctl.Grant `json:"grants"`
+	Error     string         `json:"error,omitempty"`
+}
+
+// host lists the live grants of every running service, or of --instance,
+// from the snapshots they keep (design §8.6). Like events, it takes the
+// instance only from the flag, so a FOCA_INSTANCE left set can't hide one.
+func (c *GrantsCmd) host(g *Globals, e *Env) error {
+	paths, err := g.paths(e)
+	if err != nil {
+		return err
+	}
+	out, failed, err := hostSnapshots(g, paths)
+	if err != nil {
+		return err
+	}
+	if c.Format == "json" {
+		for _, h := range out {
+			if err := writeJSONLine(e.Stdout, h); err != nil {
+				return err
+			}
+		}
+	} else if err := printHostGrants(e, out); err != nil {
+		return err
+	}
+	if failed == len(out) {
+		return fmt.Errorf("no grants could be read")
+	}
+	return nil
+}
+
+// hostSnapshots reads the grants of every running service, or of
+// --instance, and how many of them couldn't be read.
+func hostSnapshots(g *Globals, paths config.Paths) ([]hostGrants, int, error) {
+	var names []string
+	if g.Instance != "" {
+		if !config.ValidName(g.Instance) {
+			return nil, 0, fmt.Errorf("--instance %q is not an instance name", g.Instance)
+		}
+		names = []string{g.Instance}
+	} else {
+		files, err := paths.PIDFiles()
+		if err != nil {
+			return nil, 0, err
+		}
+		for _, f := range files {
+			names = append(names, filepath.Base(filepath.Dir(f)))
+		}
+		sort.Strings(names)
+	}
+	if len(names) == 0 {
+		return nil, 0, fmt.Errorf("%w (no pid file in %s)", svcctl.ErrNotRunning, paths.RuntimeDir)
+	}
+	now := time.Now()
+	out := make([]hostGrants, 0, len(names))
+	failed := 0
+	for _, name := range names {
+		h := hostGrants{Instance: name, Grants: []svcctl.Grant{}}
+		s, err := svcctl.ReadGrants(paths.PIDFile(name), paths.GrantsFile(name), now)
+		switch {
+		case errors.Is(err, svcctl.ErrNotRunning):
+			h.Error = err.Error()
+		case err != nil:
+			h.Running, h.Error = true, err.Error()
+		default:
+			h.Running, h.Reuse = true, s.Reuse
+			h.WrittenAt = &s.WrittenAt
+			if len(s.Grants) > 0 {
+				h.Grants = s.Grants
+			}
+		}
+		if h.Error != "" {
+			failed++
+		}
+		out = append(out, h)
+	}
+	return out, failed, nil
+}
+
+// dropWait is how long foca grants --host --drop waits for the service to
+// show the grants gone.
+var dropWait = 5 * time.Second
+
+// hostDrop asks the services holding the named grants to drop them (design
+// §8.6): a request in the instance's private drop directory, then SIGUSR2,
+// since a signal carries no data. Tightening, so no approval. It reports a
+// drop only once the service's snapshot shows it.
+func (c *GrantsCmd) hostDrop(g *Globals, e *Env) error {
+	if len(c.Names) == 0 {
+		return fmt.Errorf("name the grants to drop by approval id (APPROVAL_ID or APPROVAL_ID/NAME, as foca grants --host -f json shows them); foca lock drops them all")
+	}
+	if c.Format != "table" {
+		return fmt.Errorf("--format only applies to listing")
+	}
+	var targets []svcctl.DropTarget
+	for _, arg := range c.Names {
+		id, name, _ := strings.Cut(arg, "/")
+		t := svcctl.DropTarget{ApprovalID: id}
+		if name != "" {
+			t.Kind, t.Name = "action", name
+			if strings.Contains(name, ":") {
+				t.Kind = "secret"
+			}
+		}
+		if err := t.Check(); err != nil {
+			return fmt.Errorf("%s: %w", clean(arg), err)
+		}
+		targets = append(targets, t)
+	}
+	paths, err := g.paths(e)
+	if err != nil {
+		return err
+	}
+	snaps, _, err := hostSnapshots(g, paths)
+	if err != nil {
+		return err
+	}
+	// Each target goes to the instance whose snapshot holds it.
+	byInstance := map[string][]svcctl.DropTarget{}
+	var order []string
+	matched := 0
+	for _, t := range targets {
+		found := false
+		for _, h := range snaps {
+			n := 0
+			for _, gr := range h.Grants {
+				if dropMatches(t, gr) {
+					n++
+				}
+			}
+			if !h.Running || n == 0 {
+				continue
+			}
+			matched += n
+			if byInstance[h.Instance] == nil {
+				order = append(order, h.Instance)
+			}
+			byInstance[h.Instance] = append(byInstance[h.Instance], t)
+			found = true
+		}
+		if !found {
+			return fmt.Errorf("no live grant %s (see foca grants --host)", clean(t.ApprovalID+slashName(t)))
+		}
+	}
+	for _, inst := range order {
+		if err := svcctl.WriteDropRequest(paths.DropDir(inst), byInstance[inst]); err != nil {
+			return err
+		}
+		if _, err := svcctl.Signal(paths.PIDFile(inst), syscall.SIGUSR2); err != nil {
+			return err
+		}
+	}
+	// Wait for every snapshot to show its grants gone.
+	deadline := time.Now().Add(dropWait)
+	for _, inst := range order {
+		for {
+			s, err := svcctl.ReadGrants(paths.PIDFile(inst), paths.GrantsFile(inst), time.Now())
+			if err == nil && !slices.ContainsFunc(s.Grants, func(gr svcctl.Grant) bool {
+				return slices.ContainsFunc(byInstance[inst], func(t svcctl.DropTarget) bool { return dropMatches(t, gr) })
+			}) {
+				break
+			}
+			if time.Now().After(deadline) {
+				return fmt.Errorf("instance %s hasn't shown the grants dropped after %s; see its service's log", inst, dropWait)
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+	fmt.Fprintf(e.Stderr, "dropped %d grant(s); the next access asks again\n", matched)
+	return nil
+}
+
+func dropMatches(t svcctl.DropTarget, g svcctl.Grant) bool {
+	return t.ApprovalID == g.ApprovalID && (t.Kind == "" || t.Kind == g.Kind && t.Name == g.Name)
+}
+
+func slashName(t svcctl.DropTarget) string {
+	if t.Name == "" {
+		return ""
+	}
+	return "/" + t.Name
+}
+
+// printHostGrants writes the table, then what it leaves out: instances with
+// no grants on one line, then any that couldn't be read or can't reuse.
+// The notes come after the table so they don't land above it.
+func printHostGrants(e *Env, out []hostGrants) error {
+	w := tabwriter.NewWriter(e.Stdout, 0, 4, 2, ' ', 0)
+	header := false
+	var idle, notes []string
+	for _, h := range out {
+		switch {
+		case h.Error != "":
+			notes = append(notes, h.Instance+": "+clean(h.Error))
+			continue
+		case !h.Reuse:
+			notes = append(notes, h.Instance+": reuse is off (no platform events), so every access asks")
+		case len(h.Grants) == 0:
+			idle = append(idle, h.Instance)
+		}
+		for _, gr := range h.Grants {
+			if !header {
+				fmt.Fprintln(w, "INSTANCE\tNAME\tSCOPE\tFOR\tEXPIRES")
+				header = true
+			}
+			name := gr.Name
+			if gr.Kind == "action" {
+				name = "action " + name
+				if len(gr.Params) > 0 {
+					name += " (" + action.DescribeParams(gr.Params) + ")"
+				}
+			}
+			expires := gr.ExpiresAt.Local().Format(time.DateTime)
+			if gr.Quiet {
+				expires += " (quiet)"
+			}
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", h.Instance, clean(name), clean(gr.Scope), clean(scopeHolder(gr.ScopeKey)), expires)
+		}
+	}
+	if err := w.Flush(); err != nil {
+		return err
+	}
+	if len(idle) > 0 {
+		fmt.Fprintln(e.Stderr, "no live grants: "+strings.Join(idle, ", "))
+	}
+	for _, n := range notes {
+		fmt.Fprintln(e.Stderr, n)
+	}
+	return nil
+}
+
+// scopeHolder names what a grant is keyed on: a peer's session or one
+// connection.
+func scopeHolder(k *audit.ScopeKey) string {
+	switch {
+	case k == nil:
+		return "-"
+	case k.PeerSession != nil:
+		return "session " + k.PeerSession.Value
+	case k.Connection != nil:
+		return "connection " + k.Connection.Value
+	}
+	return "-"
 }

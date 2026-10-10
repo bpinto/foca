@@ -130,7 +130,10 @@ type Approval struct {
 	ScopeKey      *ScopeKey  `json:"scope_key,omitempty"`
 	GrantedAt     *time.Time `json:"granted_at,omitempty"`
 	ExpiresAt     *time.Time `json:"expires_at,omitempty"`
-	PromptText    string     `json:"prompt_text,omitempty"`
+	// Quiet is set on a grant, and each reuse of it, that the host is not
+	// told of (notify = false, design §8.7).
+	Quiet      bool   `json:"quiet,omitempty"`
+	PromptText string `json:"prompt_text,omitempty"`
 }
 
 // Peer holds kernel-verified identity only.

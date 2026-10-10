@@ -103,19 +103,11 @@ func Signal(path string, sig syscall.Signal) (int, error) {
 // read parses the pid file after checking it is a private regular file
 // owned by the current user.
 func read(path string) (record, error) {
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	f, err := openPrivate(path)
 	if err != nil {
 		return record{}, err
 	}
 	defer f.Close()
-	fi, err := f.Stat()
-	if err != nil {
-		return record{}, err
-	}
-	st, ok := fi.Sys().(*syscall.Stat_t)
-	if !fi.Mode().IsRegular() || fi.Mode().Perm()&0o077 != 0 || !ok || int(st.Uid) != os.Getuid() {
-		return record{}, fmt.Errorf("%s is not a private file of the current user; not trusting it", path)
-	}
 	b := make([]byte, 64)
 	n, _ := f.Read(b)
 	fields := strings.Fields(string(b[:n]))
@@ -168,4 +160,24 @@ func isFoca(exe string) bool {
 	}
 	self, err := inspect(os.Getpid())
 	return err == nil && self.exe == exe
+}
+
+// openPrivate opens path for reading if it is a regular file, not a
+// symlink, that only the current user owns and can read.
+func openPrivate(path string) (*os.File, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, err
+	}
+	fi, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !fi.Mode().IsRegular() || fi.Mode().Perm()&0o077 != 0 || !ok || int(st.Uid) != os.Getuid() {
+		f.Close()
+		return nil, fmt.Errorf("%s is not a private file of the current user; not trusting it", path)
+	}
+	return f, nil
 }

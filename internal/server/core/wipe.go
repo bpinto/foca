@@ -46,6 +46,7 @@ func (s *Service) Wipe(ctx context.Context, reason string, params map[string]str
 	s.wipes++
 	s.mu.Unlock()
 	s.grantMu.Unlock()
+	s.changed()
 	e := &audit.Event{Type: audit.TypeLock, Outcome: audit.OutcomeOK, Reason: reason, Count: n, Params: params}
 	_, err := s.appendEvent(ctx, e)
 	return err
@@ -58,6 +59,9 @@ func (s *Service) setHealthy(ctx context.Context, ok bool, log *slog.Logger) {
 	was := s.healthy
 	s.healthy = ok
 	s.mu.Unlock()
+	if was != ok {
+		s.changed()
+	}
 	if was && !ok {
 		if err := s.Wipe(ctx, WipeEventsUnhealthy, nil); err != nil {
 			log.Error("audit failed for lock", "err", err)
@@ -87,6 +91,7 @@ func (s *Service) expire(ctx context.Context) error {
 	if n == 0 {
 		return nil
 	}
+	s.changed()
 	e := &audit.Event{Type: audit.TypeLock, Outcome: audit.OutcomeOK, Reason: WipeExpired, Count: n}
 	_, err := s.appendEvent(ctx, e)
 	return err
@@ -275,6 +280,9 @@ func (s *Service) DropGrants(ctx context.Context, c Call, names []string) (int, 
 		n++
 	}
 	s.mu.Unlock()
+	if n > 0 {
+		s.changed()
+	}
 	e := s.Event(c, audit.TypeGrantsDrop, audit.OutcomeOK)
 	e.Count = n
 	if len(names) > 0 {
@@ -288,6 +296,55 @@ func (s *Service) DropGrants(ctx context.Context, c Call, names []string) (int, 
 		return 0, aerr
 	}
 	return n, nil
+}
+
+// HostDrop names one grant the host asks to drop: by its approval, and by
+// its resource too when Resource is set.
+type HostDrop struct {
+	ApprovalID string
+	Resource   *audit.Resource
+}
+
+// DropHostGrants drops the grants of instance that targets name, whoever
+// they belong to (foca grants --host --drop, design §8.6). Only an exact
+// match is dropped: a later approval of the same resource has another ID.
+// Like a wipe, it drops even if the event can't be recorded, since that is
+// the safe direction, and it is recorded as grants.drop from the host.
+func (s *Service) DropHostGrants(ctx context.Context, instance string, targets []HostDrop) (int, error) {
+	s.mu.Lock()
+	var dropped []audit.Resource
+	for gk, g := range s.grants {
+		if g.key.Instance != instance || !matchesDrop(g, targets) {
+			continue
+		}
+		delete(s.grants, gk)
+		dropped = append(dropped, g.resource)
+	}
+	s.mu.Unlock()
+	if len(dropped) > 0 {
+		s.changed()
+	}
+	slices.SortFunc(dropped, func(a, b audit.Resource) int { return strings.Compare(a.Kind+":"+a.ID, b.Kind+":"+b.ID) })
+	asked := make([]string, len(targets))
+	for i, t := range targets {
+		asked[i] = t.ApprovalID
+		if t.Resource != nil {
+			asked[i] += "/" + t.Resource.ID
+		}
+	}
+	e := &audit.Event{Type: audit.TypeGrantsDrop, Outcome: audit.OutcomeOK, Origin: audit.OriginHostCLI, Instance: instance,
+		Count: len(dropped), Resources: dropped, Params: map[string]string{"approval_ids": strings.Join(asked, ",")}}
+	_, err := s.appendEvent(ctx, e)
+	return len(dropped), err
+}
+
+func matchesDrop(g *grant, targets []HostDrop) bool {
+	for _, t := range targets {
+		if t.ApprovalID == g.approvalID && (t.Resource == nil || *t.Resource == g.resource) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Service) checkNamesErr(c Call, names []string) ([]string, error) {

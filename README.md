@@ -182,6 +182,7 @@ foca run -e GH_TOKEN=dev:github-pat -- gh pr list
 | `foca rekey` | host | Encrypt a vault again under a new key and recovery key, so the old recovery key and copies of the old file open nothing in it from then on (a copy still holds the secrets as they were) |
 | `foca reload` · `stop` | host | Reload the config, or stop the service |
 | `foca lock` | host | Drop every reuse grant now |
+| `foca grants --host [-f json]` | host | Every live grant of every running service, whoever it belongs to |
 | `foca policy explain [names…]` | host | What the config allows, in the prompt's own words |
 | `foca config check [file]` | host | Check a config file as `serve` would |
 | `foca events query` · `follow` | host | Search the audit log, or follow it live |
@@ -266,6 +267,11 @@ approval = "every-time"      # always asks, whatever the other levels say
 ```
 
 Run `foca policy explain` to check what a config means before approving anything.
+
+[actions.aws-creds.policy]
+approval = "reuse"
+window   = "15m"
+notify   = false             # no notification for each reuse; notify = true anywhere wins
 
 </details>
 

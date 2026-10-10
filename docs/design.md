@@ -891,6 +891,7 @@ the host, working directly on host files:
 | `config check` | parses a config file as `serve` would, without trusting or using it (Nix checks generated configs with it) | no |
 | `events` | reads the audit log (§8.5) | no |
 | `grants --host` | reads each service's grants snapshot, trusting it only while a verified service holds the instance's pid file (§8.6) | no |
+| `grants --host --drop` | writes a request naming the grants into the instance's private `drop` directory, then sends `SIGUSR2` (§8.6) | no (tightening) |
 
 - **The service is read-only on vaults.** It re-reads a vault when the file's identity, size
   or mtime changes, so the CLI's edits apply to the next request. A bug in the service can't
@@ -898,7 +899,8 @@ the host, working directly on host files:
 - **Signals go only to a verified service.** A service records its pid in
   `<runtime>/<instance>/serve.pid` (0600, inside the 0700 instance dir) for each instance it
   serves. `reload`, `lock` and `stop` signal every running service once, or with `-i` the one
-  serving that instance. Before signalling, the CLI pins the process (a pidfd on Linux, its
+  serving that instance; `grants --host --drop` signals the ones holding the grants it
+  names. Before signalling, the CLI pins the process (a pidfd on Linux, its
   pid version on macOS, checked again just before `kill`), matches its start time, and
   checks that its executable is foca (its name, on Linux, since a service hides its
   executable) and that it runs as the same uid.
@@ -1146,11 +1148,14 @@ env         = { HOME = "/Users/bruno", PATH = "/usr/bin:/bin" }
   approval = "reuse"
   window   = "15m"
   scope    = "peer-session"
+  notify   = false                 # reused on every AWS call: don't announce each (§8.7)
 ```
 
 In this example, reading `common:github-pat` from `dev` folds instance 30m, vault 2h and
 authenticator 1h, which gives reuse for 30m within `peer-session`. Reading
 `common:prod-db-password` from `work` is always every-time, whatever the other levels say.
+`aws-creds` grants are reused without a notification, unless another level says
+`notify = true`.
 
 ---
 
@@ -1238,7 +1243,8 @@ Appending uses `O_APPEND` plus `fsync` before the request continues.
   never its other arguments.
 - **`approval.mode`** is `fresh`, `reused` or `none`. `none` is for methods that need no
   approval. Reused events point at the original grant's `approval.id`, so a UI can draw "1
-  touch → 7 reads".
+  touch → 7 reads". **`approval.quiet`** is `true` on a grant made under `notify = false`
+  (§9.1), and on each of its reuses: the menu-bar app doesn't announce them (§8.7).
 - **`count`** is what the event itself counts: the grants a `lock` or `grants.drop` removed,
   the secrets a `secret.list` returned. **`coalesced`** appears only on an event that stands
   for a burst of others like it (§9.6), e.g. `"coalesced": {"count": 41, "after_seq": 1042}`:
@@ -1335,19 +1341,39 @@ the host every live grant, each service writes a snapshot.
   `serve.pid`. It is replaced atomically whenever that instance's grants change (one is made,
   dropped, wiped or expires) and when reuse turns on or off with platform-event health
   (D13). A service writes it, empty, when it starts serving an instance, and removes it when
-  it stops. Like the pid file it only has to outlive the process, so it isn't `fsync`ed.
+  it stops. Like the pid file it only has to outlive the process, so a write that is in place
+  but not yet durable will do.
 - **What it holds.**
   `{"v": 1, "instance", "written_at", "reuse", "grants": [{kind, name, params?, scope,
-  scope_key, approval_id, granted_at, expires_at}]}`: names and the fields of an event's
+  scope_key, approval_id, granted_at, expires_at, quiet?}]}`: names and the fields of an event's
   `approval` block (§8.1), never values. `reuse` is false while no grant can be made or
   reused. `approval_id` finds the `approval.granted` event, which names who was approved.
-- **`foca grants --host`** reads the snapshot of every instance in the runtime directory, or
-  of `--instance`. It trusts a file only while a verified service holds that instance's pid
-  file (§6.2): a file a crash left behind names grants that no longer exist, so the instance
-  is reported as not running. Grants past `expires_at` that the service hasn't swept yet are
-  left out. `-f json` prints one object per instance, for programs such as the menu-bar app
-  (§8.7). It needs no approval and isn't audited (like `grants.status`, it changes nothing and
-  reads no secret), and it never talks to a socket.
+- **`foca grants --host`** reads the snapshot of every instance with a pid file in the runtime
+  directory, or of `--instance` (the flag only, as for `events`). It trusts a file only while
+  a verified service holds that instance's pid file (§6.2): a file a crash left behind names
+  grants that no longer exist, so the instance is reported as not running. Grants past
+  `expires_at` that the service hasn't swept yet are left out. `-f json` prints one line per
+  instance, `{instance, running, reuse, written_at, grants, error?}`, for programs such as
+  the menu-bar app (§8.7). It needs no approval and isn't audited (like `grants.status`, it
+  changes nothing and reads no secret), and it never talks to a socket.
+- **Dropping one grant.** `foca grants --host --drop APPROVAL_ID[/NAME]…` drops grants of any
+  caller, which `grants.drop` over a socket never can: a realm only ever drops its own. It
+  only removes access, so it needs no approval, and it adds nothing a process running as the
+  user couldn't already do with `foca lock`. A signal carries no data, so the CLI finds the
+  instance holding each grant in the snapshots, writes a request
+  `{"v": 1, "grants": [{approval_id, kind?, name?}]}` (at most 32) into
+  `<runtime>/<instance>/drop/` (0700; the file 0600, written atomically and named by a fresh
+  id), and sends `SIGUSR2` to that verified service (§6.2). The service takes a request
+  only from a private file of its user in a private directory, named as the CLI names them,
+  that decodes strictly and names well-formed grants. It removes every request it looks
+  at, and logs the ones it refuses. It drops exactly the grants named: the approval, and
+  within a batch approval the resource. A later grant of the same resource has another
+  approval ID, so it is never hit. Like a wipe, it drops even when the event can't be
+  recorded, the safe direction, and records `grants.drop` with `origin: host-cli`, the
+  instance, the dropped `resources` and their count, and the IDs it was asked for in
+  `params.approval_ids`. A request left by a service that has gone names grants that went
+  with it; a service clears them when it starts. The CLI reports the drop only once the
+  snapshot shows the grants gone, and fails after 5 s otherwise.
 - **A view, not an authority.** The service never reads the file back, and nothing decides on
   it. A failed write is logged and the old file removed, so a viewer says it can't tell rather
   than show grants that are gone. Requests aren't refused over it: the audit log, not the
@@ -1412,7 +1438,7 @@ Each level holds one `Policy` value, or nothing at all.
 ```
 Policy  = Unset                              -- "no opinion" (table omitted)
         | EveryTime                          -- fresh approval for each access
-        | Reuse{window: Duration, scope: Scope}
+        | Reuse{window: Duration, scope: Scope, notify: Notify}
 Scope   = request < connection < peer-session < instance
                                          (narrow → wide)
 ```
@@ -1431,8 +1457,12 @@ transports without saying so.
 name says:
 
 1. **Scope keys contain verified data only.** Client-reported fields never go into a scope key.
+Notify  = on < off < unset               -- notify = true | false | left out
    There is deliberately no scope built from client-reported session ids.
 2. **A scope is never silently widened.** If a caller's key for the scope can't be built (its
+`notify` says whether the host is told of each reuse: the menu-bar app notifies unless the
+grant is quiet (§8.7). Only `off` silences, so a policy that leaves it out notifies.
+
    session can't be read, or its pid wasn't pinned), nothing is reused for it; it is never
    handled under a wider scope.
 3. **A grant stores its exact key.** It records each component and who vouched for it, e.g.
@@ -1445,11 +1475,12 @@ name says:
    `⏱️ 15m, anything in this VM`, `⏱️ 1h, this session` or `⏱️ 45s, this connection`.
 6. **`foca policy explain` states the same reach.** It runs on the host CLI, reading config only
    and prints the effective policy for every secret and action in plain words, naming the
-   realm (`one approval allows reuse for 15m by anything in VM dev`), so you can check what
-   the config means before anything is approved.
+   realm (`one approval allows reuse for 15m by anything in VM dev`, ending `, without
+   notifying` for a quiet one), so you can check what the config means before anything is
+   approved.
 7. **The audit log shows scope and key.** Each grant and reuse event carries `scope` and the
    key components with their trust level, so a later UI can show "1 touch → 7 reads, all from
-   VM dev".
+   VM dev", and `quiet` when its reuses go unannounced.
 
 ### 9.2 Levels folded together
 
@@ -1472,14 +1503,17 @@ that doesn't exist yet has no effect until it is added.
 ```
 meet(Unset, x)                 = x
 meet(EveryTime, x)             = EveryTime
-meet(Reuse a, Reuse b)         = Reuse{min(a.window,b.window), narrower(a.scope,b.scope)}
+meet(Reuse a, Reuse b)         = Reuse{min(a.window,b.window), narrower(a.scope,b.scope),
+                                       stricter(a.notify,b.notify)}
 effective = meet(level1, level2, level3) ; if Unset → EveryTime ; then meet(…, code floor)
 ```
 
 A `Reuse` level may leave out `scope`: it then has no opinion on scope, folds like the widest
 one, and the floor caps it at `peer-session`. `window` is required with `reuse`. After the
 floor, a window under the minimum or a `request` scope (a grant nothing could reuse) becomes
-`EveryTime`; the evaluator only ever narrows.
+`EveryTime`; the evaluator only ever narrows. `notify` folds the same way: `notify = true` at
+any level keeps a grant announced, and otherwise one level's `notify = false` makes it
+quiet. Like reuse itself, quiet is opt-in where it is set, and any other level can veto it.
 
 `meet` is commutative, associative and idempotent, and `meet(x, y) ⊑ x` holds for every `y`.
 So **adding a level, or any setting at any level, can never loosen the result**. A
@@ -1499,7 +1533,7 @@ What follows:
 
 - `MaxReuseWindow = 8h`, `MinReuseWindow = 1s`. Config values outside this range are
   **rejected** at load time. The evaluator clamps as well, as defence in depth.
-- `approval = "every-time"` with a `window` or `scope` set is a config error, and so is
+- `approval = "every-time"` with a `window`, `scope` or `notify` set is a config error, and so is
   `approval = "reuse"` without a `window`.
 - `[authenticators.<name>.policy]` names a known authenticator. Only the configured one
   applies; the others are allowed so a config can switch authenticators and keep them.

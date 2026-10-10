@@ -126,6 +126,10 @@ type Service struct {
 	// events are then written, not counted, so a sink that stopped refuses
 	// them too (design D10).
 	auditFailed atomic.Bool
+
+	// grantsChanged holds one pending signal that grants or reuse health
+	// changed, for the host's grants snapshot (design §8.6).
+	grantsChanged chan struct{}
 }
 
 func New(opts Options, instances []*Instance, stores map[string]plugin.SecretStore) *Service {
@@ -144,7 +148,7 @@ func New(opts Options, instances []*Instance, stores map[string]plugin.SecretSto
 	}
 	s := &Service{opts: opts, instances: map[string]*Instance{}, stores: stores, queue: newPromptQueue(opts.MaxQueue, len(instances)),
 		rej: rejections{windows: map[string]*rejWindow{}}, grants: map[grantKey]*grant{}, denials: map[denialKey]*denial{},
-		strikes: map[string][]strike{}, running: map[string]int{}}
+		strikes: map[string][]strike{}, running: map[string]int{}, grantsChanged: make(chan struct{}, 1)}
 	for _, i := range instances {
 		s.instances[i.Name] = i
 	}

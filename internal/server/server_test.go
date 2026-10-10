@@ -28,6 +28,7 @@ import (
 	"github.com/bpinto/foca/internal/policy"
 	"github.com/bpinto/foca/internal/protocol"
 	"github.com/bpinto/foca/internal/server/core"
+	"github.com/bpinto/foca/internal/svcctl"
 )
 
 type env struct {
@@ -116,10 +117,14 @@ func TestSocketAndDirectoryModes(t *testing.T) {
 	if err != nil || fi.Mode()&os.ModeSocket == 0 || fi.Mode().Perm() != 0o600 {
 		t.Fatalf("client socket: %v %v", fi.Mode(), err)
 	}
-	// One socket per instance and nothing else: there is no management socket.
+	// One socket per instance, and beside it only the private grants
+	// snapshot: there is no management socket.
 	entries, _ := os.ReadDir(e.paths.InstanceDir("dev"))
-	if len(entries) != 1 || entries[0].Name() != "client.sock" {
+	if len(entries) != 2 || entries[0].Name() != "client.sock" || entries[1].Name() != "grants.json" || !entries[1].Type().IsRegular() {
 		t.Fatalf("instance dir holds %v", entries)
+	}
+	if fi, err := os.Lstat(e.paths.GrantsFile("dev")); err != nil || fi.Mode().Perm() != 0o600 {
+		t.Fatalf("grants snapshot: %v %v", fi, err)
 	}
 }
 
@@ -828,5 +833,83 @@ func TestReloadShutdownWipesAsReload(t *testing.T) {
 	evs := e.sink.Events()
 	if lock := evs[len(evs)-2]; lock.Type != audit.TypeLock || lock.Reason != "reload" {
 		t.Fatalf("events end with %+v", evs[len(evs)-2:])
+	}
+}
+
+// The host's grants snapshot follows every change the service makes, holds
+// no value, and goes away with the service (design §8.6).
+func TestGrantsSnapshotFollowsEveryChange(t *testing.T) {
+	e := startWith(t, hostRealm, nil, withReuse(policy.Policy{Kind: policy.Reuse, Window: time.Hour, Scope: policy.ScopePeerSession}))
+	e.auth.Default = fake.Approve
+	path := e.paths.GrantsFile("dev")
+	snapshot := func() (svcctl.GrantsSnapshot, string) {
+		var s svcctl.GrantsSnapshot
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return s, ""
+		}
+		if err := json.Unmarshal(b, &s); err != nil {
+			t.Fatalf("snapshot %s: %v", b, err)
+		}
+		return s, string(b)
+	}
+	waitSnapshot := func(what string, ok func(svcctl.GrantsSnapshot) bool) string {
+		t.Helper()
+		for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(time.Millisecond) {
+			if s, raw := snapshot(); raw != "" && ok(s) {
+				return raw
+			}
+			if time.Now().After(deadline) {
+				s, raw := snapshot()
+				t.Fatalf("%s: snapshot is %+v (%q)", what, s, raw)
+			}
+		}
+	}
+	if fi, err := os.Stat(path); err != nil || fi.Mode().Perm() != 0o600 {
+		t.Fatalf("snapshot not written at start, or not 0600: %v %v", fi, err)
+	}
+	waitSnapshot("events ready", func(s svcctl.GrantsSnapshot) bool { return s.Reuse && len(s.Grants) == 0 && s.Instance == "dev" })
+
+	c := dial(t, e.paths.ClientSocket("dev"))
+	read := func() {
+		t.Helper()
+		var res protocol.SecretReadResult
+		if err := c.Call(ctx(t), protocol.MethodSecretRead, protocol.SecretReadParams{Names: []string{"dev:github-pat"}}, &res); err != nil {
+			t.Fatal(err)
+		}
+	}
+	read()
+	raw := waitSnapshot("a grant", func(s svcctl.GrantsSnapshot) bool {
+		return len(s.Grants) == 1 && s.Grants[0].Name == "dev:github-pat" && s.Grants[0].Kind == "secret" &&
+			s.Grants[0].Scope == "peer-session" && s.Grants[0].ScopeKey != nil && s.Grants[0].ApprovalID != ""
+	})
+	if strings.Contains(raw, "ghp_secret") {
+		t.Fatal("the snapshot holds a secret value")
+	}
+	var approval []audit.Event
+	for _, ev := range e.sink.Events() {
+		if ev.Type == audit.TypeApprovalGranted {
+			approval = append(approval, ev)
+		}
+	}
+	if s, _ := snapshot(); len(approval) != 1 || approval[0].Approval.ID != s.Grants[0].ApprovalID {
+		t.Fatalf("approval_id doesn't find the approval.granted event: %+v", approval)
+	}
+
+	var dr protocol.GrantsDropResult
+	if err := c.Call(ctx(t), protocol.MethodGrantsDrop, protocol.GrantsDropParams{}, &dr); err != nil {
+		t.Fatal(err)
+	}
+	waitSnapshot("a drop", func(s svcctl.GrantsSnapshot) bool { return len(s.Grants) == 0 })
+	read()
+	waitSnapshot("a second grant", func(s svcctl.GrantsSnapshot) bool { return len(s.Grants) == 1 })
+	if err := e.srv.opts.Core.Wipe(context.Background(), core.WipeManual, nil); err != nil {
+		t.Fatal(err)
+	}
+	waitSnapshot("a wipe", func(s svcctl.GrantsSnapshot) bool { return len(s.Grants) == 0 })
+
+	e.srv.Shutdown("signal terminated")
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the snapshot outlived the service: %v", err)
 	}
 }

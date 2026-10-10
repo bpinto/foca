@@ -15,11 +15,15 @@ func domain() []Policy {
 	scopes := append([]Scope{ScopeUnset}, Scopes...)
 	for _, w := range []time.Duration{time.Second, 15 * time.Minute, 30 * time.Minute, 8 * time.Hour, 9 * time.Hour} {
 		for _, s := range scopes {
-			out = append(out, Policy{Kind: Reuse, Window: w, Scope: s})
+			for _, n := range notifies {
+				out = append(out, Policy{Kind: Reuse, Window: w, Scope: s, Notify: n})
+			}
 		}
 	}
 	return out
 }
+
+var notifies = []Notify{NotifyUnset, NotifyOn, NotifyOff}
 
 func random(r *rand.Rand) Policy {
 	switch r.IntN(4) {
@@ -29,7 +33,7 @@ func random(r *rand.Rand) Policy {
 		return Policy{Kind: EveryTime}
 	}
 	scopes := append([]Scope{ScopeUnset}, Scopes...)
-	return Policy{Kind: Reuse, Window: time.Duration(r.Int64N(int64(10 * time.Hour))), Scope: scopes[r.IntN(len(scopes))]}
+	return Policy{Kind: Reuse, Window: time.Duration(r.Int64N(int64(10 * time.Hour))), Scope: scopes[r.IntN(len(scopes))], Notify: notifies[r.IntN(len(notifies))]}
 }
 
 // The lattice laws (design §9.3), checked over every combination of the
@@ -109,6 +113,10 @@ func TestEffectiveNeverLoosens(t *testing.T) {
 }
 
 func reuse(w time.Duration, s Scope) Policy { return Policy{Kind: Reuse, Window: w, Scope: s} }
+func quiet(w time.Duration) Policy          { return Policy{Kind: Reuse, Window: w, Notify: NotifyOff} }
+func loud(w time.Duration) Policy           { return Policy{Kind: Reuse, Window: w, Notify: NotifyOn} }
+
+func (p Policy) withScope(s Scope) Policy { p.Scope = s; return p }
 
 var every = Policy{Kind: EveryTime}
 
@@ -131,6 +139,10 @@ func TestLooseningAttempts(t *testing.T) {
 		{"an unset level changes nothing", []Policy{{}, reuse(time.Hour, ScopeConnection), {}}, reuse(time.Hour, ScopeConnection)},
 		{"a wide level can't undo a narrow one, in either order", []Policy{reuse(time.Minute, ScopeConnection), reuse(8*time.Hour, ScopeInstance)}, reuse(time.Minute, ScopeConnection)},
 		{"same, reversed", []Policy{reuse(8*time.Hour, ScopeInstance), reuse(time.Minute, ScopeConnection)}, reuse(time.Minute, ScopeConnection)},
+		{"notify = true at any level keeps a grant announced", []Policy{quiet(time.Hour), loud(time.Hour)}, loud(time.Hour).withScope(ScopePeerSession)},
+		{"same, reversed", []Policy{loud(time.Hour), quiet(time.Hour)}, loud(time.Hour).withScope(ScopePeerSession)},
+		{"one quiet level silences levels with no opinion", []Policy{reuse(time.Hour, ScopeUnset), quiet(2 * time.Hour)}, quiet(time.Hour).withScope(ScopePeerSession)},
+		{"every-time leaves nothing to silence", []Policy{quiet(time.Hour), every}, every},
 	}
 	for _, c := range cases {
 		if got := Effective(c.levels...); got != c.want {
@@ -172,5 +184,16 @@ func TestReachWording(t *testing.T) {
 		if got := Reach(c.p, c.realm); got != c.want {
 			t.Errorf("Reach(%v, %s) = %q, want %q", c.p, c.realm.Name, got, c.want)
 		}
+	}
+}
+
+// policy explain says when reuses go unannounced.
+func TestDescribeSaysWhenQuiet(t *testing.T) {
+	vm := identity.Realm{Kind: "vm", Name: "dev", Peers: identity.PeersOpaque}
+	if got := Describe(Policy{Kind: Reuse, Window: 15 * time.Minute, Scope: ScopePeerSession}, vm); got != "one approval allows reuse for 15m by anything in VM dev" {
+		t.Errorf("got %q", got)
+	}
+	if got := Describe(Policy{Kind: Reuse, Window: 15 * time.Minute, Scope: ScopePeerSession, Notify: NotifyOff}, vm); got != "one approval allows reuse for 15m by anything in VM dev, without notifying" {
+		t.Errorf("got %q", got)
 	}
 }

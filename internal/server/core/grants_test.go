@@ -213,6 +213,94 @@ func TestReuseWithinWindowThenExpiry(t *testing.T) {
 	}
 }
 
+// notify = false is recorded on the grant, on each reuse and in the host's
+// view of it, so the menu-bar app can leave those reuses unannounced; any
+// other grant is never marked quiet.
+func TestQuietGrantIsMarkedOnEveryRecord(t *testing.T) {
+	for _, quiet := range []bool{true, false} {
+		p := reuse(15*time.Minute, policy.ScopePeerSession)
+		if quiet {
+			p.Notify = policy.NotifyOff
+		}
+		r := newRig(t, all(p), fake.Approve)
+		c := r.from("c1", "sid:10:100")
+		for range 2 {
+			if err := r.read(t, c, "github-pat"); err != nil {
+				t.Fatal(err)
+			}
+		}
+		granted := r.events(audit.TypeApprovalGranted)
+		reused := r.events(audit.TypeApprovalReused)
+		if len(granted) != 1 || len(reused) != 1 || granted[0].Approval.Quiet != quiet || reused[0].Approval.Quiet != quiet {
+			t.Fatalf("quiet=%v: granted %+v, reused %+v", quiet, granted, reused)
+		}
+		hg, _ := r.svc.HostGrants(c.Instance.Name)
+		if len(hg) != 1 || hg[0].Quiet != quiet {
+			t.Fatalf("quiet=%v: host grants %+v", quiet, hg)
+		}
+	}
+}
+
+// The host drops exactly the grants it names, by approval and, within a
+// batch approval, by resource; anything else, and any other instance's
+// grants, stay. Each drop is recorded from the host, even one that matched
+// nothing.
+func TestHostDropRemovesOnlyTheNamedGrants(t *testing.T) {
+	r := newRig(t, all(reuse(15*time.Minute, policy.ScopePeerSession)), fake.Approve, fake.Approve, fake.Approve)
+	c := r.from("c1", "sid:10:100")
+	if err := r.read(t, c, "github-pat", "npm-token"); err != nil { // one approval, two grants
+		t.Fatal(err)
+	}
+	if err := r.read(t, r.from("c2", "sid:10:200"), "github-pat"); err != nil { // another session's approval
+		t.Fatal(err)
+	}
+	inst := c.Instance.Name
+	hg, _ := r.svc.HostGrants(inst)
+	if len(hg) != 3 {
+		t.Fatalf("host grants %+v", hg)
+	}
+	batch := r.events(audit.TypeApprovalGranted)[0].Approval.ID
+	pat := audit.Resource{Kind: "secret", ID: "common:github-pat"}
+
+	ctx := context.Background()
+	if n, err := r.svc.DropHostGrants(ctx, "other", []HostDrop{{ApprovalID: batch}}); n != 0 || err != nil {
+		t.Fatalf("another instance's name dropped %d (%v)", n, err)
+	}
+	if n, err := r.svc.DropHostGrants(ctx, inst, []HostDrop{{ApprovalID: batch, Resource: &pat}}); n != 1 || err != nil {
+		t.Fatalf("drop one of the batch: %d %v", n, err)
+	}
+	hg, _ = r.svc.HostGrants(inst)
+	if len(hg) != 2 {
+		t.Fatalf("after dropping one: %+v", hg)
+	}
+	for _, g := range hg {
+		if g.ApprovalID == batch && g.Resource == pat {
+			t.Fatalf("dropped grant still live: %+v", g)
+		}
+	}
+	// The other session's grant of the same secret is untouched, and still reused.
+	if err := r.read(t, r.from("c3", "sid:10:200"), "github-pat"); err != nil || r.prompts() != 2 {
+		t.Fatalf("other grant: %v, %d prompts", err, r.prompts())
+	}
+	// The dropped one asks again.
+	if err := r.read(t, c, "github-pat"); err != nil || r.prompts() != 3 {
+		t.Fatalf("dropped grant: %v, %d prompts", err, r.prompts())
+	}
+
+	drops := r.events(audit.TypeGrantsDrop)
+	if len(drops) != 2 {
+		t.Fatalf("drop events %+v", drops)
+	}
+	d := drops[1]
+	if d.Origin != audit.OriginHostCLI || d.Instance != inst || d.Count != 1 || len(d.Resources) != 1 || d.Resources[0] != pat ||
+		d.Params["approval_ids"] != batch+"/common:github-pat" {
+		t.Fatalf("drop event %+v", d)
+	}
+	if drops[0].Count != 0 || drops[0].Instance != "other" {
+		t.Fatalf("no-op drop event %+v", drops[0])
+	}
+}
+
 // A grant is reused only when every component of its key matches; a
 // component that is missing never matches.
 func TestGrantKeyMismatchNeverReuses(t *testing.T) {
@@ -955,5 +1043,93 @@ func TestMissedSleepIsCaughtBeforeReuse(t *testing.T) {
 	r.clk.sleep(40 * time.Second)
 	if gs := r.grants(t, c); len(gs) != 0 {
 		t.Fatalf("grants listed after a missed sleep: %+v", gs)
+	}
+}
+
+// The host's grants snapshot is rewritten on a signal, so every change to
+// grants or to reuse health must send one, or the host would show grants
+// that are gone (design §8.6).
+func TestGrantsChangeIsSignalledOnEveryChange(t *testing.T) {
+	ctx := context.Background()
+	r := newRig(t, all(reuse(time.Hour, policy.ScopePeerSession)), fake.Approve, fake.Approve, fake.Approve, fake.Approve)
+	c := r.from("c1", "sid:10:100")
+	drain := func() {
+		select {
+		case <-r.svc.GrantsChanged():
+		default:
+		}
+	}
+	signalled := func(what string, want bool) {
+		t.Helper()
+		select {
+		case <-r.svc.GrantsChanged():
+			if !want {
+				t.Errorf("%s signalled a change", what)
+			}
+		default:
+			if want {
+				t.Errorf("%s changed grants without a signal", what)
+			}
+		}
+	}
+	host := func() []HostGrant {
+		gs, _ := r.svc.HostGrants("dev")
+		return gs
+	}
+
+	drain()
+	if err := r.read(t, c, "github-pat"); err != nil {
+		t.Fatal(err)
+	}
+	signalled("a grant", true)
+	if gs := host(); len(gs) != 1 || gs[0].Resource.ID != "common:github-pat" || gs[0].ScopeKey.PeerSession == nil {
+		t.Fatalf("host grants after a grant: %+v", gs)
+	}
+	if err := r.read(t, c, "github-pat"); err != nil {
+		t.Fatal(err)
+	}
+	signalled("a reuse", false)
+
+	if _, err := r.svc.DropGrants(ctx, c, nil); err != nil {
+		t.Fatal(err)
+	}
+	signalled("a drop", true)
+	if _, err := r.svc.DropGrants(ctx, c, nil); err != nil {
+		t.Fatal(err)
+	}
+	signalled("a drop of nothing", false)
+
+	r.read(t, c, "github-pat")
+	drain()
+	if err := r.svc.Wipe(ctx, WipeManual, nil); err != nil {
+		t.Fatal(err)
+	}
+	signalled("a wipe", true)
+	if gs := host(); len(gs) != 0 {
+		t.Fatalf("host grants after a wipe: %+v", gs)
+	}
+
+	r.read(t, c, "github-pat")
+	drain()
+	r.clk.advance(2 * time.Hour)
+	if gs := host(); len(gs) != 0 {
+		t.Fatalf("an expired grant is still listed: %+v", gs)
+	}
+	if err := r.svc.expire(ctx); err != nil {
+		t.Fatal(err)
+	}
+	signalled("an expiry", true)
+
+	r.svc.setHealthy(ctx, false, quiet)
+	signalled("events turning unhealthy", true)
+	if _, reuse := r.svc.HostGrants("dev"); reuse {
+		t.Error("reuse reported on while events are unhealthy")
+	}
+	r.svc.setHealthy(ctx, true, quiet)
+	signalled("events turning healthy", true)
+	r.svc.setHealthy(ctx, true, quiet)
+	signalled("events staying healthy", false)
+	if gs, _ := r.svc.HostGrants("other"); len(gs) != 0 {
+		t.Errorf("another instance lists dev's grants: %+v", gs)
 	}
 }
