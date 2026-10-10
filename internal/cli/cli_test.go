@@ -499,3 +499,70 @@ func TestConfigCheck(t *testing.T) {
 		t.Fatalf("bad config: %d %s", code, errb)
 	}
 }
+
+// The help is the same wherever the CLI runs: every command, grouped, and
+// every flag. Being in a realm or on a host hides nothing.
+func TestHelpListsEverythingGroupedEverywhere(t *testing.T) {
+	dir := t.TempDir()
+	cfg := filepath.Join(dir, "config.toml")
+	os.WriteFile(cfg, nil, 0o600)
+	realmHome := filepath.Join(dir, "realm")
+	os.Mkdir(realmHome, 0o700)
+	os.WriteFile(filepath.Join(realmHome, ".foca.sock"), nil, 0o600)
+	missing := filepath.Join(dir, "none.toml")
+	var first string
+	for name, vars := range map[string]map[string]string{
+		"realm by ~/.foca.sock": {"HOME": realmHome, "FOCA_CONFIG": missing},
+		"realm by FOCA_SOCK":    {"HOME": dir, "FOCA_SOCK": "/run/foca/relay.sock", "FOCA_CONFIG": missing},
+		"host":                  {"HOME": dir, "FOCA_CONFIG": cfg},
+		"both":                  {"HOME": realmHome, "FOCA_CONFIG": cfg},
+		"neither":               {"HOME": dir, "FOCA_CONFIG": missing},
+	} {
+		env, out, _ := testEnv(t, vars)
+		if code := Main(nil, env, "x"); code != 0 {
+			t.Fatalf("%s: exit %d", name, code)
+		}
+		help := out.String()
+		for _, s := range []string{"Commands:", "  get ", "--socket", "Host commands:", "  init ", "Host flags:", "--config", "Realm commands:", "relay serve"} {
+			if !strings.Contains(help, s) {
+				t.Errorf("%s: no %q in\n%s", name, s, help)
+			}
+		}
+		if first == "" {
+			first = help
+		} else if help != first {
+			t.Errorf("%s: the help differs:\n%s\nfrom:\n%s", name, help, first)
+		}
+	}
+}
+
+// In a realm a host command still runs and has its help. When it fails
+// there, a note says it belongs on the host; nothing else gets that note.
+func TestHostCommandsInARealmRunAndExplainThemselves(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, ".foca.sock"), nil, 0o600)
+	realm := map[string]string{"HOME": dir, "FOCA_CONFIG": filepath.Join(dir, "none.toml"), "FOCA_DATA_DIR": dir, "FOCA_RUNTIME_DIR": dir}
+	note := "init is a host command, and this looks like a realm (~/.foca.sock, no host config): run it on the host"
+
+	env, out, _ := testEnv(t, realm)
+	if code := Main([]string{"help", "init"}, env, "x"); code != 0 || !strings.Contains(out.String(), "Usage: foca init") {
+		t.Fatalf("help init: %d %q", code, out.String())
+	}
+	env, _, errb := testEnv(t, realm)
+	if code := Main([]string{"init"}, env, "x"); code != 1 || !strings.Contains(errb.String(), "none.toml") || !strings.Contains(errb.String(), note) {
+		t.Fatalf("init: %d %q", code, errb.String())
+	}
+
+	// A host with no realm socket: init fails the same way, without the note.
+	host := map[string]string{"HOME": t.TempDir(), "FOCA_CONFIG": filepath.Join(dir, "none.toml"), "FOCA_DATA_DIR": dir, "FOCA_RUNTIME_DIR": dir}
+	env, _, errb = testEnv(t, host)
+	if code := Main([]string{"init"}, env, "x"); code != 1 || strings.Contains(errb.String(), "host command") {
+		t.Fatalf("init on the host: %d %q", code, errb.String())
+	}
+	// A socket command failing in a realm is no host command.
+	vars := map[string]string{"HOME": dir, "FOCA_CONFIG": filepath.Join(dir, "none.toml"), "FOCA_SOCK": filepath.Join(dir, "nothing.sock")}
+	env, _, errb = testEnv(t, vars)
+	if code := Main([]string{"list"}, env, "x"); code != 1 || strings.Contains(errb.String(), "host command") {
+		t.Fatalf("list: %d %q", code, errb.String())
+	}
+}

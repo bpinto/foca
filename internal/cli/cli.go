@@ -82,13 +82,14 @@ func (e *Env) notify(ch chan<- os.Signal) (stop func()) {
 	return func() { signal.Stop(ch) }
 }
 
-// Globals are flags every command accepts.
+// Globals are flags every command accepts. Those in the host group locate the
+// host's config, data and sockets; a realm uses only --socket.
 type Globals struct {
-	Config     string `help:"Config file (env FOCA_CONFIG)." placeholder:"FILE"`
-	DataDir    string `help:"Data directory (env FOCA_DATA_DIR)." placeholder:"DIR"`
-	RuntimeDir string `help:"Runtime directory for sockets (env FOCA_RUNTIME_DIR)." placeholder:"DIR"`
+	Config     string `group:"host-flags" help:"Config file (env FOCA_CONFIG)." placeholder:"FILE"`
+	DataDir    string `group:"host-flags" help:"Data directory (env FOCA_DATA_DIR)." placeholder:"DIR"`
+	RuntimeDir string `group:"host-flags" help:"Runtime directory for sockets (env FOCA_RUNTIME_DIR)." placeholder:"DIR"`
 	Socket     string `help:"Client socket to use (env FOCA_SOCK)." placeholder:"PATH"`
-	Instance   string `short:"i" help:"Instance whose socket to use on the host (env FOCA_INSTANCE). With events, the instance to show."`
+	Instance   string `group:"host-flags" short:"i" help:"Instance whose socket to use (env FOCA_INSTANCE). With events, the instance to show."`
 
 	version string
 	// dialed is the socket the command connected to, and dialedOwn whether
@@ -97,33 +98,43 @@ type Globals struct {
 	dialedOwn bool
 }
 
+// CLI is every command. Ungrouped ones talk to a socket and work anywhere;
+// the help lists them first.
 type CLI struct {
 	Globals
 	ShowVersion kong.VersionFlag `name:"version" help:"Print the version."`
 
-	Serve        ServeCmd        `cmd:"" help:"Run the service for every instance in the config."`
-	Init         InitCmd         `cmd:"" help:"Create an encrypted vault (host)."`
-	Recover      RecoverCmd      `cmd:"" help:"Seal a vault's key again with the configured key protector, using its recovery key (host)."`
-	Rekey        RekeyCmd        `cmd:"" help:"Encrypt a vault again under a new key, with a new recovery key (host)."`
-	Add          AddCmd          `cmd:"" help:"Add a secret to a vault (host)."`
-	Edit         EditCmd         `cmd:"" help:"Change a secret's value or metadata (host)."`
-	Remove       RemoveCmd       `cmd:"" aliases:"rm" help:"Remove a secret from a vault (host)."`
-	List         ListCmd         `cmd:"" aliases:"ls" help:"List the secrets this realm can see."`
-	Get          GetCmd          `cmd:"" help:"Read secrets to a pipe or a file."`
-	Run          RunCmd          `cmd:"" help:"Run a command with secrets in its environment."`
-	Exec         ExecCmd         `cmd:"" help:"Run an action the host config offers here."`
-	Actions      ActionsCmd      `cmd:"" help:"List the actions this realm can run."`
-	Reload       ReloadCmd       `cmd:"" help:"Make the running service reload its config (host)."`
-	Lock         LockCmd         `cmd:"" help:"Drop every reuse grant now, so the next access asks again (host)."`
-	Stop         StopCmd         `cmd:"" help:"Stop the running service (host)."`
-	Policy       PolicyCmd       `cmd:"" help:"Explain the approval policy the config sets (host)."`
-	Config       ConfigCmd       `cmd:"" help:"Check a config file (host)."`
-	Events       EventsCmd       `cmd:"" help:"Query or follow the audit log (host)."`
-	Grants       GrantsCmd       `cmd:"" help:"List or drop your reuse grants."`
-	PolkitPolicy PolkitPolicyCmd `cmd:"" name:"polkit-policy" help:"Print the polkit action the polkit authenticator needs (host, Linux)."`
-	Relay        RelayCmd        `cmd:"" help:"The guest relay, run inside a realm: verified identity for its callers."`
-	Version      VersionCmd      `cmd:"" help:"Print the version."`
-	Help         HelpCmd         `cmd:"" help:"Show help for foca or a command."`
+	List    ListCmd    `cmd:"" aliases:"ls" help:"List the secrets this realm can see."`
+	Get     GetCmd     `cmd:"" help:"Read secrets to a pipe or a file."`
+	Run     RunCmd     `cmd:"" help:"Run a command with secrets in its environment."`
+	Exec    ExecCmd    `cmd:"" help:"Run an action the host config offers here."`
+	Actions ActionsCmd `cmd:"" help:"List the actions this realm can run."`
+	Grants  GrantsCmd  `cmd:"" help:"List or drop your reuse grants."`
+	Version VersionCmd `cmd:"" help:"Print the version."`
+	Help    HelpCmd    `cmd:"" help:"Show help for foca or a command."`
+
+	Serve        ServeCmd        `cmd:"" group:"host" help:"Run the service for every instance in the config."`
+	Init         InitCmd         `cmd:"" group:"host" help:"Create an encrypted vault."`
+	Recover      RecoverCmd      `cmd:"" group:"host" help:"Seal a vault's key again with the configured key protector, using its recovery key."`
+	Rekey        RekeyCmd        `cmd:"" group:"host" help:"Encrypt a vault again under a new key, with a new recovery key."`
+	Add          AddCmd          `cmd:"" group:"host" help:"Add a secret to a vault."`
+	Edit         EditCmd         `cmd:"" group:"host" help:"Change a secret's value or metadata."`
+	Remove       RemoveCmd       `cmd:"" group:"host" aliases:"rm" help:"Remove a secret from a vault."`
+	Reload       ReloadCmd       `cmd:"" group:"host" help:"Make the running service reload its config."`
+	Lock         LockCmd         `cmd:"" group:"host" help:"Drop every reuse grant now, so the next access asks again."`
+	Stop         StopCmd         `cmd:"" group:"host" help:"Stop the running service."`
+	Policy       PolicyCmd       `cmd:"" group:"host" help:"Explain the approval policy the config sets."`
+	Config       ConfigCmd       `cmd:"" group:"host" help:"Check a config file."`
+	Events       EventsCmd       `cmd:"" group:"host" help:"Query or follow the audit log."`
+	PolkitPolicy PolkitPolicyCmd `cmd:"" group:"host" name:"polkit-policy" help:"Print the polkit action the polkit authenticator needs (Linux)."`
+
+	Relay RelayCmd `cmd:"" group:"realm" help:"The guest relay: verified identity for the realm's callers."`
+}
+
+var groups = []kong.Group{
+	{Key: "host", Title: "Host commands:", Description: "Run where the service and vaults are."},
+	{Key: "realm", Title: "Realm commands:", Description: "Run inside a VM or container."},
+	{Key: "host-flags", Title: "Host flags:"},
 }
 
 type exitCode int
@@ -137,6 +148,7 @@ func Parser(cli *CLI, e *Env) (*kong.Kong, error) {
 		kong.Writers(e.Stdout, e.Stderr),
 		kong.Exit(func(code int) { panic(exitCode(code)) }),
 		kong.UsageOnError(),
+		kong.ExplicitGroups(groups),
 		kong.ConfigureHelp(kong.HelpOptions{Compact: true}),
 	)
 }
@@ -182,6 +194,9 @@ func Main(args []string, e *Env, version string) (code int) {
 		}
 		// Errors can carry the service's own message.
 		fmt.Fprintln(e.Stderr, "foca:", cleanLines(err.Error()))
+		if note := misplaced(kctx, cli.Globals.where(e)); note != "" {
+			fmt.Fprintln(e.Stderr, "foca:", note)
+		}
 		return 1
 	}
 	return 0

@@ -120,6 +120,11 @@ One Go binary, `foca`:
 - `foca serve` runs the service for one instance.
 - All other subcommands are the CLI. The same binary is cross-compiled for `linux/arm64` (the
   VMs) and `darwin/arm64` (the host).
+- The help lists every command, grouped: those that talk to a socket, the host commands
+  (§6.2) and the realm's (`relay`). A host command that fails where `FOCA_SOCK` or
+  `~/.foca.sock` is set and there's no host config adds a note that it belongs on the host.
+  That guess only words the note; nothing about access depends on it: a socket refuses
+  host-only methods, and host commands need the host's config and keys.
 
 One small Swift binary, `foca-darwin`, wraps the macOS APIs Go can't reach without cgo:
 LocalAuthentication, Keychain, and the IOKit / DistributedNotificationCenter sleep and lock
