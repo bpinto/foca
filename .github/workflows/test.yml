@@ -6,13 +6,16 @@ on:
     # A tag must pass too before the release workflow publishes it.
     tags: ["v*"]
   pull_request:
+    # Adding release-preview runs the tests, then release.yml publishes pr-<N>.
+    types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # Other labels run nothing and cancel nothing.
+  group: ${{ github.workflow }}-${{ github.ref }}${{ github.event.action == 'labeled' && github.event.label.name != 'release-preview' && '-label' || '' }}
   cancel-in-progress: true
 
 env:
@@ -20,6 +23,7 @@ env:
 
 jobs:
   linux:
+    if: github.event.action != 'labeled' || github.event.label.name == 'release-preview'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -49,6 +53,7 @@ jobs:
   # The flake: the package builds and the NixOS and home-manager modules
   # produce what foca needs (nix/checks.nix).
   nix:
+    if: github.event.action != 'labeled' || github.event.label.name == 'release-preview'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -56,6 +61,7 @@ jobs:
       - run: nix flake check
 
   macos:
+    if: github.event.action != 'labeled' || github.event.label.name == 'release-preview'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -107,3 +113,74 @@ jobs:
             echo "$out"
             echo "$out" | grep -q "no approval prompt can be shown"
           fi
+
+  # A pull request labelled release-preview: its release archives, built in
+  # its own run and signed ad hoc, for release.yml to publish as pr-<N>.
+  preview-linux:
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      contains(github.event.pull_request.labels.*.name, 'release-preview') &&
+      (github.event.action != 'labeled' || github.event.label.name == 'release-preview')
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: build
+        env:
+          PR: ${{ github.event.pull_request.number }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          FOCA_VERSION=$(scripts/release-version.sh "pr.$PR" "$SHA")
+          export FOCA_VERSION
+          scripts/build-linux.sh "${{ matrix.arch }}" "$RUNNER_TEMP/out"
+          scripts/package.sh "linux-${{ matrix.arch }}" "$RUNNER_TEMP/out"
+          if [ "${{ matrix.arch }}" = amd64 ]; then
+            [ "$("$RUNNER_TEMP/out/foca" version)" = "foca $FOCA_VERSION" ]
+          fi
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: foca-linux-${{ matrix.arch }}
+          path: foca-linux-${{ matrix.arch }}.tar.gz
+          retention-days: 3
+
+  preview-macos:
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      contains(github.event.pull_request.labels.*.name, 'release-preview') &&
+      (github.event.action != 'labeled' || github.event.label.name == 'release-preview')
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: build
+        env:
+          PR: ${{ github.event.pull_request.number }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          FOCA_VERSION=$(scripts/release-version.sh "pr.$PR" "$SHA")
+          export FOCA_VERSION
+          scripts/build-darwin.sh "$RUNNER_TEMP/out"
+          [ "$("$RUNNER_TEMP/out/foca" version)" = "foca $FOCA_VERSION" ]
+          scripts/package.sh darwin-arm64 "$RUNNER_TEMP/out"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: foca-darwin-arm64
+          path: foca-darwin-arm64.tar.gz
+          retention-days: 3

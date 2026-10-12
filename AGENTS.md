@@ -216,14 +216,22 @@ run `nix build`, and copy the hash it prints.
 
 ## Releases
 
-`.github/workflows/release.yml` runs after `test` passes for a push, and builds through
+`.github/workflows/release.yml` runs after `test` passes, and builds through
 `scripts/build-linux.sh` and `scripts/build-darwin.sh` (which pins the signed helper into
-`foca`):
+`foca`), packed by `scripts/package.sh`. It always runs as it is on `main`, whatever the pull
+request changed:
 
 - every commit on `main` replaces the assets of the rolling `tip` pre-release, versioned
-  `<next patch>-tip.<commit date, UTC, YYYYMMDD>+<sha>`; an older commit never
-  replaces a newer one;
-- a `vX.Y.Z` tag publishes that release.
+  `<next patch>-tip.<commit date, UTC, YYYYMMDD>+<sha>`. `tip` only moves to a commit on
+  `main`, never back along it; after a force push, the rewritten history takes it over;
+- a `vX.Y.Z` tag publishes that release;
+- a pull request from a branch here, labelled `release-preview`, gets the rolling `pr-<N>`
+  pre-release of its head, `<next patch>-pr.<N>.<date>+<sha>`, rebuilt on every push and
+  force push. Its code is unreviewed, so its archives are built by its own `test` run, with
+  no secrets and in its own cache scope, and `release.yml` only publishes them (signed ad
+  hoc: the Keychain asks again when you switch to it). Only people with triage or write
+  access can add labels, and a fork's pull request never publishes.
+  `pr-release-cleanup.yml` deletes it when the pull request closes or loses the label.
 
 Assets: `foca-darwin-arm64.tar.gz` (`foca` and `foca-darwin`), `foca-linux-amd64.tar.gz`,
 `foca-linux-arm64.tar.gz` and `SHA256SUMS`. Never ship a `foca` built any other way on

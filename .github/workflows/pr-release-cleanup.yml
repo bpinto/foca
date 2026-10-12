@@ -1,0 +1,36 @@
+name: pr-release cleanup
+
+# Deletes a pull request's pr-<N> pre-release and its tag (release.yml) when
+# the pull request closes or loses its release-preview label.
+
+on:
+  pull_request:
+    types: [closed, unlabeled]
+
+permissions:
+  contents: read
+
+jobs:
+  delete:
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      (github.event.action == 'closed' || github.event.label.name == 'release-preview')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: pr-${{ github.event.pull_request.number }}
+    steps:
+      - run: |
+          set -eu
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release delete "$TAG" --yes --cleanup-tag
+            echo "deleted the $TAG release and tag"
+          elif gh api "repos/$GH_REPO/git/refs/tags/$TAG" > /dev/null 2>&1; then
+            gh api -X DELETE "repos/$GH_REPO/git/refs/tags/$TAG"
+            echo "deleted the $TAG tag"
+          else
+            echo "no $TAG release"
+          fi

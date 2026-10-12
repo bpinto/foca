@@ -1,14 +1,18 @@
 name: release
 
-# Publishes binaries once the test workflow has passed for a push:
+# Publishes binaries once the test workflow has passed:
 #
 # - main: the rolling "tip" pre-release, rebuilt for every commit and
-#   versioned <next patch>-tip.<commit date, UTC, YYYYMMDD>+<sha>;
+#   versioned <next patch>-tip.<commit date, UTC, YYYYMMDD>+<sha>. A force
+#   push to main moves it to the rewritten history.
 # - a v* tag: a stable release of that version. For vX.Y.Z (not a
 #   pre-release), its macOS archive is then pinned in nix/darwin-release.nix
 #   on main by a commit of this workflow's.
-#
-# Pull requests never publish anything.
+# - a pull request from a branch of this repository, labelled
+#   release-preview: the rolling "pr-<N>" pre-release of its head, versioned
+#   <next patch>-pr.<N>.<commit date>+<sha> and signed ad hoc. Its archives
+#   are built by its own test run (test.yml) and only published here.
+#   pr-release-cleanup.yml deletes it.
 #
 # macOS builds go through scripts/build-darwin.sh, which signs foca-darwin
 # and pins its sha256 into foca. With these secrets the helper is signed with
@@ -35,7 +39,7 @@ jobs:
   plan:
     if: >-
       github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.event == 'push' &&
+      (github.event.workflow_run.event == 'push' || github.event.workflow_run.event == 'pull_request') &&
       github.event.workflow_run.head_repository.full_name == github.repository
     runs-on: ubuntu-latest
     outputs:
@@ -43,31 +47,52 @@ jobs:
       version: ${{ steps.plan.outputs.version }}
       tag: ${{ steps.plan.outputs.tag }}
       previous: ${{ steps.plan.outputs.previous }}
+      pr: ${{ steps.plan.outputs.pr }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event.workflow_run.event == 'push'
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
           fetch-depth: 0
       - id: plan
         env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          EVENT: ${{ github.event.workflow_run.event }}
           REF: ${{ github.event.workflow_run.head_branch }}
           SHA: ${{ github.event.workflow_run.head_sha }}
+          RUN: ${{ github.event.workflow_run.id }}
+          # Empty for a pull request from a fork.
+          PR: ${{ github.event.workflow_run.pull_requests[0].number }}
         run: |
           set -eu
-          if [ "$REF" = main ]; then
-            # The newest stable tag this commit contains; pre-release tags
-            # don't count.
-            last=$(git tag --merged "$SHA" --list 'v*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1 || true)
-            if [ -n "$last" ]; then
-              IFS=. read -r major minor patch <<< "${last#v}"
-              base="$major.$minor.$((patch + 1))"
-            else
-              base=0.1.0
+          if [ "$EVENT" = pull_request ]; then
+            # The pull request's own test run built its archives (test.yml);
+            # nothing of it runs here.
+            if [ -z "$PR" ]; then
+              echo "kind=skip" >> "$GITHUB_OUTPUT"
+              echo "not a pull request from this repository: nothing to publish"
+              exit 0
             fi
-            # The commit's date, not the build's, so a rebuild of the same
-            # commit gets the same version.
-            date=$(TZ=UTC git show -s --format=%cd --date=format-local:%Y%m%d "$SHA")
-            { echo kind=tip; echo tag=tip; echo "version=$base-tip.$date+${SHA:0:7}"; } >> "$GITHUB_OUTPUT"
+            # A run whose jobs were all skipped (another label) still succeeds.
+            jobs=$(gh api "repos/$GH_REPO/actions/runs/$RUN/jobs" --jq '[.jobs[].conclusion] | unique | join(",")')
+            if [ "$jobs" != success ]; then
+              echo "kind=skip" >> "$GITHUB_OUTPUT"
+              echo "the test run's jobs ended $jobs: nothing to publish"
+              exit 0
+            fi
+            # Only the current head of an open pull request with the label.
+            ok=$(gh api "repos/$GH_REPO/pulls/$PR" | jq --arg sha "$SHA" --arg repo "$GH_REPO" \
+              '.state == "open" and .head.sha == $sha and .head.repo.full_name == $repo and any(.labels[]; .name == "release-preview")')
+            if [ "$ok" != true ]; then
+              echo "kind=skip" >> "$GITHUB_OUTPUT"
+              echo "pull request #$PR is closed, unlabelled, from elsewhere, or past $SHA: nothing to publish"
+              exit 0
+            fi
+            { echo kind=pr; echo "tag=pr-$PR"; echo "pr=$PR"; } >> "$GITHUB_OUTPUT"
+          elif [ "$REF" = main ]; then
+            { echo kind=tip; echo tag=tip; echo "version=$(scripts/release-version.sh tip "$SHA")"; } >> "$GITHUB_OUTPUT"
           elif [ "$(git rev-parse -q --verify "refs/tags/$REF^{commit}" || true)" = "$SHA" ] &&
                echo "$REF" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
             # The release notes start from the newest stable tag before this
@@ -82,7 +107,7 @@ jobs:
 
   linux:
     needs: plan
-    if: needs.plan.outputs.kind != 'skip'
+    if: needs.plan.outputs.kind == 'tip' || needs.plan.outputs.kind == 'release'
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -91,6 +116,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
@@ -99,8 +125,7 @@ jobs:
           FOCA_VERSION: ${{ needs.plan.outputs.version }}
         run: |
           scripts/build-linux.sh "${{ matrix.arch }}" "$RUNNER_TEMP/out"
-          cp LICENSE README.md "$RUNNER_TEMP/out/"
-          tar -czf "foca-linux-${{ matrix.arch }}.tar.gz" -C "$RUNNER_TEMP/out" foca LICENSE README.md
+          scripts/package.sh "linux-${{ matrix.arch }}" "$RUNNER_TEMP/out"
       - if: matrix.arch == 'amd64'
         run: '[ "$("$RUNNER_TEMP/out/foca" version)" = "foca ${{ needs.plan.outputs.version }}" ]'
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -110,12 +135,13 @@ jobs:
 
   macos:
     needs: plan
-    if: needs.plan.outputs.kind != 'skip'
+    if: needs.plan.outputs.kind == 'tip' || needs.plan.outputs.kind == 'release'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
@@ -147,8 +173,7 @@ jobs:
         run: |
           scripts/build-darwin.sh "$RUNNER_TEMP/out"
           [ "$("$RUNNER_TEMP/out/foca" version)" = "foca $FOCA_VERSION" ]
-          cp LICENSE README.md "$RUNNER_TEMP/out/"
-          tar -czf foca-darwin-arm64.tar.gz -C "$RUNNER_TEMP/out" foca foca-darwin LICENSE README.md
+          scripts/package.sh darwin-arm64 "$RUNNER_TEMP/out"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: foca-darwin-arm64
@@ -156,9 +181,17 @@ jobs:
 
   publish:
     needs: [plan, linux, macos]
+    # A pull request's archives come from its test run, so linux and macos
+    # are skipped for it.
+    if: >-
+      always() && needs.plan.result == 'success' &&
+      (needs.plan.outputs.kind == 'pr' ||
+       ((needs.plan.outputs.kind == 'tip' || needs.plan.outputs.kind == 'release') &&
+        needs.linux.result == 'success' && needs.macos.result == 'success'))
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      actions: read
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
@@ -168,43 +201,92 @@ jobs:
       SHA: ${{ github.event.workflow_run.head_sha }}
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: env.KIND != 'pr'
         with:
           path: dist
           merge-multiple: true
-      - name: checksums
-        run: cd dist && sha256sum -- *.tar.gz > SHA256SUMS && cat SHA256SUMS
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: env.KIND == 'pr'
+        with:
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+          pattern: foca-*
+          path: dist
+          merge-multiple: true
+      - name: assets
+        run: |
+          set -eu
+          # Exactly the three archives, as regular files: a pull request's
+          # run chose what it uploaded.
+          want="foca-darwin-arm64.tar.gz foca-linux-amd64.tar.gz foca-linux-arm64.tar.gz"
+          got=$(find dist -mindepth 1 -printf '%P\n' | sort | tr '\n' ' ' | sed 's/ $//')
+          if [ "$got" != "$want" ] || [ "$(find dist -mindepth 1 -type f | wc -l)" != 3 ]; then
+            echo "expected $want in dist, got: $got"
+            exit 1
+          fi
+          cd dist && sha256sum -- *.tar.gz > SHA256SUMS && cat SHA256SUMS
+      # tip and pr-<N> are rolling: their tag is moved and their assets
+      # replaced.
       - name: tip
+        id: tip
         if: env.KIND == 'tip'
         run: |
           set -eu
-          # Test runs can finish out of order; never move tip back to an
-          # older commit. The commit needn't be main's head: commits this
-          # workflow pushes (the Nix pin below) start no runs of their own.
-          on_main=$(gh api "repos/$GH_REPO/compare/$SHA...main" --jq .status)
+          # tip only moves to a commit on main, never back along it. Once its
+          # commit is no longer on main (a force push), any commit on main
+          # may take it. The commit needn't be main's head: the Nix pin
+          # commit below starts no run.
+          status() { gh api "repos/$GH_REPO/compare/$1...$2" --jq .status; }
+          on_main=$(status "$SHA" main)
           if [ "$on_main" != ahead ] && [ "$on_main" != identical ]; then
             echo "$SHA is no longer on main; not publishing it"
             exit 0
           fi
           if cur=$(gh api "repos/$GH_REPO/git/ref/tags/tip" --jq .object.sha 2> /dev/null); then
-            newer=$(gh api "repos/$GH_REPO/compare/$cur...$SHA" --jq .status)
-            if [ "$newer" != ahead ] && [ "$newer" != identical ]; then
-              echo "tip is at $cur, newer than $SHA; leaving it there"
-              exit 0
+            cur_on_main=$(status "$cur" main)
+            if [ "$cur_on_main" = ahead ] || [ "$cur_on_main" = identical ]; then
+              newer=$(status "$cur" "$SHA")
+              if [ "$newer" != ahead ] && [ "$newer" != identical ]; then
+                echo "tip is at $cur, newer on main than $SHA; leaving it there"
+                exit 0
+              fi
+            else
+              echo "tip is at $cur, which main no longer has (rewritten); moving it"
             fi
           fi
-          if gh api "repos/$GH_REPO/git/refs/tags/tip" > /dev/null 2>&1; then
-            gh api -X PATCH "repos/$GH_REPO/git/refs/tags/tip" -f sha="$SHA" -F force=true > /dev/null
-          else
-            gh api "repos/$GH_REPO/git/refs" -f ref=refs/tags/tip -f sha="$SHA" > /dev/null
+          echo go=true >> "$GITHUB_OUTPUT"
+          echo "TITLE=tip $VERSION" >> "$GITHUB_ENV"
+          { echo "NOTES<<EOF"; echo "Built from $SHA on main. A pre-release: it changes with every commit to main."; echo; echo "Version: \`$VERSION\`"; echo EOF; } >> "$GITHUB_ENV"
+      - name: pr
+        id: pr
+        if: env.KIND == 'pr'
+        env:
+          PR: ${{ needs.plan.outputs.pr }}
+        run: |
+          set -eu
+          # Checked again: still the head, open and labelled.
+          ok=$(gh api "repos/$GH_REPO/pulls/$PR" | jq --arg sha "$SHA" --arg repo "$GH_REPO" \
+            '.state == "open" and .head.sha == $sha and .head.repo.full_name == $repo and any(.labels[]; .name == "release-preview")')
+          if [ "$ok" != true ]; then
+            echo "pull request #$PR is closed, unlabelled, or past $SHA; not publishing it"
+            exit 0
           fi
-          notes="Built from $SHA on main. A pre-release: it changes with every commit to main.
-
-          Version: \`$VERSION\`"
-          if gh release view tip > /dev/null 2>&1; then
-            gh release upload tip dist/* --clobber
-            gh release edit tip --prerelease --title "tip $VERSION" --notes "$notes"
+          echo go=true >> "$GITHUB_OUTPUT"
+          { echo "TITLE=pr-$PR ${SHA:0:7}"; echo "NOTES=Built from $SHA in pull request #$PR, unreviewed and signed ad hoc. A pre-release: it changes with every push to the pull request; \`foca version\` names the build."; } >> "$GITHUB_ENV"
+      - name: rolling
+        if: steps.tip.outputs.go == 'true' || steps.pr.outputs.go == 'true'
+        run: |
+          set -eu
+          if gh api "repos/$GH_REPO/git/refs/tags/$TAG" > /dev/null 2>&1; then
+            gh api -X PATCH "repos/$GH_REPO/git/refs/tags/$TAG" -f sha="$SHA" -F force=true > /dev/null
           else
-            gh release create tip dist/* --prerelease --verify-tag --title "tip $VERSION" --notes "$notes"
+            gh api "repos/$GH_REPO/git/refs" -f ref="refs/tags/$TAG" -f sha="$SHA" > /dev/null
+          fi
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+            gh release edit "$TAG" --prerelease --title "$TITLE" --notes "$NOTES"
+          else
+            gh release create "$TAG" dist/* --prerelease --verify-tag --title "$TITLE" --notes "$NOTES"
           fi
       - name: release
         if: env.KIND == 'release'

@@ -1970,8 +1970,8 @@ internal/ids/             sortable ids
 internal/format/          output formatters: raw, json, env
 helpers/darwin/           Swift package: foca-darwin
 scripts/                  build-darwin.sh (signed helper, pinned into foca), build-linux.sh
-.github/workflows/        test (every push and pull request), release (tip from main, v* tags, then the
-                          macOS Nix pin on main)
+.github/workflows/        test (every push and pull request), release (tip from main, v* tags, labelled
+                          pull requests' pr-<N>, then the macOS Nix pin on main), pr-release-cleanup
 nix/                      the Linux package, the macOS package (the release archive, installed unchanged),
                           NixOS module (host: polkit action, TPM access and ptrace
                           hardening), the home-manager module (config, and systemd user units on Linux or
