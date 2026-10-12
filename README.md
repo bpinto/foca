@@ -221,7 +221,7 @@ keep_files        = 16            # rotated files kept, 1-1000
 
 ## Menu-bar app (macOS)
 
-<img width="406" height="386" alt="Screenshot 2026-10-12 at 16 01 08" src="https://github.com/user-attachments/assets/064df9ff-467e-45e8-b99a-5494f5d15068" />
+<img width="360" height="340" alt="Screenshot 2026-10-12 at 16 05 01" src="https://github.com/user-attachments/assets/230e085c-bb59-41a7-af3c-b331fd9c1102" />
 
 `Foca.app` shows each running service's live grants, how long they have left and how often
 they were used, the last day's activity with repeats folded together, and a
