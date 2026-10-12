@@ -23,8 +23,8 @@ func parsePolicy(r *rawPolicy) (policy.Policy, error) {
 	}
 	switch r.Approval {
 	case "every-time":
-		if r.Window != nil || r.Scope != "" {
-			return policy.Policy{}, errors.New(`approval = "every-time" takes no window or scope`)
+		if r.Window != nil || r.Scope != "" || r.Notify != nil {
+			return policy.Policy{}, errors.New(`approval = "every-time" takes no window, scope or notify`)
 		}
 		return policy.Policy{Kind: policy.EveryTime}, nil
 	case "reuse":
@@ -42,6 +42,12 @@ func parsePolicy(r *rawPolicy) (policy.Policy, error) {
 				return policy.Policy{}, err
 			}
 			p.Scope = s
+		}
+		if r.Notify != nil {
+			p.Notify = policy.NotifyOff
+			if *r.Notify {
+				p.Notify = policy.NotifyOn
+			}
 		}
 		return p, nil
 	case "":

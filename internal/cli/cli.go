@@ -78,7 +78,7 @@ func (e *Env) notify(ch chan<- os.Signal) (stop func()) {
 		e.Signals(ch)
 		return func() {}
 	}
-	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGUSR1)
+	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGUSR1, syscall.SIGUSR2)
 	return func() { signal.Stop(ch) }
 }
 

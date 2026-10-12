@@ -188,6 +188,7 @@ internal/identity/        verified and reported identity types
 internal/fsutil/          trusted-file checks, private dirs, atomic writes, locks
 internal/svcctl/          serve.pid, the instance lock, and verified signalling (reload, lock, stop)
 helpers/darwin/           foca-darwin (Swift): Touch ID, Keychain, sleep and lock events
+apps/macos/               Foca.app (Swift), the menu-bar app: grants, activity, reuse notifications
 nix/                      packages (Linux from source, macOS the release archive), NixOS module (host),
                           home-manager module (systemd or launchd), flake checks
 ```
@@ -209,8 +210,8 @@ nix flake check                                         # the package and the Ni
 On a Mac: `scripts/build-darwin.sh`, then `FOCA_HELPER=$PWD/bin/foca-darwin go test
 ./internal/plugin/helper/...` runs the helper conformance suite; add
 `FOCA_HELPER_INTERACTIVE=1` and `-run Interactive` for the Touch ID and screen-lock tests,
-which need a person at the Mac. CI runs the Linux
-matrix, `nix flake check` and the macOS suite on every push (`.github/workflows/test.yml`).
+which need a person at the Mac. `cd apps/macos && swift test` runs the menu-bar app's tests.
+CI runs the Linux matrix, `nix flake check` and the macOS suite on every push (`.github/workflows/test.yml`).
 After changing `go.mod`, update `vendorHash` in `nix/package.nix`: set it to `lib.fakeHash`,
 run `nix build`, and copy the hash it prints.
 
@@ -233,11 +234,11 @@ request changed:
   access can add labels, and a fork's pull request never publishes.
   `pr-release-cleanup.yml` deletes it when the pull request closes or loses the label.
 
-Assets: `foca-darwin-arm64.tar.gz` (`foca` and `foca-darwin`), `foca-linux-amd64.tar.gz`,
+Assets: `foca-darwin-arm64.tar.gz` (`foca`, `foca-darwin` and `Foca.app`), `foca-linux-amd64.tar.gz`,
 `foca-linux-arm64.tar.gz` and `SHA256SUMS`. Never ship a `foca` built any other way on
 macOS: without the build script it has no helper pin and runs no helper. The
 `MACOS_CERT_P12`, `MACOS_CERT_PASSWORD` and `MACOS_SIGN_IDENTITY` secrets sign the helper
-with a Developer ID; without them it is signed ad hoc.
+and `Foca.app` with a Developer ID; without them they are signed ad hoc.
 
 The Nix package for macOS installs a published release archive, pinned in
 `nix/darwin-release.nix`. After publishing a `vX.Y.Z` release, the workflow pins it there with

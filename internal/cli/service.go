@@ -23,7 +23,8 @@ type ServeCmd struct {
 	Only []string `help:"Serve only this instance; repeat for more. Instances that read a vault in common must be served by one process." placeholder:"INSTANCE"`
 }
 
-// Run serves until SIGINT or SIGTERM. SIGUSR1 (foca lock) drops every grant.
+// Run serves until SIGINT or SIGTERM. SIGUSR1 (foca lock) drops every grant,
+// and SIGUSR2 (foca grants --host --drop) the grants the host named.
 // SIGHUP reloads the config: a config
 // that fails to load or wire keeps the old one running. A good one replaces
 // the running service, which closes open connections and cancels pending
@@ -60,6 +61,11 @@ func (c *ServeCmd) Run(g *Globals, e *Env) error {
 		return err
 	}
 	defer pids.release()
+	// A request left by a process that has gone names grants that went with
+	// it.
+	for _, inst := range cfg.Instances {
+		svcctl.TakeDropRequests(paths.DropDir(inst.Name))
+	}
 
 	for {
 		select {
@@ -69,6 +75,10 @@ func (c *ServeCmd) Run(g *Globals, e *Env) error {
 				if err := b.Core.Wipe(background(), core.WipeManual, nil); err != nil {
 					log.Error("audit failed for lock", "err", err)
 				}
+				continue
+			}
+			if s == syscall.SIGUSR2 {
+				takeDrops(b, cfg, paths, log)
 				continue
 			}
 			if s != syscall.SIGHUP {
@@ -354,4 +364,28 @@ func (c *ConfigCheckCmd) Run(g *Globals, e *Env) error {
 	}
 	fmt.Fprintf(e.Stderr, "config %s is valid\n", path)
 	return nil
+}
+
+// takeDrops applies the host's requests to drop single grants (foca grants
+// --host --drop, design §8.6), for every instance this process serves.
+func takeDrops(b *wiring.Built, cfg *config.Config, paths config.Paths, log *slog.Logger) {
+	for _, inst := range cfg.Instances {
+		targets, errs := svcctl.TakeDropRequests(paths.DropDir(inst.Name))
+		for _, err := range errs {
+			log.Error("drop request", "instance", inst.Name, "err", err)
+		}
+		if len(targets) == 0 {
+			continue
+		}
+		drops := make([]core.HostDrop, len(targets))
+		for i, t := range targets {
+			drops[i].ApprovalID = t.ApprovalID
+			if t.Kind != "" {
+				drops[i].Resource = &audit.Resource{Kind: t.Kind, ID: t.Name}
+			}
+		}
+		if _, err := b.Core.DropHostGrants(background(), inst.Name, drops); err != nil {
+			log.Error("audit failed for grants.drop", "err", err)
+		}
+	}
 }

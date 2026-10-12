@@ -103,6 +103,18 @@ func (p Paths) PIDFile(instance string) string {
 	return filepath.Join(p.InstanceDir(instance), "serve.pid")
 }
 
+// GrantsFile is where a service keeps the snapshot of an instance's live
+// grants for the host (design §8.6).
+func (p Paths) GrantsFile(instance string) string {
+	return filepath.Join(p.InstanceDir(instance), "grants.json")
+}
+
+// DropDir holds the host's requests to drop single grants of an instance,
+// which its service takes on SIGUSR2 (design §8.6).
+func (p Paths) DropDir(instance string) string {
+	return filepath.Join(p.InstanceDir(instance), "drop")
+}
+
 // LockFile is the lock a service holds for every instance it serves, so no
 // other process can serve it at the same time.
 func (p Paths) LockFile(instance string) string {

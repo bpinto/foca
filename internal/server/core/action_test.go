@@ -230,7 +230,7 @@ func TestActionGrantCoversOnlyItsParams(t *testing.T) {
 	if len(reused) != 1 || reused[0].Params["profile"] != "dev-admin" || reused[0].Resource.ID != "aws" {
 		t.Fatalf("reused %+v", reused)
 	}
-	if !strings.Contains(r.auth.Requests()[0].Prompt, "15m, anything in this VM") {
+	if !strings.Contains(r.auth.Requests()[0].Prompt, "15m · whole VM") {
 		t.Fatalf("prompt %q", r.auth.Requests()[0].Prompt)
 	}
 	// Other values ask again.

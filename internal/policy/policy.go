@@ -96,12 +96,48 @@ const (
 	Reuse
 )
 
+// Notify says whether the host is told of each reuse of a grant (design
+// §8.7). Only NotifyOff silences it, so a policy with no opinion notifies.
+type Notify int
+
+const (
+	// NotifyUnset has no opinion. It folds like the loosest value, but
+	// notifies unless another level says NotifyOff.
+	NotifyUnset Notify = iota
+	// NotifyOn is notify = true: no level can silence the grant.
+	NotifyOn
+	// NotifyOff is notify = false: reuses are recorded, but not announced.
+	NotifyOff
+)
+
+// rank orders values for folding, strictest first.
+func (n Notify) rank() int {
+	switch n {
+	case NotifyOn:
+		return 0
+	case NotifyOff:
+		return 1
+	}
+	return 2
+}
+
+func stricterNotify(a, b Notify) Notify {
+	if a.rank() <= b.rank() {
+		return a
+	}
+	return b
+}
+
 // Policy is one level's setting, or the folded result.
 type Policy struct {
 	Kind   Kind
 	Window time.Duration // Reuse only
 	Scope  Scope         // Reuse only
+	Notify Notify        // Reuse only
 }
+
+// Quiet reports whether reuses of a grant made under p go unannounced.
+func (p Policy) Quiet() bool { return p.Kind == Reuse && p.Notify == NotifyOff }
 
 // Floor is the hard cap in code (design §9.2). Not configurable.
 var Floor = Policy{Kind: Reuse, Window: MaxReuseWindow, Scope: ScopePeerSession}
@@ -116,7 +152,7 @@ func Meet(a, b Policy) Policy {
 	case a.Kind == EveryTime || b.Kind == EveryTime:
 		return Policy{Kind: EveryTime}
 	}
-	return Policy{Kind: Reuse, Window: min(a.Window, b.Window), Scope: narrower(a.Scope, b.Scope)}
+	return Policy{Kind: Reuse, Window: min(a.Window, b.Window), Scope: narrower(a.Scope, b.Scope), Notify: stricterNotify(a.Notify, b.Notify)}
 }
 
 // Effective folds the configured levels, in any order. Nothing configured
@@ -152,7 +188,7 @@ func AtMost(a, b Policy) bool {
 	case b.Kind == EveryTime:
 		return false
 	}
-	return a.Window <= b.Window && a.Scope.width() <= b.Scope.width()
+	return a.Window <= b.Window && a.Scope.width() <= b.Scope.width() && a.Notify.rank() <= b.Notify.rank()
 }
 
 // String is the config-like form, for logs and tests.
@@ -166,6 +202,12 @@ func (p Policy) String() string {
 	s := "reuse " + FormatWindow(p.Window)
 	if p.Scope != ScopeUnset {
 		s += " " + p.Scope.String()
+	}
+	switch p.Notify {
+	case NotifyOn:
+		s += " notify"
+	case NotifyOff:
+		s += " quiet"
 	}
 	return s
 }
@@ -183,25 +225,21 @@ func FormatWindow(d time.Duration) string {
 }
 
 // Reach says how long and for whom an approval under p is reused, or "" if
-// approving creates no grant: "15m, anything in this VM". It is the
+// approving creates no grant: "15m · whole VM". It is the
 // prompt's ⏱️ line (design §4.1.1), which comes after the line naming the
 // realm, so it says "this VM" rather than naming the realm again.
 func Reach(p Policy, realm identity.Realm) string {
 	if p.Kind != Reuse {
 		return ""
 	}
-	return FormatWindow(p.Window) + ", " + whoHere(p.Scope, realm)
+	return FormatWindow(p.Window) + " · " + whoHere(p.Scope, realm)
 }
 
 // whoHere is who, for a prompt that has already named the realm.
 func whoHere(s Scope, realm identity.Realm) string {
-	anything := "anything on this host"
-	switch n := realm.Noun(); n {
-	case "":
-	case "remote host":
-		anything = "anything on this remote host"
-	default:
-		anything = "anything in this " + n
+	whole := "whole host"
+	if n := realm.Noun(); n != "" {
+		whole = "whole " + n
 	}
 	switch s {
 	case ScopeConnection:
@@ -209,11 +247,11 @@ func whoHere(s Scope, realm identity.Realm) string {
 	case ScopePeerSession:
 		if realm.Peers == identity.PeersOpaque {
 			// The host sees only the proxy, so the session is the whole realm.
-			return anything
+			return whole
 		}
 		return "this session"
 	default:
-		return anything
+		return whole
 	}
 }
 
@@ -222,7 +260,11 @@ func Describe(p Policy, realm identity.Realm) string {
 	if p.Kind != Reuse {
 		return "asks every time"
 	}
-	return fmt.Sprintf("one approval allows reuse for %s %s", FormatWindow(p.Window), who(p.Scope, realm))
+	s := fmt.Sprintf("one approval allows reuse for %s %s", FormatWindow(p.Window), who(p.Scope, realm))
+	if p.Quiet() {
+		s += ", without notifying"
+	}
+	return s
 }
 
 func who(s Scope, realm identity.Realm) string {

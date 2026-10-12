@@ -212,6 +212,7 @@ func (s *Service) ask(ctx context.Context, c Call, a ask, release func()) (*audi
 		if grants {
 			exp := now.Add(a.policy.Window)
 			ap.ExpiresAt = &exp
+			ap.Quiet = a.policy.Quiet()
 		} else if a.policy.Kind == policy.Reuse {
 			// A wipe, or unhealthy events, while the prompt was open:
 			// this request is served, but nothing is reused.
@@ -489,7 +490,8 @@ func (s *Service) approved(c Call, a ask, ap *audit.Approval, grants bool) {
 		res := audit.Resource{Kind: r.Kind, ID: r.ID}
 		s.grants[grantKey{resource: res, params: params, scope: a.policy.Scope, key: a.key}] = &grant{
 			approvalID: ap.ID, resource: res, params: copyParams(a.params), scope: a.policy.Scope, key: a.key,
-			grantedAt: *ap.GrantedAt, expiresAt: *ap.ExpiresAt,
+			grantedAt: *ap.GrantedAt, expiresAt: *ap.ExpiresAt, quiet: ap.Quiet,
 		}
 	}
+	s.changed()
 }

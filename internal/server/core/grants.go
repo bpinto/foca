@@ -74,13 +74,15 @@ type grant struct {
 	key       ScopeKey
 	grantedAt time.Time
 	expiresAt time.Time
+	// quiet grants are reused without telling the host (notify = false).
+	quiet bool
 }
 
 func (g *grant) approval(authenticator string) *audit.Approval {
 	granted, expires := g.grantedAt, g.expiresAt
 	return &audit.Approval{
 		ID: g.approvalID, Mode: audit.ModeReused, Authenticator: authenticator,
-		Scope: g.scope.String(), ScopeKey: g.key.audit(), GrantedAt: &granted, ExpiresAt: &expires,
+		Scope: g.scope.String(), ScopeKey: g.key.audit(), GrantedAt: &granted, ExpiresAt: &expires, Quiet: g.quiet,
 	}
 }
 
@@ -147,4 +149,51 @@ func (s *Service) Grants(ctx context.Context, c Call) ([]GrantInfo, error) {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Resource.ID < out[j].Resource.ID })
 	return out, nil
+}
+
+// HostGrant describes a live grant to the host (design §8.6).
+type HostGrant struct {
+	Resource   audit.Resource
+	Params     map[string]string
+	Scope      string
+	ScopeKey   *audit.ScopeKey
+	ApprovalID string
+	GrantedAt  time.Time
+	ExpiresAt  time.Time
+	Quiet      bool
+}
+
+// changed signals that grants or reuse health changed. A signal already
+// pending covers this one: the reader takes the state as it is then.
+func (s *Service) changed() {
+	select {
+	case s.grantsChanged <- struct{}{}:
+	default:
+	}
+}
+
+// GrantsChanged receives after any change to grants or reuse health. One
+// receive can stand for several changes.
+func (s *Service) GrantsChanged() <-chan struct{} { return s.grantsChanged }
+
+// HostGrants lists every live grant of instance, whoever it belongs to, and
+// whether grants can be made and reused now. It is for the host's snapshot,
+// which no realm can read, so it costs no token.
+func (s *Service) HostGrants(instance string) (grants []HostGrant, reuse bool) {
+	now := s.wall()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, g := range s.grants {
+		if g.key.Instance == instance && now.Before(g.expiresAt) {
+			grants = append(grants, HostGrant{Resource: g.resource, Params: copyParams(g.params), Scope: g.scope.String(),
+				ScopeKey: g.key.audit(), ApprovalID: g.approvalID, GrantedAt: g.grantedAt, ExpiresAt: g.expiresAt, Quiet: g.quiet})
+		}
+	}
+	sort.Slice(grants, func(i, j int) bool {
+		if grants[i].Resource.ID != grants[j].Resource.ID {
+			return grants[i].Resource.ID < grants[j].Resource.ID
+		}
+		return grants[i].ApprovalID < grants[j].ApprovalID
+	})
+	return grants, s.healthy
 }

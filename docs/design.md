@@ -32,7 +32,8 @@ Goals
 5. **Every access recorded** as versioned structured events, ready for a later UI
    (`foca events query` / `follow`, §8.5).
 
-Non-goals for now: the UI itself, syncing between machines, sharing between users, Windows.
+Non-goals for now: approving in a UI (the macOS menu-bar app only shows, §8.7), syncing
+between machines, sharing between users, Windows.
 
 ---
 
@@ -318,7 +319,7 @@ foca is trying to share:
 🔑 GitHub PAT
 🖥️ VM dev
 ❔ gh via claude (unverified)
-⏱️ 15m, anything in this VM
+⏱️ 15m · whole VM
 ```
 
 The first line is `share:` for a read and `run:` for an action. Each line after it is left
@@ -331,7 +332,7 @@ out when it has nothing to say, in this order:
 | `🖥️` / `🚢` / `🌐` | `{instance}`: a VM, a container or a remote host; none for a host-local client | `🖥️ VM dev`, `🚢 container web` |
 | `👤` | host-verified `{program}` and `{via}` | `👤 gh via claude` (sealed), `👤 gh ⚠ via claude` (`gh` not sealed) |
 | `❔` | claimed `{program}` and `{via}` | `❔ npm via claude (unverified)` |
-| `⏱️` | `{reach}`, if approving creates a grant | `⏱️ 15m, anything in this VM` |
+| `⏱️` | `{reach}`, if approving creates a grant | `⏱️ 15m · whole VM` |
 | `🚫` | recent denials (§9.6) | `🚫 denied 2 times` |
 | `🔕` | the instance's unanswered prompts (§9.6) | `🔕 1 prompt unanswered` |
 
@@ -889,6 +890,8 @@ the host, working directly on host files:
 | `stop` | sends `SIGTERM`, or uses launchctl / systemctl | no |
 | `config check` | parses a config file as `serve` would, without trusting or using it (Nix checks generated configs with it) | no |
 | `events` | reads the audit log (§8.5) | no |
+| `grants --host` | reads each service's grants snapshot, trusting it only while a verified service holds the instance's pid file (§8.6) | no |
+| `grants --host --drop` | writes a request naming the grants into the instance's private `drop` directory, then sends `SIGUSR2` (§8.6) | no (tightening) |
 
 - **The service is read-only on vaults.** It re-reads a vault when the file's identity, size
   or mtime changes, so the CLI's edits apply to the next request. A bug in the service can't
@@ -896,7 +899,8 @@ the host, working directly on host files:
 - **Signals go only to a verified service.** A service records its pid in
   `<runtime>/<instance>/serve.pid` (0600, inside the 0700 instance dir) for each instance it
   serves. `reload`, `lock` and `stop` signal every running service once, or with `-i` the one
-  serving that instance. Before signalling, the CLI pins the process (a pidfd on Linux, its
+  serving that instance; `grants --host --drop` signals the ones holding the grants it
+  names. Before signalling, the CLI pins the process (a pidfd on Linux, its
   pid version on macOS, checked again just before `kill`), matches its start time, and
   checks that its executable is foca (its name, on Linux, since a service hides its
   executable) and that it runs as the same uid.
@@ -1144,11 +1148,14 @@ env         = { HOME = "/Users/bruno", PATH = "/usr/bin:/bin" }
   approval = "reuse"
   window   = "15m"
   scope    = "peer-session"
+  notify   = false                 # reused on every AWS call: don't announce each (§8.7)
 ```
 
 In this example, reading `common:github-pat` from `dev` folds instance 30m, vault 2h and
 authenticator 1h, which gives reuse for 30m within `peer-session`. Reading
 `common:prod-db-password` from `work` is always every-time, whatever the other levels say.
+`aws-creds` grants are reused without a notification, unless another level says
+`notify = true`.
 
 ---
 
@@ -1236,7 +1243,8 @@ Appending uses `O_APPEND` plus `fsync` before the request continues.
   never its other arguments.
 - **`approval.mode`** is `fresh`, `reused` or `none`. `none` is for methods that need no
   approval. Reused events point at the original grant's `approval.id`, so a UI can draw "1
-  touch → 7 reads".
+  touch → 7 reads". **`approval.quiet`** is `true` on a grant made under `notify = false`
+  (§9.1), and on each of its reuses: the menu-bar app doesn't announce them (§8.7).
 - **`count`** is what the event itself counts: the grants a `lock` or `grants.drop` removed,
   the secrets a `secret.list` returned. **`coalesced`** appears only on an event that stands
   for a burst of others like it (§9.6), e.g. `"coalesced": {"count": 41, "after_seq": 1042}`:
@@ -1323,6 +1331,140 @@ file directly. `--from-seq` lets a viewer backfill and then go live without gaps
 interface keeps `Query` and `Follow` (§4.7) so a later SQLite sink fits behind the same
 commands.
 
+### 8.6 Grants on the host
+
+Grants live only in the memory of the `serve` process (§9.5), and the host CLI reaches that
+process only through signals (§6.2). `grants.status` shows a caller its own grants; to show
+the host every live grant, each service writes a snapshot.
+
+- **The file.** `<runtime>/<instance>/grants.json`, 0600 in the 0700 instance dir, next to
+  `serve.pid`. It is replaced atomically whenever that instance's grants change (one is made,
+  dropped, wiped or expires) and when reuse turns on or off with platform-event health
+  (D13). A service writes it, empty, when it starts serving an instance, and removes it when
+  it stops. Like the pid file it only has to outlive the process, so a write that is in place
+  but not yet durable will do.
+- **What it holds.**
+  `{"v": 1, "instance", "written_at", "reuse", "grants": [{kind, name, params?, scope,
+  scope_key, approval_id, granted_at, expires_at, quiet?}]}`: names and the fields of an event's
+  `approval` block (§8.1), never values. `reuse` is false while no grant can be made or
+  reused. `approval_id` finds the `approval.granted` event, which names who was approved.
+- **`foca grants --host`** reads the snapshot of every instance with a pid file in the runtime
+  directory, or of `--instance` (the flag only, as for `events`). It trusts a file only while
+  a verified service holds that instance's pid file (§6.2): a file a crash left behind names
+  grants that no longer exist, so the instance is reported as not running. Grants past
+  `expires_at` that the service hasn't swept yet are left out. `-f json` prints one line per
+  instance, `{instance, running, reuse, written_at, grants, error?}`, for programs such as
+  the menu-bar app (§8.7). It needs no approval and isn't audited (like `grants.status`, it
+  changes nothing and reads no secret), and it never talks to a socket.
+- **Dropping one grant.** `foca grants --host --drop APPROVAL_ID[/NAME]…` drops grants of any
+  caller, which `grants.drop` over a socket never can: a realm only ever drops its own. It
+  only removes access, so it needs no approval, and it adds nothing a process running as the
+  user couldn't already do with `foca lock`. A signal carries no data, so the CLI finds the
+  instance holding each grant in the snapshots, writes a request
+  `{"v": 1, "grants": [{approval_id, kind?, name?}]}` (at most 32) into
+  `<runtime>/<instance>/drop/` (0700; the file 0600, written atomically and named by a fresh
+  id), and sends `SIGUSR2` to that verified service (§6.2). The service takes a request
+  only from a private file of its user in a private directory, named as the CLI names them,
+  that decodes strictly and names well-formed grants. It removes every request it looks
+  at, and logs the ones it refuses. It drops exactly the grants named: the approval, and
+  within a batch approval the resource. A later grant of the same resource has another
+  approval ID, so it is never hit. Like a wipe, it drops even when the event can't be
+  recorded, the safe direction, and records `grants.drop` with `origin: host-cli`, the
+  instance, the dropped `resources` and their count, and the IDs it was asked for in
+  `params.approval_ids`. A request left by a service that has gone names grants that went
+  with it; a service clears them when it starts. The CLI reports the drop only once the
+  snapshot shows the grants gone, and fails after 5 s otherwise.
+- **A view, not an authority.** The service never reads the file back, and nothing decides on
+  it. A failed write is logged and the old file removed, so a viewer says it can't tell rather
+  than show grants that are gone. Requests aren't refused over it: the audit log, not the
+  snapshot, is the record (D10).
+
+### 8.7 The menu-bar app (macOS)
+
+`Foca.app` is a menu-bar app, with no Dock icon. It shows what foca is doing, and it tells
+the user when a grant is reused, since a reuse shows no Touch ID prompt. It is a viewer: it
+holds no keys, reads no secrets, and does nothing a host CLI user couldn't. It runs host
+commands as child processes and reads their JSON:
+
+| It shows | From |
+|---|---|
+| live grants, with time left, for the instances that have any | `foca grants --host -f json`, after each event and every 15 s |
+| how often each live grant was used, and when last | `secret.read` and `action.run` events, from the same query and `follow` |
+| recent activity, one row per request, folded by grant, about five rows with the rest scrolling | `foca events query --since 24h` (the last 300 events), then `foca events follow` |
+| a notification for each reuse, unless its grant is quiet or muted | `approval.reused` events from the same `follow` |
+| a "Revoke all grants" item, and a revoke button on each grant | `foca lock` (§6.2), `foca grants --host --drop` (§8.6) |
+
+- **It runs the CLI and never parses the files.** Rotation, the no-gap rule and escaping
+  (§8.5), and the pid-file check (§8.6), come from `foca`. `audit.jsonl` and `grants.json`
+  keep one reader each.
+- **Finding foca.** `FOCA_BIN` in the app's environment (the home-manager agent sets it),
+  else the `foca` next to `Foca.app` (the release archive), else `bin/foca` next to the
+  `Applications` directory that holds it (the Nix package). foca's paths are its defaults
+  (§7), as for the home-manager `serve` agent; a service started with other paths needs the
+  same `FOCA_*` variables in the app's environment.
+- **Running it.** From the release archive, by opening `Foca.app`. With Nix, the macOS package
+  installs it in `Applications`, and the home-manager option `services.foca.menuBar.enable`
+  runs it as a launchd agent in the GUI session; quitting from the menu keeps it quit.
+- **A notification comes after the fact.** `approval.reused` is recorded before the value is
+  served (D10), so the notification arrives as the value is used, or after. It is for
+  awareness and protects nothing: the controls are the grant window and the wipes (§9.5), and
+  nothing may depend on the user seeing it.
+- **Trusted text only.** A notification names the resource (an action with its params), the
+  instance, and the verified peer (`peer.verified.name`, its realm), as the prompt does
+  (§4.1.1). `client.reported` is never shown in one: a notification can't carry the
+  `(unverified)` marking the prompt gives it. Text is decoded from JSON, where foca escaped
+  non-printing runes (§8.5), so the app applies the prompt's rules again: a program name
+  keeps only `[A-Za-z0-9._+-]` (`identity.DisplayName`), and other text loses its
+  non-printing runes and is shortened.
+- **Bursts.** Reuses are grouped by `approval.id`. The first notifies at once; later ones in
+  the next 60 s replace it with a count ("`aws-creds` reused 14× by ssh (vm dev) in the last
+  minute") rather than adding more.
+- **Silencing.** A reuse shows no prompt, so its notification is the only live sign of it;
+  silencing trades that for less noise, for a grant something reuses all the time. There are
+  two ways, and neither changes what is recorded or shown in the menu. `notify = false` in a
+  reuse policy (§9.1) is the host's: the grant and its reuses carry `approval.quiet` (§8.1)
+  and the snapshot `quiet` (§8.6), and the grant's bell starts crossed out. The config sets
+  where a grant starts; the bell on each grant flips it until that grant ends: it mutes a
+  grant, or turns a quiet one on. A choice names one grant (its `approval_id` and resource),
+  so a new approval of the same secret starts from the config again. Choices are kept across
+  restarts, and cover the reuses summed up after one. Nothing a realm sends can silence
+  anything.
+- **Restarts and gaps.** The app keeps the last seq it has shown. On start it follows from
+  the next one, and folds the reuses it missed into one summary ("6 reuses while Foca wasn't
+  running"). When `follow` stops with an error (rotation removed files it hadn't read, §8.5),
+  when foca can't be found, or when notifications are turned off for Foca, the menu-bar icon
+  shows a warning and the menu says why. After an error it follows again from the newest
+  event. For notifications the menu also offers the fix: asking macOS again when it never
+  asked (or the request failed), else opening Foca's page in System Settings, since after a
+  denial macOS never shows its prompt again.
+- **Only what matters.** An instance with no grants is left out of the menu, unless its service
+  runs and its grants can't be read. Each grant says how often it was used and when last
+  ("Used 3× · last 2m ago"): the access it was approved for and each reuse, as its activity
+  row counts them. These are the `secret.read` and `action.run` events served under that
+  grant (its `approval_id` and resource), so a later grant of the same secret starts at none.
+  The line opens to list the uses, newest first: when, whether it was the approved access or a
+  reuse, and by which program; the app keeps a grant's latest 50, shows 10 and counts the
+  rest. On start the app reads them from the last 24 hours, which cover any live grant's
+  window.
+  In recent activity a request is one row: its approval event and each `secret.read` or
+  `action.run` share a `request_id`, so the row names what was read or run and by whom, and
+  says how it ended: approved (with a prompt), reused, denied, timed out, or the outcome of
+  a failed serve. A row then folds the requests allowed under one grant by the same program
+  (one `approval.id`, from its approval through its reuses), and otherwise those that read
+  alike and ended alike, with a count ("5×") that opens to list each one and its time.
+  Allowed and refused requests never share a row, and a refused or failed one is shown in
+  red. Events of no request, such as `lock`, are rows of their own. Colour is kept for what
+  needs noticing: the status dot (watching, needs attention, not running), how a request
+  ended, a muted or quiet grant's bell, and warnings. Routine things, such as a grant's kind,
+  its time left and a `lock`, are grey. The icons are pixel art
+  (`scripts/pixelart`): a padlock whose body is a seal's face, its keyhole the seal's nose.
+  The menu-bar one has a "!" while the menu has a warning.
+- **Building and signing.** A SwiftPM package in `apps/macos`. `scripts/build-darwin.sh`
+  assembles it into `Foca.app` (bundle id `io.github.bpinto.foca`, `LSUIElement`) and signs it
+  with the helper's identity and the hardened runtime. Local notifications need only a bundle
+  id, so an ad-hoc signature is enough. `foca-darwin` stays a separate binary; once it
+  becomes the bundle's executable (§5), the pin covers that file.
+
 ---
 
 ## 9. Approval policy
@@ -1336,10 +1478,14 @@ Each level holds one `Policy` value, or nothing at all.
 ```
 Policy  = Unset                              -- "no opinion" (table omitted)
         | EveryTime                          -- fresh approval for each access
-        | Reuse{window: Duration, scope: Scope}
+        | Reuse{window: Duration, scope: Scope, notify: Notify}
 Scope   = request < connection < peer-session < instance
                                          (narrow → wide)
+Notify  = on < off < unset               -- notify = true | false | left out
 ```
+
+`notify` says whether the host is told of each reuse: the menu-bar app notifies unless the
+grant is quiet (§8.7). Only `off` silences, so a policy that leaves it out notifies.
 
 A scope name says **who vouches for it**. No name means different things on different
 transports without saying so.
@@ -1366,14 +1512,15 @@ name says:
    wins". `grants.drop` is the only thing a caller can do to its grants.
 5. **The prompt states how far the approval reaches.** If approving creates a grant, the
    prompt's `⏱️` line says for how long and for whom, after the line naming the realm:
-   `⏱️ 15m, anything in this VM`, `⏱️ 1h, this session` or `⏱️ 45s, this connection`.
+   `⏱️ 15m · whole VM`, `⏱️ 1h · this session` or `⏱️ 45s · this connection`.
 6. **`foca policy explain` states the same reach.** It runs on the host CLI, reading config only
    and prints the effective policy for every secret and action in plain words, naming the
-   realm (`one approval allows reuse for 15m by anything in VM dev`), so you can check what
-   the config means before anything is approved.
+   realm (`one approval allows reuse for 15m by anything in VM dev`, ending `, without
+   notifying` for a quiet one), so you can check what the config means before anything is
+   approved.
 7. **The audit log shows scope and key.** Each grant and reuse event carries `scope` and the
    key components with their trust level, so a later UI can show "1 touch → 7 reads, all from
-   VM dev".
+   VM dev", and `quiet` when its reuses go unannounced.
 
 ### 9.2 Levels folded together
 
@@ -1396,14 +1543,17 @@ that doesn't exist yet has no effect until it is added.
 ```
 meet(Unset, x)                 = x
 meet(EveryTime, x)             = EveryTime
-meet(Reuse a, Reuse b)         = Reuse{min(a.window,b.window), narrower(a.scope,b.scope)}
+meet(Reuse a, Reuse b)         = Reuse{min(a.window,b.window), narrower(a.scope,b.scope),
+                                       stricter(a.notify,b.notify)}
 effective = meet(level1, level2, level3) ; if Unset → EveryTime ; then meet(…, code floor)
 ```
 
 A `Reuse` level may leave out `scope`: it then has no opinion on scope, folds like the widest
 one, and the floor caps it at `peer-session`. `window` is required with `reuse`. After the
 floor, a window under the minimum or a `request` scope (a grant nothing could reuse) becomes
-`EveryTime`; the evaluator only ever narrows.
+`EveryTime`; the evaluator only ever narrows. `notify` folds the same way: `notify = true` at
+any level keeps a grant announced, and otherwise one level's `notify = false` makes it
+quiet. Like reuse itself, quiet is opt-in where it is set, and any other level can veto it.
 
 `meet` is commutative, associative and idempotent, and `meet(x, y) ⊑ x` holds for every `y`.
 So **adding a level, or any setting at any level, can never loosen the result**. A
@@ -1423,7 +1573,7 @@ What follows:
 
 - `MaxReuseWindow = 8h`, `MinReuseWindow = 1s`. Config values outside this range are
   **rejected** at load time. The evaluator clamps as well, as defence in depth.
-- `approval = "every-time"` with a `window` or `scope` set is a config error, and so is
+- `approval = "every-time"` with a `window`, `scope` or `notify` set is a config error, and so is
   `approval = "reuse"` without a `window`.
 - `[authenticators.<name>.policy]` names a known authenticator. Only the configured one
   applies; the others are allowed so a config can switch authenticators and keep them.
@@ -1930,6 +2080,7 @@ Format: context → decision → consequences. Short on purpose.
 | D18 | No ported third-party code | Clean implementation, no notices to carry | Everything is written and tested here |
 | D20 | Instances, vaults and actions are separate objects; separate-per-realm by default, sharing explicit | Users choose anything from strict separation to "everything everywhere" without weakening the default | Exposure rules and their config errors must be tested |
 | D21 | CLI: `kong` for commands, `charmbracelet/huh` for interactive prompts; secret values read with `golang.org/x/term` | The owner prefers a polished interactive UX. Secret values stay in zeroable `[]byte`, which a `huh` field (a Go string) can't give | Larger dependency tree, also present in the VM copy of the binary; prompts only on a TTY, so agents and scripts never see one |
+| D22 | The menu-bar app runs host commands; `serve` writes a grants snapshot for the host to read | No admin socket (D4), one reader per file format, and a viewer that can't do more than the host CLI | The host's grants view is as fresh as the last snapshot, and is trusted only while the service holds its pid file (§8.6) |
 
 ### D18: No third-party code is ported
 
@@ -1969,13 +2120,17 @@ internal/svcctl/          serve.pid, the instance lock, and verified signalling 
 internal/ids/             sortable ids
 internal/format/          output formatters: raw, json, env
 helpers/darwin/           Swift package: foca-darwin
-scripts/                  build-darwin.sh (signed helper, pinned into foca), build-linux.sh
+apps/macos/               Swift package: Foca.app, the menu-bar app (§8.7)
+scripts/                  build-darwin.sh (signed helper, pinned into foca, and Foca.app), build-linux.sh,
+                          package.sh (release archives), release-version.sh (tip and pr-<N> versions),
+                          pixelart/ (draws Foca.app's icons from text grids into apps/macos/Resources)
 .github/workflows/        test (every push and pull request), release (tip from main, v* tags, labelled
                           pull requests' pr-<N>, then the macOS Nix pin on main), pr-release-cleanup
 nix/                      the Linux package, the macOS package (the release archive, installed unchanged),
                           NixOS module (host: polkit action, TPM access and ptrace
                           hardening), the home-manager module (config, and systemd user units on Linux or
-                          launchd agents on macOS), and the flake checks that evaluate them
+                          launchd agents on macOS, with the menu-bar app if asked for), and the flake
+                          checks that evaluate them
 flake.nix                 dev shell (go, gopls, socat; dbus for the logind and polkit tests; bubblewrap and
                           FOCA_POLKITD to run the real polkitd in tests; swtpm and FOCA_SWTPM for the
                           TPM tests; gcc only for `go test -race`); the package, the modules and
@@ -2059,6 +2214,11 @@ noted; packages are named as in `go test` output (`main` is `cmd/foca`, whose te
 | paging and filters | `audit.TestQueryPagesAcrossRotatedFiles`, `cli.TestEventsQueryPages`, `cli.TestEventsQueryFilters`, `cli.TestEventsFilterFlagsAreChecked` |
 | backfill + live with no gaps, across writers and rotations | `audit.TestFollowBackfillsThenStreamsWithoutGap`, `audit.TestLogFollowSeesEveryWriterAcrossRotations`, `audit.TestLogFollowRefusesAGapLeftByRemovedFiles`, `audit.TestJSONLSeqUniqueAcrossProcesses` |
 | recorded names can't act on the terminal | `cli.TestEventsPrintNonPrintingRunesEscaped` |
+| the host's grants view follows every change; a file without a live service isn't trusted | `core.TestGrantsChangeIsSignalledOnEveryChange`, `server.TestGrantsSnapshotFollowsEveryChange`, `cli.TestHostGrantsTrustsOnlyALiveService` |
+| the menu-bar app shows only host fields, with names cleaned as the prompt does (on a Mac, in CI) | `FocaKitTests.ReuseTests.testNotificationTextComesOnlyFromHostFields`, `FocaKitTests.ReuseTests.testPeerWordingSanitisesWhatTheProcessChose`, `FocaKitTests.NamesTests` |
+| a reuse is silenced only by the host: `notify = false` folded stricter-wins, or a mute from the menu that ends with its grant; quiet grants are marked on every record | `policy.TestLooseningAttempts`, `config.TestNotifyTrueAtAnyLevelBeatsNotifyFalse`, `core.TestQuietGrantIsMarkedOnEveryRecord`, `cli.TestHostGrantsShowQuietGrants`, `FocaKitTests.UsageTests.testAQuietGrantIsReadAsQuiet`, `FocaKitTests.UsageTests.testQuietAndMutedReusesDontNotify`, `FocaKitTests.UsageTests.testAQuietGrantCanBeTurnedOnFromTheMenu` |
+| the menu never folds a refused request into an allowed one, and shows it in red; a request is one row (on a Mac, in CI) | `FocaKitTests.ActivityTests` |
+| the host drops exactly the grants it names, from private, well-formed requests only, recorded from the host | `core.TestHostDropRemovesOnlyTheNamedGrants`, `svcctl.TestDropRequestsTakeOnlyPrivateWellFormedFiles`, `cli.TestHostDropDropsOneGrant` |
 
 The real-polkitd tests need `FOCA_POLKITD` and bubblewrap, and the TPM tests `FOCA_SWTPM`;
 without them they skip (the dev shell and CI set both). The Nix modules are checked by
@@ -2079,9 +2239,13 @@ without them they skip (the dev shell and CI set both). The Nix modules are chec
 - User presence for the vault key on Linux: the TPM binds it to the machine and its boot
   state, not to a touch (a FIDO2 key's `hmac-secret` would add that, §12.4). The first seal
   takes the TPM's storage key on trust; an endorsement-key certificate chain would anchor it.
+- In the menu-bar app (§8.7): approving, and settings for foca's paths.
 
 **Not verified on real hardware or desktops**
 
+- `Foca.app` has not run on a Mac yet; CI builds and signs it and runs its unit tests. Still
+  to see: its notifications under an ad-hoc signature, whether macOS keeps their permission
+  across rebuilds, and the menu under the home-manager agent.
 - On a Mac: the interactive helper tests (a real Touch ID approve and deny, a screen lock;
   `FOCA_HELPER_INTERACTIVE=1`), whether the dialog says "foca" (§4.1.1), and NSWorkspace
   session notifications under a launchd agent. CI's macOS runner has no Touch ID, so its

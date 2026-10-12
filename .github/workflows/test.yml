@@ -73,6 +73,7 @@ jobs:
         run: |
           scripts/build-darwin.sh "$RUNNER_TEMP/bin"
           codesign -dv "$RUNNER_TEMP/bin/foca-darwin"
+          codesign -dv "$RUNNER_TEMP/bin/Foca.app"
           echo "FOCA_HELPER_BIN=$RUNNER_TEMP/bin/foca-darwin" >> "$GITHUB_ENV"
       # The helper stores vault keys in the default keychain. A runner's
       # login keychain may be locked, so use a throwaway one.
@@ -91,6 +92,10 @@ jobs:
       # against the Go fake here.
       - run: go test -count=1 ./...
       - run: go test -count=1 -tags foca_testing ./...
+      # The menu-bar app's logic: event and grant decoding, the name rules,
+      # reuse grouping (apps/macos/Tests).
+      - name: menu-bar app tests
+        run: cd apps/macos && swift test
       # The conformance suite against the real helper. A runner has no
       # Touch ID, so the interactive tests skip.
       - name: helper conformance

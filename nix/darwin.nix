@@ -1,6 +1,7 @@
 # foca for macOS: the release archive, installed as it is. foca-darwin is
 # signed, and foca runs it only if its sha256 matches the pin built into foca
-# (design §5), so nothing here may strip, patch or re-sign either binary.
+# (design §5), so nothing here may strip, patch or re-sign either binary, or
+# Foca.app.
 { lib, stdenvNoCC, fetchurl }:
 
 let
@@ -25,6 +26,11 @@ stdenvNoCC.mkDerivation {
   installPhase = ''
     runHook preInstall
     install -Dm755 -t $out/bin foca foca-darwin
+    # The menu-bar app, signed as built; releases before it have none.
+    if [ -d Foca.app ]; then
+      mkdir -p $out/Applications
+      cp -R Foca.app $out/Applications/
+    fi
     runHook postInstall
   '';
   meta = {

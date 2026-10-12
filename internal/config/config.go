@@ -288,6 +288,7 @@ type rawPolicy struct {
 	Approval string    `toml:"approval"`
 	Window   *duration `toml:"window"`
 	Scope    string    `toml:"scope"`
+	Notify   *bool     `toml:"notify"`
 }
 
 type rawInstance struct {

@@ -57,10 +57,19 @@ in
         Instances that read a vault in common must be in one service.
       '';
     };
+
+    menuBar.enable = lib.mkEnableOption ''
+      the menu-bar app on macOS (design §8.7): live grants, recent activity, and a
+      notification when a grant is reused, which shows no Touch ID prompt. It needs a
+      package that ships Foca.app'';
   };
 
   config = lib.mkIf cfg.enable (lib.mkMerge [
     {
+      assertions = [{
+        assertion = cfg.menuBar.enable -> pkgs.stdenv.hostPlatform.isDarwin;
+        message = "services.foca.menuBar is for macOS only.";
+      }];
       home.packages = [ cfg.package ];
       xdg.configFile."foca/config.toml".source = configFile;
     }
@@ -109,6 +118,23 @@ in
           StandardErrorPath = "${config.home.homeDirectory}/Library/Logs/${name}.log";
         };
       }) cfg.processes;
+    })
+
+    (lib.mkIf (pkgs.stdenv.hostPlatform.isDarwin && cfg.menuBar.enable) {
+      launchd.agents.foca-menu-bar = {
+        enable = true;
+        domain = "gui";
+        config = {
+          ProgramArguments = [ "${cfg.package}/Applications/Foca.app/Contents/MacOS/Foca" ];
+          # The foca it runs: this package's, with the config home-manager
+          # writes to foca's default path.
+          EnvironmentVariables.FOCA_BIN = foca;
+          RunAtLoad = true;
+          # Quit from the menu exits 0 and stays quit.
+          KeepAlive.SuccessfulExit = false;
+          ProcessType = "Interactive";
+        };
+      };
     })
   ]);
 }

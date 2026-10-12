@@ -24,6 +24,7 @@ import (
 	"github.com/bpinto/foca/internal/identity"
 	"github.com/bpinto/foca/internal/plugin"
 	"github.com/bpinto/foca/internal/server/core"
+	"github.com/bpinto/foca/internal/svcctl"
 )
 
 type Options struct {
@@ -60,6 +61,7 @@ type Server struct {
 	stopOnce  sync.Once
 	done      chan struct{}
 	guardDone <-chan struct{}
+	snapDone  chan struct{}
 	uid       int
 }
 
@@ -78,7 +80,7 @@ func New(opts Options) *Server {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Server{opts: opts, ctx: ctx, cancel: cancel, conns: map[net.Conn]struct{}{},
-		done: make(chan struct{}), uid: os.Getuid()}
+		done: make(chan struct{}), snapDone: make(chan struct{}), uid: os.Getuid()}
 }
 
 // Start creates the runtime directories and sockets and begins accepting.
@@ -108,6 +110,10 @@ func (s *Server) Start() error {
 		s.closeListeners()
 		return fmt.Errorf("audit: %w", err)
 	}
+	// Written before Start returns, so by the time the pid file names this
+	// process the snapshot is its own, not one a previous service left.
+	s.writeGrants()
+	go s.snapshots()
 	s.guardDone = s.opts.Core.Guard(s.ctx, s.opts.Events, s.opts.Log)
 	return nil
 }
@@ -297,8 +303,10 @@ func (s *Server) Shutdown(reason string) {
 		s.closeListeners()
 		s.wg.Wait()
 		// Grants never outlive the service, and a reload starts with none.
-		if s.guardDone != nil {
+		started := s.guardDone != nil
+		if started {
 			<-s.guardDone
+			<-s.snapDone
 		}
 		wipe := core.WipeShutdown
 		if reason == "reload" {
@@ -314,6 +322,15 @@ func (s *Server) Shutdown(reason string) {
 		if _, err := s.opts.Core.Audit().Append(context.Background(), e); err != nil {
 			s.opts.Log.Error("audit failed for server.stop", "err", err)
 		}
+		// Only a server that started wrote snapshots; one that didn't may have
+		// failed because another service serves these instances.
+		if started {
+			for _, inst := range s.opts.Instances {
+				if err := svcctl.RemoveGrants(s.opts.Paths.GrantsFile(inst.Name)); err != nil {
+					s.opts.Log.Error("grants snapshot", "instance", inst.Name, "err", err)
+				}
+			}
+		}
 		close(s.done)
 	})
 }
@@ -324,5 +341,42 @@ func (s *Server) Done() <-chan struct{} { return s.done }
 func (s *Server) closeListeners() {
 	for _, l := range s.listeners {
 		l.Close()
+	}
+}
+
+// snapshots keeps each instance's grants snapshot current until the server
+// stops (design §8.6).
+func (s *Server) snapshots() {
+	defer close(s.snapDone)
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-s.opts.Core.GrantsChanged():
+			s.writeGrants()
+		}
+	}
+}
+
+// writeGrants writes every instance's snapshot. One that can't be written is
+// removed rather than left stale, so the host says it can't tell instead of
+// showing grants that are gone. Requests go on either way: the snapshot is a
+// view, and the audit log is the record.
+func (s *Server) writeGrants() {
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	for _, inst := range s.opts.Instances {
+		gs, reuse := s.opts.Core.HostGrants(inst.Name)
+		snap := svcctl.GrantsSnapshot{Instance: inst.Name, WrittenAt: now, Reuse: reuse}
+		for _, g := range gs {
+			snap.Grants = append(snap.Grants, svcctl.Grant{Kind: g.Resource.Kind, Name: g.Resource.ID, Params: g.Params,
+				Scope: g.Scope, ScopeKey: g.ScopeKey, ApprovalID: g.ApprovalID, GrantedAt: g.GrantedAt, ExpiresAt: g.ExpiresAt, Quiet: g.Quiet})
+		}
+		path := s.opts.Paths.GrantsFile(inst.Name)
+		if err := svcctl.WriteGrants(path, snap); err != nil {
+			s.opts.Log.Error("grants snapshot", "instance", inst.Name, "err", err)
+			if err := svcctl.RemoveGrants(path); err != nil {
+				s.opts.Log.Error("grants snapshot", "instance", inst.Name, "err", err)
+			}
+		}
 	}
 }

@@ -344,6 +344,8 @@ func TestPolicyRejections(t *testing.T) {
 		"secret in no vault":       {pol(`secrets."nope:x".policy`, "approval = \"every-time\""), `secrets.nope:x: vault "nope" is not in the config`},
 		"every-time with a window": {pol(`secrets."dev:x".policy`, "approval = \"every-time\"\nwindow = \"1m\""), "takes no window"},
 		"every-time with a scope":  {pol(`secrets."dev:x".policy`, "approval = \"every-time\"\nscope = \"connection\""), "takes no window"},
+		"every-time with notify":   {pol(`secrets."dev:x".policy`, "approval = \"every-time\"\nnotify = false"), "takes no window, scope or notify"},
+		"notify not a boolean":     {pol("instances.dev.policy", "approval = \"reuse\"\nwindow = \"1m\"\nnotify = \"no\""), "notify"},
 		"reuse without a window":   {pol("instances.dev.policy", "approval = \"reuse\""), "needs a window"},
 		"no approval key":          {pol("instances.dev.policy", "window = \"1m\""), "approval is required"},
 		"unknown approval":         {pol("instances.dev.policy", "approval = \"sometimes\""), "must be"},
@@ -415,6 +417,41 @@ approval = "every-time"
 	}
 	if c.Plugins.PlatformEvents != "auto" {
 		t.Errorf("platform_events default %q", c.Plugins.PlatformEvents)
+	}
+}
+
+// notify = false silences a grant only while no level that applies says
+// notify = true.
+func TestNotifyTrueAtAnyLevelBeatsNotifyFalse(t *testing.T) {
+	cfg := minimal + `
+[vaults.dev]
+[vaults.dev.policy]
+approval = "reuse"
+window   = "1h"
+notify   = false
+[secrets."dev:loud".policy]
+approval = "reuse"
+window   = "1h"
+notify   = true
+`
+	c, err := Parse([]byte(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dev, _ := c.Instance("dev")
+	if got := c.SecretPolicy(dev, "dev:quiet"); !got.Quiet() {
+		t.Errorf("dev:quiet = %v, want quiet", got)
+	}
+	if got := c.SecretPolicy(dev, "dev:loud"); got.Quiet() {
+		t.Errorf("dev:loud = %v, want it to notify", got)
+	}
+	c, err = Parse([]byte(strings.Replace(cfg, "[instances.dev]\n", "[instances.dev]\npolicy = { approval = \"reuse\", window = \"8h\", notify = true }\n", 1)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dev, _ = c.Instance("dev")
+	if got := c.SecretPolicy(dev, "dev:quiet"); got.Quiet() {
+		t.Errorf("with notify = true on the instance, dev:quiet = %v, want it to notify", got)
 	}
 }
 
