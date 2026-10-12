@@ -221,6 +221,8 @@ keep_files        = 16            # rotated files kept, 1-1000
 
 ## Menu-bar app (macOS)
 
+<img width="406" height="386" alt="Screenshot 2026-10-12 at 16 01 08" src="https://github.com/user-attachments/assets/064df9ff-467e-45e8-b99a-5494f5d15068" />
+
 `Foca.app` shows each running service's live grants, how long they have left and how often
 they were used, the last day's activity with repeats folded together, and a
 **notification whenever a grant is reused**: a reuse shows no Touch ID prompt, so this is how
