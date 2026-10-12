@@ -113,8 +113,8 @@ func TestPromptWording(t *testing.T) {
 		{"remote", PromptInput{Realm: identity.Realm{Kind: "remote", Name: "ci", Peers: "opaque"}, Resources: refs("x"), Requester: plugin.Requester{Peer: ssh}, ShowClient: true},
 			"share:\n🔑 x\n🌐 remote host ci"},
 		{"reach and strikes", PromptInput{Realm: vm, Resources: refs("x"), Requester: plugin.Requester{Peer: ssh}, ShowClient: true,
-			Reach: "15m, anything in this VM", Denials: 2, Unanswered: 1},
-			"share:\n🔑 x\n🖥️ VM dev\n⏱️ 15m, anything in this VM\n🚫 denied 2 times\n🔕 1 prompt unanswered"},
+			Reach: "15m · whole VM", Denials: 2, Unanswered: 1},
+			"share:\n🔑 x\n🖥️ VM dev\n⏱️ 15m · whole VM\n🚫 denied 2 times\n🔕 1 prompt unanswered"},
 		{"add", PromptInput{Operation: "secret.add", Vault: "common", Resources: refs("New token"), ShowClient: true},
 			"add New token to vault common, visible to no instance."},
 	}

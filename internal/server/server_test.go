@@ -788,7 +788,7 @@ func TestGrantsOverTheSocket(t *testing.T) {
 	if n := len(e.auth.Requests()); n != 1 {
 		t.Fatalf("%d prompts, want 1", n)
 	}
-	if p := e.auth.Requests()[0].Prompt; !strings.HasSuffix(p, "1h, this session") {
+	if p := e.auth.Requests()[0].Prompt; !strings.HasSuffix(p, "1h · this session") {
 		t.Fatalf("prompt %q", p)
 	}
 

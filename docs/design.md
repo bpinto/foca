@@ -319,7 +319,7 @@ foca is trying to share:
 🔑 GitHub PAT
 🖥️ VM dev
 ❔ gh via claude (unverified)
-⏱️ 15m, anything in this VM
+⏱️ 15m · whole VM
 ```
 
 The first line is `share:` for a read and `run:` for an action. Each line after it is left
@@ -332,7 +332,7 @@ out when it has nothing to say, in this order:
 | `🖥️` / `🚢` / `🌐` | `{instance}`: a VM, a container or a remote host; none for a host-local client | `🖥️ VM dev`, `🚢 container web` |
 | `👤` | host-verified `{program}` and `{via}` | `👤 gh via claude` (sealed), `👤 gh ⚠ via claude` (`gh` not sealed) |
 | `❔` | claimed `{program}` and `{via}` | `❔ npm via claude (unverified)` |
-| `⏱️` | `{reach}`, if approving creates a grant | `⏱️ 15m, anything in this VM` |
+| `⏱️` | `{reach}`, if approving creates a grant | `⏱️ 15m · whole VM` |
 | `🚫` | recent denials (§9.6) | `🚫 denied 2 times` |
 | `🔕` | the instance's unanswered prompts (§9.6) | `🔕 1 prompt unanswered` |
 
@@ -1512,7 +1512,7 @@ name says:
    wins". `grants.drop` is the only thing a caller can do to its grants.
 5. **The prompt states how far the approval reaches.** If approving creates a grant, the
    prompt's `⏱️` line says for how long and for whom, after the line naming the realm:
-   `⏱️ 15m, anything in this VM`, `⏱️ 1h, this session` or `⏱️ 45s, this connection`.
+   `⏱️ 15m · whole VM`, `⏱️ 1h · this session` or `⏱️ 45s · this connection`.
 6. **`foca policy explain` states the same reach.** It runs on the host CLI, reading config only
    and prints the effective policy for every secret and action in plain words, naming the
    realm (`one approval allows reuse for 15m by anything in VM dev`, ending `, without

@@ -24,7 +24,7 @@ every attempt lands in an audit log.
 > 🔑 **GitHub PAT**<br>
 > 🖥️ **VM dev**<br>
 > 👤 **gh** via **claude**<br>
-> ⏱️ 15m, anything in this VM
+> ⏱️ 15m · whole VM
 
 ## Why foca
 

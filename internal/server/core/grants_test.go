@@ -172,7 +172,7 @@ func TestReuseWithinWindowThenExpiry(t *testing.T) {
 	if err := r.read(t, c, "github-pat"); err != nil {
 		t.Fatal(err)
 	}
-	if got := r.auth.Requests()[0].Prompt; !strings.HasSuffix(got, "\n⏱️ 15m, anything in this VM") {
+	if got := r.auth.Requests()[0].Prompt; !strings.HasSuffix(got, "\n⏱️ 15m · whole VM") {
 		t.Fatalf("prompt doesn't state the reach: %q", got)
 	}
 	// Another connection in the same peer session: reused, no prompt.
@@ -399,7 +399,7 @@ func TestBatchRunsUnderTheStricterPolicy(t *testing.T) {
 	if err := r.read(t, c, "github-pat", "npm-token"); err != nil {
 		t.Fatal(err)
 	}
-	if p := r.auth.Requests()[0].Prompt; !strings.HasSuffix(p, "\n⏱️ 15m, this connection") {
+	if p := r.auth.Requests()[0].Prompt; !strings.HasSuffix(p, "\n⏱️ 15m · this connection") {
 		t.Fatalf("prompt %q", p)
 	}
 	// Both grants are connection-scoped: another connection is prompted.

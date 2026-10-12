@@ -225,25 +225,21 @@ func FormatWindow(d time.Duration) string {
 }
 
 // Reach says how long and for whom an approval under p is reused, or "" if
-// approving creates no grant: "15m, anything in this VM". It is the
+// approving creates no grant: "15m · whole VM". It is the
 // prompt's ⏱️ line (design §4.1.1), which comes after the line naming the
 // realm, so it says "this VM" rather than naming the realm again.
 func Reach(p Policy, realm identity.Realm) string {
 	if p.Kind != Reuse {
 		return ""
 	}
-	return FormatWindow(p.Window) + ", " + whoHere(p.Scope, realm)
+	return FormatWindow(p.Window) + " · " + whoHere(p.Scope, realm)
 }
 
 // whoHere is who, for a prompt that has already named the realm.
 func whoHere(s Scope, realm identity.Realm) string {
-	anything := "anything on this host"
-	switch n := realm.Noun(); n {
-	case "":
-	case "remote host":
-		anything = "anything on this remote host"
-	default:
-		anything = "anything in this " + n
+	whole := "whole host"
+	if n := realm.Noun(); n != "" {
+		whole = "whole " + n
 	}
 	switch s {
 	case ScopeConnection:
@@ -251,11 +247,11 @@ func whoHere(s Scope, realm identity.Realm) string {
 	case ScopePeerSession:
 		if realm.Peers == identity.PeersOpaque {
 			// The host sees only the proxy, so the session is the whole realm.
-			return anything
+			return whole
 		}
 		return "this session"
 	default:
-		return anything
+		return whole
 	}
 }
 

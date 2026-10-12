@@ -172,12 +172,12 @@ func TestReachWording(t *testing.T) {
 		realm identity.Realm
 		want  string
 	}{
-		{reuse(15*time.Minute, ScopePeerSession), vm, "15m, anything in this VM"},
-		{reuse(90*time.Minute, ScopePeerSession), host, "1h30m, this session"},
-		{reuse(2*time.Hour, ScopePeerSession), ctr, "2h, this session"},
-		{reuse(45*time.Second, ScopeConnection), vm, "45s, this connection"},
-		{reuse(time.Hour, ScopeInstance), ctr, "1h, anything in this container"},
-		{reuse(time.Hour, ScopeInstance), host, "1h, anything on this host"},
+		{reuse(15*time.Minute, ScopePeerSession), vm, "15m · whole VM"},
+		{reuse(90*time.Minute, ScopePeerSession), host, "1h30m · this session"},
+		{reuse(2*time.Hour, ScopePeerSession), ctr, "2h · this session"},
+		{reuse(45*time.Second, ScopeConnection), vm, "45s · this connection"},
+		{reuse(time.Hour, ScopeInstance), ctr, "1h · whole container"},
+		{reuse(time.Hour, ScopeInstance), host, "1h · whole host"},
 		{every, vm, ""},
 	}
 	for _, c := range cases {
