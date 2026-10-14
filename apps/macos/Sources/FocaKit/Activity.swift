@@ -117,11 +117,41 @@ public struct ActivityItem: Equatable, Identifiable {
     }
 }
 
+/// Where recent activity starts: the newest `server.start`, or `lock` that
+/// wiped every grant. One service serves every instance and a wipe drops
+/// them all, so there is one cut for the whole log. A `lock` for grants that
+/// expired is no reset: the others live on.
+public enum ActivityWindow {
+    /// Events given newest first, through the newest start or wipe (kept, to
+    /// say where the list begins). All of them when none is among them.
+    public static func current(_ newestFirst: [AuditEvent]) -> [AuditEvent] {
+        guard let i = newestFirst.firstIndex(where: isReset) else {
+            return newestFirst
+        }
+        return Array(newestFirst[...i])
+    }
+
+    static func isReset(_ e: AuditEvent) -> Bool {
+        e.type == "server.start" || (e.type == "lock" && e.reason != "expired")
+    }
+}
+
+extension ActivityItem {
+    /// Shown when the menu shows only what matters: a request (what was read
+    /// or run, however it ended), or anything refused or failed. A lock, a
+    /// list, a start or a reload is routine.
+    public var isImportant: Bool {
+        id.hasPrefix("req:") || tone == .bad || tone == .warning
+    }
+}
+
 /// Repeats in recent activity, folded into one row ("5×"): the requests
 /// allowed under one grant (its approval, then its reuses) by the same
 /// program, and otherwise items that read the same and ended the same way.
-/// Allowed and refused requests never share a row.
+/// Only a run of them folds: with something else between, they are separate
+/// rows. Allowed and refused requests never share a row.
 public struct ActivityGroup: Identifiable, Equatable {
+    /// Its oldest item's, so a row keeps it as newer items join.
     public let id: String
     /// Newest first; never empty.
     public let items: [ActivityItem]
@@ -132,26 +162,33 @@ public struct ActivityGroup: Identifiable, Equatable {
     /// items, else the newest; the time is always the newest's.
     public var summary: ActivityItem { items.first { $0.how == "approved" } ?? items[0] }
 
-    /// Groups items given newest first. A group sits where its newest item
-    /// is, and keeps its items newest first.
+    /// Groups items given newest first, folding each run of alike items.
+    /// Groups and their items stay newest first.
     public static func group(_ newestFirst: [ActivityItem]) -> [ActivityGroup] {
-        var order: [String] = []
-        var byKey: [String: [ActivityItem]] = [:]
+        var runs: [(key: String, items: [ActivityItem])] = []
         for i in newestFirst {
             var k = i.symbol + "\u{0}" + i.how + "\u{0}" + i.text
             if let ap = i.approvalID {
                 k = "grant\u{0}" + ap + "\u{0}" + i.text
             }
-            if byKey[k] == nil {
-                order.append(k)
+            if let last = runs.last, last.key == k {
+                runs[runs.count - 1].items.append(i)
+            } else {
+                runs.append((key: k, items: [i]))
             }
-            byKey[k, default: []].append(i)
         }
-        return order.map { ActivityGroup(id: $0, items: byKey[$0]!) }
+        return runs.map { ActivityGroup(id: $0.items[$0.items.count - 1].id, items: $0.items) }
     }
 
-    /// Events given newest first, merged into items and folded.
-    public static func of(_ newestFirst: [AuditEvent]) -> [ActivityGroup] {
-        group(ActivityItem.items(newestFirst))
+    /// Events given newest first, merged into items and folded. With
+    /// sinceReset, they are cut where activity starts (ActivityWindow). With
+    /// importantOnly, routine items are left out before folding: a run only
+    /// they interrupted folds.
+    public static func of(_ newestFirst: [AuditEvent], sinceReset: Bool = true, importantOnly: Bool = false) -> [ActivityGroup] {
+        var items = ActivityItem.items(sinceReset ? ActivityWindow.current(newestFirst) : newestFirst)
+        if importantOnly {
+            items = items.filter(\.isImportant)
+        }
+        return group(items)
     }
 }

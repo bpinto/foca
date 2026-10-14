@@ -313,8 +313,9 @@ final class UsageTests: XCTestCase {
         XCTAssertFalse(b.notifies(g.id, quiet: true, now: now), "and off again")
     }
 
-    func testRepeatedActivityFoldsIntoOneRow() {
+    func testOnlyARunOfRepeatsFoldsIntoOneRow() {
         let newestFirst = [
+            event(seq: 6, ts: "2026-10-10T01:06:00Z"),
             event(seq: 5, ts: "2026-10-10T01:05:00Z"),
             event(seq: 4, ts: "2026-10-10T01:04:00Z", id: "dev:y"),
             event(seq: 3, ts: "2026-10-10T01:03:00Z"),
@@ -322,7 +323,8 @@ final class UsageTests: XCTestCase {
             event(seq: 1, ts: "2026-10-10T01:01:00Z"),
         ]
         let groups = ActivityGroup.of(newestFirst)
-        XCTAssertEqual(groups.map { $0.items.map(\.seq) }, [[5, 3, 1], [4], [2]])
+        XCTAssertEqual(groups.map { $0.items.map(\.seq) }, [[6, 5], [4], [3], [2], [1]], "x 2, y, x, x denied, x: never x 4")
+        XCTAssertEqual(groups.map(\.id), ["seq:5", "seq:4", "seq:3", "seq:2", "seq:1"], "a row is known by its oldest item")
     }
 }
 
@@ -382,7 +384,7 @@ final class ActivityTests: XCTestCase {
             ev(1, "approval.reused", req: "r1", mode: "reused"),
         ]
         let groups = ActivityGroup.of(events)
-        XCTAssertEqual(groups.map { $0.items.map(\.seq) }, [[6, 2], [4]], "the reuses fold; the denial stays apart")
+        XCTAssertEqual(groups.map { $0.items.map(\.seq) }, [[6], [4], [2]], "the denial stays apart, and parts the reuses")
         XCTAssertEqual(groups[1].newest.how, "denied")
     }
 
@@ -402,6 +404,52 @@ final class ActivityTests: XCTestCase {
         XCTAssertEqual(groups[1].summary.how, "approved", "the row says how the grant was made")
         XCTAssertEqual(groups[1].newest.seq, 6, "and when it was last used")
         XCTAssertEqual(groups[0].summary.how, "reused")
+    }
+
+    func plain(_ seq: UInt64, _ type: String, outcome: String = "ok", reason: String? = nil) -> AuditEvent {
+        let r = reason.map { #","reason":"\#($0)""# } ?? ""
+        let json = #"{"seq":\#(seq),"ts":"2026-10-10T01:00:0\#(seq)Z","type":"\#(type)","outcome":"\#(outcome)"\#(r)}"#
+        return try! JSONDecoder().decode(AuditEvent.self, from: Data(json.utf8))
+    }
+
+    func testActivityStartsAtTheNewestStartOrWipe() {
+        let events = [
+            ev(9, "secret.read", req: "r3", mode: "reused"),
+            ev(8, "approval.reused", req: "r3", mode: "reused"),
+            plain(7, "lock", reason: "expired"),
+            plain(6, "lock", reason: "screen-lock"),
+            ev(5, "secret.read", req: "r2", mode: "reused"),
+            ev(4, "approval.reused", req: "r2", mode: "reused"),
+            plain(3, "server.start"),
+            ev(2, "secret.read", req: "r1", mode: "fresh"),
+            ev(1, "approval.granted", req: "r1", mode: "fresh"),
+        ]
+        XCTAssertEqual(ActivityGroup.of(events).map(\.id), ["req:r3", "seq:7", "seq:6"],
+                       "a wipe starts it, and is shown; grants that expired are no reset")
+        XCTAssertEqual(ActivityGroup.of(Array(events[4...])).map(\.id), ["req:r2", "seq:3"], "so does a start")
+        XCTAssertEqual(ActivityGroup.of(Array(events[7...])).map(\.id), ["req:r1"], "with neither, everything read is shown")
+        XCTAssertEqual(ActivityGroup.of(events, sinceReset: false).map(\.id), ["req:r3", "seq:7", "seq:6", "req:r2", "seq:3", "req:r1"],
+                       "turned off, everything read is shown")
+    }
+
+    func testImportantOnlyLeavesOutRoutineEventsAndFoldsWhatTheyParted() {
+        let events = [
+            ev(8, "secret.read", req: "r3", mode: "reused"),
+            ev(7, "approval.reused", req: "r3", mode: "reused"),
+            plain(6, "secret.list"),
+            plain(5, "lock", reason: "expired"),
+            plain(4, "request.rejected", outcome: "rejected"),
+            ev(3, "secret.read", req: "r2", mode: "reused"),
+            ev(2, "approval.reused", req: "r2", mode: "reused"),
+            plain(1, "config.reload"),
+        ]
+        XCTAssertEqual(ActivityGroup.of(events).map { $0.items.map(\.seq) }, [[8], [6], [5], [4], [3], [1]])
+        XCTAssertEqual(ActivityGroup.of(events, importantOnly: true).map { $0.items.map(\.seq) }, [[8], [4], [3]],
+                       "a rejected request is kept, and still parts the reuses")
+        XCTAssertEqual(ActivityGroup.of(Array(events[..<4]), importantOnly: true).map { $0.items.map(\.seq) }, [[8]])
+        let parted = Array(events[..<4]) + Array(events[5...])
+        XCTAssertEqual(ActivityGroup.of(parted, importantOnly: true).map { $0.items.map(\.seq) }, [[8, 3]],
+                       "reuses parted only by routine events fold")
     }
 
     func testAFailedServeIsNotShownAsApproved() {
