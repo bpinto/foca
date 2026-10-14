@@ -1390,7 +1390,7 @@ commands as child processes and reads their JSON:
 |---|---|
 | live grants, with time left, for the instances that have any | `foca grants --host -f json`, after each event and every 15 s |
 | how often each live grant was used, and when last | `secret.read` and `action.run` events, from the same query and `follow` |
-| recent activity, one row per request, folded by grant, about five rows with the rest scrolling | `foca events query --since 24h` (the last 300 events), then `foca events follow` |
+| recent activity since the service started or last wiped its grants, one row per request, runs folded, about five rows with the rest scrolling | `foca events query --since 24h` (the last 300 events), then `foca events follow` |
 | a notification for each reuse, unless its grant is quiet or muted | `approval.reused` events from the same `follow` |
 | a "Revoke all grants" item, and a revoke button on each grant | `foca lock` (§6.2), `foca grants --host --drop` (§8.6) |
 
@@ -1449,14 +1449,26 @@ commands as child processes and reads their JSON:
   In recent activity a request is one row: its approval event and each `secret.read` or
   `action.run` share a `request_id`, so the row names what was read or run and by whom, and
   says how it ended: approved (with a prompt), reused, denied, timed out, or the outcome of
-  a failed serve. A row then folds the requests allowed under one grant by the same program
-  (one `approval.id`, from its approval through its reuses), and otherwise those that read
-  alike and ended alike, with a count ("5×") that opens to list each one and its time.
-  Allowed and refused requests never share a row, and a refused or failed one is shown in
-  red. Events of no request, such as `lock`, are rows of their own. Colour is kept for what
-  needs noticing: the status dot (watching, needs attention, not running), how a request
-  ended, a muted or quiet grant's bell, and warnings. Routine things, such as a grant's kind,
-  its time left and a `lock`, are grey. The icons are pixel art
+  a failed serve. A row then folds a run of requests allowed under one grant by the same
+  program (one `approval.id`, from its approval through its reuses), and otherwise a run of
+  those that read alike and ended alike, with a count ("5×") that opens to list each one and
+  its time. Only a run folds: A three times, then B, then A five times are three rows, not
+  "A 8×", so the list keeps the order things happened in. Allowed and refused requests never
+  share a row, and a refused or failed one is shown in red. Events of no request, such as
+  `lock`, are rows of their own.
+  The list starts at the newest `server.start`, or `lock` that wiped every grant (sleep, screen
+  lock, `foca lock`, a reload, …), shown as its oldest row: what came before belongs to grants
+  and backoff that no longer exist. One service serves every instance and a wipe drops all
+  their grants, so there is one start for the whole list. A `lock` for grants that expired
+  drops only those, so it is no reset. Two icons in the section's title turn the filters on
+  and off; both start on and are kept across launches. The padlock (`lock.rotation`) is this
+  cut; off, the list shows all it read (the last 24 hours). The funnel shows only what
+  matters: requests, however they ended, and anything refused or failed (such as a
+  `request.rejected`). It leaves out the routine (locks, starts, reloads, lists) before
+  folding, so a run that only those parted is one row.
+  Colour is kept for what needs noticing: the status dot (watching, needs attention, not
+  running), how a request ended, a muted or quiet grant's bell, and warnings. Routine things,
+  such as a grant's kind, its time left and a `lock`, are grey. The icons are pixel art
   (`scripts/pixelart`): a padlock whose body is a seal's face, its keyhole the seal's nose.
   The menu-bar one has a "!" while the menu has a warning.
 - **Building and signing.** A SwiftPM package in `apps/macos`. `scripts/build-darwin.sh`

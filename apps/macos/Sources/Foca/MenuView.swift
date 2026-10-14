@@ -6,7 +6,7 @@ extension Tone {
     var color: Color {
         switch self {
         case .good: return .green
-        case .info: return .blue
+        case .info: return .accentColor
         case .warning: return .orange
         case .bad: return .red
         case .neutral: return .secondary
@@ -17,6 +17,11 @@ extension Tone {
 struct MenuView: View {
     @ObservedObject var monitor: Monitor
     private let visibleActivity = 5
+    // Recent activity's two filters, kept across launches: only what came
+    // since the service started or last wiped its grants, and only what was
+    // read or run, or refused or failed (no locks, starts or lists).
+    @AppStorage("activitySinceReset") private var sinceReset = true
+    @AppStorage("activityImportantOnly") private var importantOnly = true
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -44,13 +49,15 @@ struct MenuView: View {
 
             Divider()
 
-            section("Recent activity") {
-                if monitor.recent.isEmpty {
-                    Label("Nothing in the last 24 hours", systemImage: "tray")
+            section("Recent activity", accessory: { activityFilters }) {
+                let groups = ActivityGroup.of(monitor.recent, sinceReset: sinceReset, importantOnly: importantOnly)
+                if groups.isEmpty {
+                    Label(emptyActivity, systemImage: "tray")
                         .font(.callout)
+                        .fixedSize(horizontal: false, vertical: true)
                         .foregroundStyle(.secondary)
                 } else {
-                    ActivityList(groups: ActivityGroup.of(monitor.recent), now: monitor.now, visibleRows: visibleActivity)
+                    ActivityList(groups: groups, now: monitor.now, visibleRows: visibleActivity)
                 }
             }
 
@@ -96,11 +103,42 @@ struct MenuView: View {
         return ("Watching", .good)
     }
 
+    private var activityFilters: some View {
+        HStack(spacing: 6) {
+            FilterToggle(on: $sinceReset, symbol: "lock.rotation", onSymbol: "lock.rotation",
+                         help: sinceReset ? "Showing activity since foca started or last locked. Click to show the last 24 hours"
+                                          : "Showing the last 24 hours. Click to show only activity since foca started or last locked")
+            FilterToggle(on: $importantOnly, symbol: "line.3.horizontal.decrease.circle", onSymbol: "line.3.horizontal.decrease.circle.fill",
+                         help: importantOnly ? "Showing what was read or run, and anything refused or failed. Click to show locks, starts and lists too"
+                                             : "Showing every event. Click to show only what was read or run, and anything refused or failed")
+        }
+        .font(.subheadline)
+    }
+
+    private var emptyActivity: String {
+        if monitor.recent.isEmpty {
+            return "Nothing in the last 24 hours"
+        }
+        if importantOnly {
+            return sinceReset ? "No accesses since the last start or lock" : "No accesses in the last 24 hours"
+        }
+        return "Nothing since the last start or lock"
+    }
+
     private func section<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
+        section(title, accessory: { EmptyView() }, content: content)
+    }
+
+    private func section<Accessory: View, Content: View>(_ title: String, @ViewBuilder accessory: () -> Accessory,
+                                                         @ViewBuilder content: () -> Content) -> some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text(title)
-                .font(.subheadline.weight(.semibold))
-                .foregroundStyle(.secondary)
+            HStack {
+                Text(title)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                accessory()
+            }
             VStack(alignment: .leading, spacing: 6, content: content)
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
@@ -209,6 +247,28 @@ struct ActivityList: View {
         } else {
             line
         }
+    }
+}
+
+/// A filter in a section's title: an icon, in the accent colour (and filled,
+/// when its symbol has a filled form) while it filters, grey while it doesn't.
+struct FilterToggle: View {
+    @Binding var on: Bool
+    let symbol: String
+    let onSymbol: String
+    let help: String
+
+    var body: some View {
+        Button {
+            on.toggle()
+        } label: {
+            Image(systemName: on ? onSymbol : symbol)
+                .foregroundStyle(on ? Color.accentColor : Color.secondary)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.borderless)
+        .help(help)
+        .accessibilityAddTraits(on ? .isSelected : [])
     }
 }
 

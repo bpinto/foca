@@ -224,7 +224,8 @@ keep_files        = 16            # rotated files kept, 1-1000
 <img width="360" height="340" alt="Screenshot 2026-10-12 at 16 05 01" src="https://github.com/user-attachments/assets/230e085c-bb59-41a7-af3c-b331fd9c1102" />
 
 `Foca.app` shows each running service's live grants, how long they have left and how often
-they were used, the last day's activity with repeats folded together, and a
+they were used, activity since the service started or last locked (runs of repeats folded
+together; two icons turn off that cut and the hiding of routine events such as locks), and a
 **notification whenever a grant is reused**: a reuse shows no Touch ID prompt, so this is how
 you see it. `notify = false` in a reuse policy silences a grant from the config; the bell on
 a grant flips that until it ends, muting it or turning a quiet one on. The ✕ on a grant revokes it
