@@ -4,6 +4,6 @@
 # never pinned: its assets change with every commit. A hash of null means no
 # release is pinned yet.
 {
-  version = "0.2.0";
-  hash = "sha256-mh6zuXLmCz0L6WsXovJOisaPXxXcjSoooKd98TJiiPU=";
+  version = "0.3.0";
+  hash = "sha256-Ov9oHb092yeffEDQgNaYo4bxwlmttDSPsDJCubMZR3o=";
 }
